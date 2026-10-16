@@ -15,8 +15,9 @@ were activated. The original implementation plan is retained
 | GitHub `main` at delivery preparation | `e29223564fbbddf83c10134cf610f2562cc7ebce` |
 | Original Nix design baseline | `d61ecaedc808caba4586c9e48704dcfac1002785` |
 
-The source and lock remained unchanged throughout validation. Delivery adds
-documentation only to that reviewed source. The publication snapshot retains
+The source and lock remained unchanged throughout validation. The initial
+delivery snapshot `06b280ad8393f0f62ab0e53619126f56b5a6660f` added documentation
+only to that reviewed source. That publication snapshot retains
 the tested files but has a new commit identity; the original development
 history remains retained locally.
 

@@ -147,6 +147,13 @@ preview/platform validation; listing them here does not make them optional.
 
 ## Verification
 
+The [Nix source tests workflow](../.github/workflows/nix-source-tests.yml) runs
+the package-checker self-test, entrypoint, ownership and migration source suites
+on Ubuntu pull requests and pushes to `main`. It uses private fixture homes,
+reports test results and skips, and needs no Nix installation. These checks substitute
+activation and service managers; a passing CI job does not establish Nix builds
+or native platform acceptance.
+
 From a normal source checkout, with the committed lock:
 
 ```sh
