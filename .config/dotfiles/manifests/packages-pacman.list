@@ -1,6 +1,7 @@
 ca-certificates
 curl
 git
+python
 neovim
 tmux
 fzf

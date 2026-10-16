@@ -138,10 +138,11 @@ passthrough=$("$real_tmux" -S "$socket_path" \
 assert_equal on "$passthrough" "fresh global allow-passthrough"
 
 root_bindings=$(
-  "$real_tmux" -S "$socket_path" list-keys -T root \
-    -F '#{key_string}:#{key_command}' 2>/dev/null
+  "$real_tmux" -S "$socket_path" list-keys -T root 2>/dev/null
 ) || fail "could not read root key bindings"
-m_q_binding=$(printf '%s\n' "$root_bindings" | sed -n 's/^M-q://p')
+# Parse the standard output so this also works with tmux 3.6.
+m_q_binding=$(printf '%s\n' "$root_bindings" | sed -n \
+  's/^bind-key[[:space:]][[:space:]]*-T[[:space:]][[:space:]]*root[[:space:]][[:space:]]*M-q[[:space:]][[:space:]]*//p')
 [ -n "$m_q_binding" ] || fail "root M-q binding is missing"
 assert_contains 'confirm-before' "$m_q_binding" \
   "root M-q uses confirm-before"
@@ -150,10 +151,15 @@ assert_contains 'Kill pane #P? (y/n)' "$m_q_binding" \
 assert_contains 'kill-pane' "$m_q_binding" \
   "root M-q command"
 
-prefix_key_names=$(
-  "$real_tmux" -S "$socket_path" list-keys -T prefix \
-    -F ':#{key_string}:' 2>/dev/null
+prefix_bindings=$(
+  "$real_tmux" -S "$socket_path" list-keys -T prefix 2>/dev/null
 ) || fail "could not read prefix key bindings"
+prefix_key_names=$(printf '%s\n' "$prefix_bindings" | awk '
+  $1 == "bind-key" {
+    table_flag = ($2 == "-r" ? 3 : 2)
+    if ($table_flag == "-T" && $(table_flag + 1) == "prefix")
+      print ":" $(table_flag + 2) ":"
+  }')
 case $prefix_key_names in
   *':x:'*) fail "prefix x must remain unbound" ;;
 esac

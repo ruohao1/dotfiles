@@ -64,6 +64,7 @@ local function fixture(case)
   end
 
   local realpaths = {
+    [module_path] = module_path,
     [environment] = environment,
     [duckdb_path] = duckdb_path,
     ["/usr/bin/bwrap"] = "/usr/bin/bwrap",
@@ -157,6 +158,9 @@ local function fixture(case)
     json_decode = vim.json.decode,
     lstat = function(path)
       state.lstat_calls[#state.lstat_calls + 1] = path
+      if case.fs_root and path:sub(1, #case.fs_root + 1) == case.fs_root .. "/" then
+        return vim.uv.fs_lstat(path)
+      end
       if case.lstat_exceptions and case.lstat_exceptions[path] then
         error(case.lstat_exceptions[path])
       end
@@ -199,6 +203,9 @@ local function fixture(case)
     end,
     readable = function(path)
       state.readable_calls[#state.readable_calls + 1] = path
+      if case.fs_root and path:sub(1, #case.fs_root + 1) == case.fs_root .. "/" then
+        return vim.fn.filereadable(path)
+      end
       if case.readable_exception == path then
         error("readability check exploded")
       end
@@ -206,6 +213,9 @@ local function fixture(case)
     end,
     realpath = function(path)
       state.realpath_calls[#state.realpath_calls + 1] = path
+      if case.fs_root and path:sub(1, #case.fs_root + 1) == case.fs_root .. "/" then
+        return vim.uv.fs_realpath(path)
+      end
       if case.realpath_exceptions and case.realpath_exceptions[path] then
         error(case.realpath_exceptions[path])
       end
@@ -631,6 +641,74 @@ for _, case in ipairs({
   local report = runtime.probe()
   expect(not report.ok, case.name .. " unexpectedly passed")
   contains(joined_errors(report), case.needle, case.name .. " diagnostic")
+end
+
+-- File-level Home Manager deployment leaves the config directory real while
+-- individual modules and runners resolve into a shared immutable source tree.
+do
+  local parent =
+    assert(vim.env.DOTFILES_TEST_HOME or vim.env.TMPDIR, "private test parent required")
+  local root = vim.fs.joinpath(parent, "runner-trust")
+  expect(vim.uv.fs_lstat(root) == nil, "runner fixture already exists")
+  expect(vim.fn.mkdir(root, "p", 448) == 1, "runner fixture creation")
+  local config = root .. "/config/nvim"
+  local tree = root .. "/source/nvim"
+  local other = root .. "/other/nvim"
+  for _, base in ipairs({ config, tree, other }) do
+    vim.fn.mkdir(base .. "/lua/data_query", "p", 448)
+    vim.fn.mkdir(base .. "/scripts", "p", 448)
+  end
+  local lexical_module = config .. "/lua/data_query/tool.lua"
+  local canonical_module = tree .. "/lua/data_query/tool.lua"
+  local lexical_runner = config .. "/scripts/data-query-runner.py"
+  local canonical_runner = tree .. "/scripts/data-query-runner.py"
+  expect(
+    vim.fn.writefile(vim.fn.readfile(nvim_root .. "/lua/data_query/tool.lua"), canonical_module)
+      == 0,
+    "module fixture"
+  )
+  expect(vim.fn.writefile({ "# fixture" }, canonical_runner) == 0, "runner fixture")
+  expect(vim.uv.fs_symlink(canonical_module, lexical_module), "module link")
+  expect(vim.uv.fs_symlink(canonical_runner, lexical_runner), "runner link")
+  local runtime = fixture({ module_path = lexical_module, fs_root = root })
+  local report = runtime.probe()
+  expect(report.ok, "same-tree file links must succeed: " .. joined_errors(report))
+  expect(report.runner.path == canonical_runner, "runner must be canonical")
+
+  expect(vim.uv.fs_unlink(lexical_runner), "remove runner link")
+  local foreign_runner = other .. "/scripts/data-query-runner.py"
+  vim.fn.writefile({ "# foreign" }, foreign_runner)
+  expect(vim.uv.fs_symlink(foreign_runner, lexical_runner), "foreign runner link")
+  report = fixture({ module_path = lexical_module, fs_root = root }).probe()
+  contains(
+    joined_errors(report),
+    "runner resolves outside the Neovim root",
+    "foreign tree rejection"
+  )
+
+  expect(vim.uv.fs_unlink(lexical_module), "remove module link")
+  local wrong_module = tree .. "/wrong.lua"
+  vim.fn.writefile({ "return {}" }, wrong_module)
+  expect(vim.uv.fs_symlink(wrong_module, lexical_module), "wrong layout link")
+  report = fixture({ module_path = lexical_module, fs_root = root }).probe()
+  contains(
+    joined_errors(report),
+    "expected nvim/lua/data_query/tool.lua layout",
+    "canonical layout rejection"
+  )
+  expect(vim.uv.fs_unlink(lexical_module), "remove wrong layout link")
+  expect(vim.uv.fs_symlink(canonical_module, lexical_module), "restore module link")
+  expect(vim.uv.fs_unlink(lexical_runner), "remove foreign runner link")
+  expect(vim.uv.fs_symlink(canonical_runner, lexical_runner), "restore runner link")
+
+  expect(vim.uv.fs_chmod(canonical_runner, 0), "make runner unreadable")
+  report = fixture({ module_path = lexical_module, fs_root = root }).probe()
+  contains(joined_errors(report), "runner is not readable", "real unreadable file rejection")
+  expect(vim.uv.fs_chmod(canonical_runner, 384), "restore runner permissions")
+  expect(vim.uv.fs_unlink(canonical_runner), "remove runner file")
+  vim.fn.mkdir(canonical_runner, "p", 448)
+  report = fixture({ module_path = lexical_module, fs_root = root }).probe()
+  contains(joined_errors(report), "runner must be a regular file", "real directory rejection")
 end
 
 local default_request = {

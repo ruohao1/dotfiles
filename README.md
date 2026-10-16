@@ -27,6 +27,14 @@ dotfiles_bootstrap() (
 
 Choose the command for your system. Remove `--apply` to preview the complete package, conflict, backup, and configuration plan without changing anything.
 
+To select another repository, pass `--repo` with a credential-free HTTPS URL, an SSH URL, or a local path.
+For private HTTPS repositories, configure a Git credential helper; for SSH, use your SSH key or agent.
+HTTP(S) URLs containing userinfo (`user@host` or `user:password@host`), a query (`?`), or a fragment (`#`) are rejected before bootstrap prints or stores the URL.
+Explicit `http::` and `https::` remote-helper prefixes are unsupported; use a standard URL instead.
+Inputs beginning with `http:/` or `https:/` must use exactly two slashes followed by a host. To address an SSH host named `http` or `https`, use an explicit `ssh://` URL instead of an ambiguous scp-style absolute path.
+Keep credentials out of repository URLs, including path components. Accepted repository URLs appear in plans and are retained in Git configuration and recovery metadata.
+This input check does not inspect URL rewrites or credentials supplied by your Git configuration.
+
 ### macOS
 
 ```sh
@@ -74,6 +82,37 @@ $HOME/.config/dotfiles/bootstrap --rollback latest
 ```
 
 Rollback intentionally keeps installed packages.
+
+---
+
+## Nix and Home Manager (experimental)
+
+The Nix route is available through [bootstrap-nix](.config/dotfiles/bootstrap-nix).
+It remains experimental. An offline Ubuntu 24.04.5 x86_64 smoke test passed Nix
+installation and direct Home Manager activation, a second generation, repeat and
+rollback. Migration-wrapper acceptance on Ubuntu, native prerequisites, full
+GUI/editor workflows, other Linux distributions and native macOS remain pending.
+The native route above remains the installation default. See the
+[validation record](nix/validation/2026-10-16-ubuntu-smoke.md) and
+[evidence matrix and migration
+instructions](nix/README.md#installation-and-migration-experimental).
+
+Use a separate clean, committed checkout and declare your actual host first:
+
+```sh
+/path/to/checkout/.config/dotfiles/bootstrap-nix --source-root /path/to/checkout -- \
+  plan --profile your-host --output review.json
+# Review conflicts, native prerequisites, files, services and recovery locations.
+/path/to/checkout/.config/dotfiles/bootstrap-nix --source-root /path/to/checkout -- \
+  apply --plan review.json
+```
+
+Nix, Git and Python 3 must already be installed. The entrypoint never installs
+Nix silently. Native desktop applications, fonts, permissions and preferences
+remain separate preparation. Do not reuse ordinary bootstrap as a desktop-only
+installer after Home Manager takes ownership. Current legacy entrypoints enforce
+the ownership guard; arbitrary old bootstrap copies cannot acquire that protection
+retroactively. Retain the migration journals and backups for explicit recovery.
 
 ---
 

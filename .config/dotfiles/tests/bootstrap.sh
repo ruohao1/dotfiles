@@ -54,9 +54,39 @@ require_excludes() {
   esac
 }
 
+prepare_private_capture_home() {
+  capture_home=
+  capture_mutating=false
+  for capture_argument do
+    case "$capture_argument" in
+      HOME=*) capture_home=${capture_argument#HOME=} ;;
+      --apply|--rollback) capture_mutating=true ;;
+    esac
+  done
+  # Real deployments require an existing identity. Only private positive fixture
+  # homes are prepared here; parser rejections and dry-run absence stay intact.
+  if [ "$capture_mutating" = true ] && [ -n "$capture_home" ]; then
+    case "$capture_home" in
+      "$test_tmp"/*)
+        if [ ! -e "$capture_home" ] && [ ! -L "$capture_home" ]; then
+          mkdir -p -- "$capture_home"
+        fi
+        ;;
+    esac
+  fi
+}
+
+only_ownership_coordination() {
+  [ ! -e "$1/.local" ] && return 0
+  [ ! -L "$1/.local" ] && [ -d "$1/.local/state/dotfiles-ownership" ] || return 1
+  coordination_entries=$(find "$1/.local" -mindepth 1 -print | LC_ALL=C sort)
+  [ "$coordination_entries" = "$(printf '%s\n' "$1/.local/state" "$1/.local/state/dotfiles-ownership")" ]
+}
+
 run_capture() {
   output_file=$1
   shift
+  prepare_private_capture_home "$@"
   set +e
   "$@" >"$output_file" 2>&1
   run_status=$?
@@ -67,6 +97,7 @@ run_capture_in_directory() {
   output_file=$1
   capture_directory=$2
   shift 2
+  prepare_private_capture_home "$@"
   set +e
   (
     CDPATH='' cd -- "$capture_directory"
@@ -516,7 +547,9 @@ make_managed_stage_signal_bootstrap() {
   managed_stage_source=$1
   managed_stage_target=$2
   awk '
-    $0 == "  active_package_tmp=$managed_stage_root" {
+    $0 == "install_debian_language_servers() {" { in_installer = 1 }
+    in_installer && $0 == "}" { in_installer = 0 }
+    in_installer && $0 == "  active_package_tmp=$managed_stage_root" {
       print "  printf \"%s\\n\" \"$managed_stage_root\" >\"$DOTFILES_BOOTSTRAP_TEST_MANAGED_STAGE_RACE_PATH_FILE\""
       print "  kill -TERM \"$$\""
       injected += 1
@@ -711,7 +744,7 @@ run_parquet_unsafe_target_case() {
   parquet_unsafe_actions=$parquet_probe_root/$parquet_unsafe_name.actions
   : >"$parquet_unsafe_actions"
   run_capture "$parquet_probe_root/$parquet_unsafe_name.output" env \
-    PATH="$parquet_probe_bin:/usr/bin:/bin" \
+    PATH="$parquet_probe_bin:$test_utilities_bin" \
     HOME="$parquet_probe_root/home" \
     UV_TOOL_DIR="$parquet_unsafe_tool_root" \
     UV_TOOL_BIN_DIR="$parquet_unsafe_bin_root" \
@@ -741,7 +774,7 @@ run_parquet_trailing_slash_target_case() {
   parquet_trailing_actions=$parquet_probe_root/$parquet_trailing_name.actions
   : >"$parquet_trailing_actions"
   run_capture "$parquet_probe_root/$parquet_trailing_name.output" env \
-    PATH="$parquet_probe_bin:/usr/bin:/bin" \
+    PATH="$parquet_probe_bin:$test_utilities_bin" \
     HOME="$parquet_probe_root/home" \
     UV_TOOL_DIR="$parquet_trailing_tool_root" \
     UV_TOOL_BIN_DIR="$parquet_trailing_bin_root" \
@@ -1048,7 +1081,7 @@ run_debian_runtime_apply_case() {
     esac)"
 
   run_capture "$runtime_apply_output_path" "$test_real_env" \
-    PATH="$runtime_apply_bin:/usr/bin:/bin" \
+    PATH="$runtime_apply_bin:$test_utilities_bin" \
     TMPDIR="$runtime_apply_tmp" \
     HOME="$runtime_apply_home" \
     XDG_STATE_HOME="$runtime_apply_state" \
@@ -1133,7 +1166,7 @@ run_debian_runtime_boundary_case() {
   case "$runtime_boundary" in
     standalone)
       run_capture "$runtime_boundary_output_path" "$test_real_env" \
-        PATH="$runtime_boundary_bin:/usr/bin:/bin" \
+        PATH="$runtime_boundary_bin:$test_utilities_bin" \
         TMPDIR="$runtime_boundary_tmp" \
         HOME="$runtime_boundary_home" \
         XDG_STATE_HOME="$runtime_boundary_state" \
@@ -1150,7 +1183,7 @@ run_debian_runtime_boundary_case() {
       ;;
     remote)
       run_capture "$runtime_boundary_output_path" "$test_real_env" \
-        PATH="$runtime_boundary_bin:/usr/bin:/bin" \
+        PATH="$runtime_boundary_bin:$test_utilities_bin" \
         TMPDIR="$runtime_boundary_tmp" \
         HOME="$runtime_boundary_home" \
         XDG_STATE_HOME="$runtime_boundary_state" \
@@ -1366,7 +1399,7 @@ signal_verified_test_process() {
   verified_signal_identity=$3
   verified_signal_command=$4
   case $verified_signal_name in
-    CONT|TERM|KILL) ;;
+    CONT|HUP|INT|TERM|KILL) ;;
     *) return 1 ;;
   esac
   test_pid_is_safe "$verified_signal_pid" || return 1
@@ -1678,7 +1711,7 @@ run_satisfaction_case() {
   mkdir -p "$satisfaction_root"
   prepare_satisfaction_commands "$satisfaction_bin" "$@"
   run_capture "$satisfaction_root/output" env \
-    PATH="$satisfaction_bin:/usr/bin:/bin" \
+    PATH="$satisfaction_bin:$test_utilities_bin" \
     HOME="$satisfaction_root/home" \
     XDG_STATE_HOME="$satisfaction_root/state" \
     DOTFILES_BOOTSTRAP_TESTING=1 \
@@ -2054,7 +2087,9 @@ run_managed_failure_case() {
       ;;
     parent-directory)
       managed_failure_signal_command='mkdir'
-      managed_failure_signal_target=$managed_failure_home/.local
+      # .local is now created by the ownership guard before provisioning.
+      # Interrupt the original pre-journal package-parent creation instead.
+      managed_failure_signal_target=$managed_failure_home/.local/opt
       ;;
     managed-directory)
       managed_failure_signal_command='mv'
@@ -2662,7 +2697,7 @@ run_selective_managed_case() {
     "$selective_external_taplo")
 
   run_capture "$selective_root/output" env \
-    PATH="$selective_bin:$selective_node_bin:/usr/bin:/bin" \
+    PATH="$selective_bin:$selective_node_bin:$test_utilities_bin" \
     HOME="$selective_home" \
     XDG_STATE_HOME="$selective_state" \
     DOTFILES_BOOTSTRAP_TESTING=1 \
@@ -2757,12 +2792,31 @@ run_selective_managed_case() {
 }
 
 managed_tree_digest() {
-  managed_digest_home=$1
-  if command -v sha256sum >/dev/null 2>&1; then
-    tar -cf - -C "$managed_digest_home" .local | sha256sum | awk '{ print $1 }'
-  else
-    tar -cf - -C "$managed_digest_home" .local | shasum -a 256 | awk '{ print $1 }'
-  fi
+  python3 - "$1" <<'MANAGED_TREE_DIGEST'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+home = Path(sys.argv[1])
+root = home / '.local'
+coordination = root / 'state/dotfiles-ownership'
+paths = [root]
+for parent, directories, files in os.walk(root, followlinks=False):
+    paths.extend(Path(parent) / name for name in directories + files)
+entries = []
+for path in sorted(paths):
+    info = path.lstat()
+    # Atomic lock mkdir/rmdir changes only this real directory's mtime.
+    mtime = 0 if path == coordination and stat.S_ISDIR(info.st_mode) else info.st_mtime_ns
+    content = hashlib.sha256(path.read_bytes()).hexdigest() if stat.S_ISREG(info.st_mode) else None
+    link = os.readlink(path) if stat.S_ISLNK(info.st_mode) else None
+    entries.append([str(path.relative_to(home)), info.st_mode, info.st_uid,
+                    info.st_gid, info.st_ino, mtime, content, link])
+print(hashlib.sha256(json.dumps(entries, separators=(',', ':')).encode()).hexdigest())
+MANAGED_TREE_DIGEST
 }
 
 retained_language_server_actions_are_present() {
@@ -2782,6 +2836,786 @@ retained_language_server_actions_are_present() {
   done
 }
 
+managed_probe_root_set() {
+  managed_probe_tmp=$1
+  find "$managed_probe_tmp" -mindepth 1 -maxdepth 1 \
+    -name 'dotfiles-bootstrap.*' -print | LC_ALL=C sort
+}
+
+managed_probe_process_set() {
+  managed_probe_tmp=$1
+  private_probe_process_ids "$managed_probe_tmp" | LC_ALL=C sort
+}
+
+managed_probe_state_matches() {
+  managed_probe_tmp=$1
+  managed_probe_expected_roots=$2
+  managed_probe_expected_processes=$3
+  managed_probe_pid_file=$4
+
+  [ "$(managed_probe_root_set "$managed_probe_tmp")" \
+    = "$managed_probe_expected_roots" ] || return 1
+  [ "$(managed_probe_process_set "$managed_probe_tmp")" \
+    = "$managed_probe_expected_processes" ] || return 1
+
+  if [ -s "$managed_probe_pid_file" ]; then
+    managed_probe_pid=$(cat "$managed_probe_pid_file") || return 1
+    case $managed_probe_pid in
+      ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$managed_probe_pid" -gt 1 ] || return 1
+    [ ! -e "/proc/$managed_probe_pid" ] || return 1
+  fi
+}
+
+prepare_managed_scope_case() {
+  prepare_managed_failure_case "scope-$1"
+  scope_home=$managed_failure_home
+  scope_tmp=$managed_failure_tmp
+  scope_bin=$managed_failure_bin
+  scope_output=$managed_failure_root/output
+  scope_pid_file=$managed_failure_root/probe.pid
+  scope_target=$scope_home/.local/opt/taplo-0.10.0-x86_64
+  scope_link=$scope_home/.local/bin/taplo
+  scope_path=$scope_bin:$scope_home/.local/bin:$test_utilities_bin
+  scope_arch=x86_64
+  scope_platform=linux
+  scope_publish_failure=
+  scope_mutation_phase=
+  scope_mutation_kind=
+  scope_device_case=target
+  scope_signal_parent=
+  scope_bootstrap=$managed_failure_harness/bootstrap
+}
+
+prepare_managed_scope_snapshot() {
+  scope_snapshot_mutating=false
+  for scope_snapshot_argument do
+    [ "$scope_snapshot_argument" != --apply ] || scope_snapshot_mutating=true
+  done
+  [ "$scope_snapshot_mutating" = true ] || return 0
+  # Establish only the expected empty coordination fixture before a strict tree
+  # snapshot; an unsafe existing parent must still be rejected by production.
+  for scope_snapshot_directory in "$scope_home/.local" "$scope_home/.local/state" \
+      "$scope_home/.local/state/dotfiles-ownership"; do
+    [ ! -L "$scope_snapshot_directory" ] || return 0
+    if [ -e "$scope_snapshot_directory" ] && [ ! -d "$scope_snapshot_directory" ]; then
+      return 0
+    fi
+  done
+  mkdir -p "$scope_home/.local/state/dotfiles-ownership"
+}
+
+managed_scope_tree() {
+  find -P "$scope_home" -printf '%P|%y|%m|%i|%l\n' | LC_ALL=C sort
+  find -P "$scope_home" -type f -exec sha256sum {} + | LC_ALL=C sort
+}
+
+run_managed_scope() {
+  run_capture "$scope_output" env \
+    PATH="$scope_path" HOME="$scope_home" TMPDIR="$scope_tmp" \
+    DOTFILES_BOOTSTRAP_TESTING=1 \
+    DOTFILES_BOOTSTRAP_TEST_PLATFORM="$scope_platform" \
+    DOTFILES_BOOTSTRAP_TEST_ARCH="$scope_arch" \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=must-not-be-detected \
+    DOTFILES_BOOTSTRAP_TEST_WINDOW_MANAGER=must-not-be-selected \
+    DOTFILES_BOOTSTRAP_TEST_REAL_MANAGED_INSTALL=1 \
+    DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$managed_failure_download" \
+    DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$managed_failure_log" \
+    DOTFILES_BOOTSTRAP_TEST_TAPLO_PROBE_PID_FILE="$scope_pid_file" \
+    DOTFILES_BOOTSTRAP_TEST_PUBLISH_FAIL_AFTER="$scope_publish_failure" \
+    DOTFILES_BOOTSTRAP_TEST_LINK_MUTATION_PHASE="$scope_mutation_phase" \
+    DOTFILES_BOOTSTRAP_TEST_LINK_MUTATION_KIND="$scope_mutation_kind" \
+    DOTFILES_BOOTSTRAP_TEST_LINK_MUTATION_TARGET="$scope_link" \
+    "$scope_bootstrap" "$@"
+}
+
+managed_scope_is_clean() {
+  managed_probe_state_matches "$scope_tmp" '' '' "$scope_pid_file"
+}
+
+assert_managed_scope_readonly() {
+  scope_expected_status=$1
+  scope_expected_text=$2
+  scope_label=$3
+  shift 3
+  prepare_managed_scope_snapshot "$@"
+  scope_tree_before=$(managed_scope_tree)
+  scope_commands_before=$(cat "$managed_failure_log" 2>/dev/null || true)
+  run_managed_scope "$@"
+  if [ "$run_status" -eq "$scope_expected_status" ] \
+    && grep -Fq -- "$scope_expected_text" "$scope_output" \
+    && [ "$(managed_scope_tree)" = "$scope_tree_before" ] \
+    && managed_scope_is_clean \
+    && [ "$(cat "$managed_failure_log" 2>/dev/null || true)" = "$scope_commands_before" ]; then
+    pass "$scope_label"
+  else
+    fail "$scope_label"
+    sed 's/^/  scoped output: /' "$scope_output" >&2
+  fi
+}
+
+make_exact_managed_scope_layout() {
+  mkdir -p "$scope_target" "$scope_home/.local/bin"
+  make_taplo_command "$scope_target/taplo" 'taplo 0.10.0' success
+  ln -s "$scope_target/taplo" "$scope_link"
+}
+
+make_scoped_registration_signal_fixture() {
+  # Record the real owner in the copied harness; interrupt mktemp before its
+  # result can be assigned to the journal/staging cleanup variable.
+  registration_bash=
+  if [ "$scope_registration_shell" = bash ]; then
+    registration_bash=$(resolve_test_executable bash) || return 1
+  fi
+  awk -v registration_shell="$scope_registration_shell" \
+    -v registration_bash="$registration_bash" '
+    NR == 1 && registration_shell == "bash" {
+      print "#!" registration_bash " --posix"
+      next
+    }
+    $0 == "platform=$(detect_platform)" {
+      print "DOTFILES_BOOTSTRAP_TEST_SCOPE_OWNER_PID=$$"
+      print "export DOTFILES_BOOTSTRAP_TEST_SCOPE_OWNER_PID"
+      injected += 1
+    }
+    { print }
+    END { if (injected != 1) exit 1 }
+  ' "$scope_bootstrap" >"$scope_bootstrap.new"
+  mv "$scope_bootstrap.new" "$scope_bootstrap"
+  chmod 0755 "$scope_bootstrap"
+  {
+    printf '%s\n' '#!/bin/sh' "real_mktemp='$test_real_mktemp'"
+    printf '%s\n' "counter='$managed_failure_root/mktemp.count'"
+    printf '%s\n' "path_file='$managed_failure_root/interrupted.path'"
+    printf '%s\n' "signal_at='$scope_signal_at'" "signal_name='$scope_signal'"
+    printf '%s\n' "signal_parent='$scope_signal_parent'"
+    cat <<'SCOPE_MKTEMP'
+created_root=$("$real_mktemp" "$@") || exit 1
+count=0
+[ ! -s "$counter" ] || count=$(cat "$counter")
+count=$((count + 1))
+printf '%s\n' "$count" >"$counter"
+signal_this_root=false
+if [ -n "$signal_parent" ]; then
+  case $created_root in "$signal_parent"/dotfiles-bootstrap.*) signal_this_root=true ;; esac
+elif [ "$count" -eq "$signal_at" ]; then
+  signal_this_root=true
+fi
+if [ "$signal_this_root" = true ]; then
+  printf '%s\n' "$created_root" >"$path_file"
+  kill -"$signal_name" "$DOTFILES_BOOTSTRAP_TEST_SCOPE_OWNER_PID"
+fi
+printf '%s\n' "$created_root"
+SCOPE_MKTEMP
+  } >"$scope_bin/mktemp"
+  chmod 0755 "$scope_bin/mktemp"
+}
+
+make_scoped_publication_race_fixture() {
+  awk -v race="$scope_race" -v marker="$managed_failure_root/race.reached" '
+    $0 == "publish_managed_directory() {" { in_directory = 1 }
+    $0 == "publish_managed_link() {" { in_link = 1 }
+    $0 == "}" { in_directory = 0; in_link = 0 }
+    { print }
+    (in_directory && race == "target-collision" || in_link && race == "link-collision") \
+      && $0 == "  begin_managed_publication_critical" {
+      path = in_directory ? "$publish_target" : "$link_target"
+      print "  mkdir \"" path "\""
+      print "  printf replacement >\"" path "/sentinel\""
+      print "  printf reached >\"" marker "\""
+      injected += 1
+    }
+    $0 == "mutate_managed_link_for_test() {" && race ~ /^replace-/ {
+      phase = race ~ /before$/ ? "before-journal" : "after-journal"
+      print "  if [ \"$1\" = \"" phase "\" ]; then"
+      if (race ~ /^replace-directory/) {
+        print "    mv \"$managed_taplo_target\" \"$HOME/original-target\""
+        print "    mkdir \"$managed_taplo_target\""
+        print "    printf replacement >\"$managed_taplo_target/sentinel\""
+      } else {
+        print "    mv \"$managed_taplo_link\" \"$HOME/original-link\""
+        print "    ln -s \"$HOME/replacement\" \"$managed_taplo_link\""
+      }
+      print "    printf reached >\"" marker "\""
+      print "    die \"forced replacement failure\""
+      print "  fi"
+      injected += 1
+    }
+    END { if (injected != 1) exit 1 }
+  ' "$scope_bootstrap" >"$scope_bootstrap.new"
+  mv "$scope_bootstrap.new" "$scope_bootstrap"
+  chmod 0755 "$scope_bootstrap"
+}
+
+make_scoped_cross_device_commands() {
+  # Model TMPDIR on a different device; only the external stat/mv boundary
+  # is replaced, while staging, publication and cleanup run unchanged.
+  case $scope_device_case in
+    target)
+      scope_foreign_root=$scope_tmp
+      scope_device_target=$scope_target
+      scope_device_parent=$scope_home/.local/opt
+      ;;
+    link)
+      scope_foreign_root=$scope_home/.local/bin
+      scope_device_target=$scope_link
+      scope_device_parent=$scope_home/.local/bin
+      ;;
+  esac
+  {
+    printf '%s\n' '#!/bin/sh' "real_stat='$(command -v stat)'"
+    printf '%s\n' "foreign_tmp='$scope_foreign_root'"
+    cat <<'SCOPE_STAT'
+if [ "$1" = -c ] && [ "$2" = '%d' ]; then
+  case $3 in "$foreign_tmp"|"$foreign_tmp"/*) printf '%s\n' different-device; exit 0 ;; esac
+fi
+exec "$real_stat" "$@"
+SCOPE_STAT
+  } >"$scope_bin/stat"
+  {
+    printf '%s\n' '#!/bin/sh' "real_mv='$(command -v mv)'"
+    printf '%s\n' "expected_parent='$scope_device_parent'" "final_target='$scope_device_target'"
+    printf '%s\n' "fallback_marker='$managed_failure_root/copy-fallback'"
+    cat <<'SCOPE_MV'
+if [ "$#" -eq 4 ] && [ "$4" = "$final_target" ]; then
+  case $3 in
+    "$expected_parent"/*) ;;
+    *)
+      printf '%s\n' copied >"$fallback_marker"
+      cp -R "$3" "$4" && rm -r "$3"
+      exit $?
+      ;;
+  esac
+fi
+exec "$real_mv" "$@"
+SCOPE_MV
+  } >"$scope_bin/mv"
+  chmod 0755 "$scope_bin/stat" "$scope_bin/mv"
+}
+
+# Clipboard tests run real capture code with only the Cliphist boundary replaced.
+run_clipboard_capture_tests() {
+  if python3 - "$workspace_root" "$test_tmp" <<'CLIPBOARD_CAPTURE_TEST'
+from pathlib import Path
+import os, signal, stat, subprocess, sys, time, shlex
+
+source, scratch = map(Path, sys.argv[1:])
+store = source / '.config/clipboard-history/store'
+assert store.is_file() and os.access(store, os.X_OK), 'bounded clipboard store helper is missing'
+root = scratch / 'clipboard-capture'
+root.mkdir(mode=0o700)
+for name in ('bin', 'cache', 'home', 'config'):
+    (root / name).mkdir(mode=0o700)
+history = root / 'cache/cliphist'
+history.mkdir(mode=0o700)
+fake = root / 'bin/cliphist'
+fake.write_text('''#!/bin/sh
+[ "$1" = -db-path ] && [ "$2" = "$XDG_CACHE_HOME/cliphist/db" ] && [ "$3" = store ] || exit 91
+stat -Lc '%a' /proc/self/fd/0 > "$CLIP_TEST_MODE"
+cat > "$CLIP_TEST_CAPTURE"
+exit "${CLIP_TEST_EXIT:-0}"
+''')
+fake.chmod(0o700)
+captured = root / 'captured'
+env = dict(os.environ, HOME=str(root/'home'), XDG_CACHE_HOME=str(root/'cache'),
+           XDG_CONFIG_HOME=str(root/'config'), PATH=str(root/'bin')+':' + os.environ['DOTFILES_BOOTSTRAP_TEST_UTILITY_PATH'],
+           CLIP_TEST_CAPTURE=str(captured), CLIP_TEST_MODE=str(root/'mode'),
+           CLIPHIST_CONFIG_PATH=str(root/'config/empty'), CLIPHIST_DB_PATH=str(history/'db'))
+(root/'config/empty').write_text('')
+
+def run(payload, changes=None):
+    captured.unlink(missing_ok=True)
+    result = subprocess.run([str(store)], input=payload, env=env | (changes or {}), capture_output=True, timeout=5)
+    assert not result.stdout and not result.stderr, 'capture emitted content or diagnostics'
+    assert not list(history.glob('.store.*')), 'capture left a temporary payload'
+    return result.returncode, captured.read_bytes() if captured.exists() else None
+
+for payload in (b'x', b' leading and trailing \t ', b'first\nsecond\n', 'é中🙂\n'.encode(), b'x'*1048575, b'x'*1048576):
+    assert run(payload) == (0, payload), 'capture changed valid text bytes'
+    assert (root/'mode').read_text().strip() == '600', 'capture temporary file is not private'
+for payload in (b'', b'x'*1048577):
+    assert run(payload) == (0, None), 'empty or over-limit payload reached Cliphist'
+assert run(b'child status', {'CLIP_TEST_EXIT':'42'}) == (42, b'child status'), 'child status was lost'
+
+history.chmod(0o755)
+assert run(b'unsafe mode')[0] != 0 and not captured.exists(), 'public history directory accepted'
+history.chmod(0o700)
+history.rename(root/'real-history')
+history.symlink_to(root/'real-history', target_is_directory=True)
+assert run(b'symlink')[0] != 0 and not captured.exists(), 'symlinked history directory accepted'
+history.unlink()
+history.write_text('not a directory')
+assert run(b'file')[0] != 0 and not captured.exists(), 'regular file accepted as history directory'
+history.unlink()
+(root/'real-history').rename(history)
+
+# Reject a foreign owner without requiring privileged chown in the test suite.
+fake_stat = root/'bin/stat'
+fake_stat.write_text('#!/bin/sh\nif [ "$2" = %u ]; then printf "999999\\n"; else exec ' + shlex.quote(os.environ['DOTFILES_BOOTSTRAP_TEST_REAL_STAT']) + ' "$@"; fi\n')
+fake_stat.chmod(0o700)
+assert run(b'foreign owner')[0] != 0 and not captured.exists(), 'foreign history owner accepted'
+fake_stat.unlink()
+
+db = history/'db'
+db.symlink_to(root/'unrelated')
+assert run(b'symlink db')[0] != 0 and not captured.exists(), 'symlinked database accepted'
+db.unlink()
+db.write_bytes(b'existing')
+db.chmod(0o600)
+os.link(db, root/'linked-db')
+assert run(b'hardlink db')[0] != 0 and not captured.exists(), 'multiply linked database accepted'
+(root/'linked-db').unlink()
+db.chmod(0o644)
+assert run(b'public db')[0] != 0 and not captured.exists(), 'public database accepted'
+prepared = subprocess.run([str(store), '--prepare'], env=env, capture_output=True)
+assert prepared.returncode == 0 and stat.S_IMODE(db.stat().st_mode) == 0o600, 'prepare did not secure existing database'
+history.chmod(0o755)
+prepared = subprocess.run([str(store), '--prepare'], env=env, capture_output=True)
+assert prepared.returncode == 0 and stat.S_IMODE(history.stat().st_mode) == 0o700, 'prepare did not secure existing directory'
+db.unlink()
+history.rmdir()
+prepared = subprocess.run([str(store), '--prepare'], env=env, capture_output=True)
+assert prepared.returncode == 0 and stat.S_IMODE(history.stat().st_mode) == 0o700, 'prepare did not create private directory'
+assert subprocess.run([str(store), '--unknown'], env=env, capture_output=True).returncode != 0, 'unknown capture argument accepted'
+
+default = root/'home/.cache/cliphist'
+default.mkdir(mode=0o700, parents=True)
+default_env = dict(env)
+default_env.pop('XDG_CACHE_HOME')
+result = subprocess.run([str(store)], input=b'fallback', env=default_env, capture_output=True)
+assert result.returncode == 0 and captured.read_bytes() == b'fallback', 'unset XDG cache fallback failed'
+assert not list(default.glob('.store.*'))
+
+# Signal the owned process while its reader is waiting for more input.
+process = subprocess.Popen([str(store)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+try:
+    deadline = time.monotonic()+3
+    while not list(history.glob('.store.*')) and time.monotonic() < deadline:
+        time.sleep(.01)
+    assert list(history.glob('.store.*')), 'capture reader never started'
+    process.send_signal(signal.SIGTERM)
+    process.wait(timeout=3)
+    assert process.returncode != 0 and not list(history.glob('.store.*')), 'TERM leaked a capture payload'
+finally:
+    if process.poll() is None:
+        process.kill()
+        process.wait()
+    process.stdin.close()
+
+print('Clipboard capture behavior assertions: ok')
+CLIPBOARD_CAPTURE_TEST
+  then
+    pass 'clipboard capture bounds, exact bytes, private paths, child failures, and cleanup'
+  else
+    fail 'clipboard capture bounds, exact bytes, private paths, child failures, and cleanup'
+  fi
+
+  run_capture "$test_tmp/clipboard-plan.output" env \
+    DOTFILES_BOOTSTRAP_TESTING=1 DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+    DOTFILES_BOOTSTRAP_TEST_MANAGER=pacman \
+    "$bootstrap" --window-manager hypr
+  clipboard_plan=$(cat "$test_tmp/clipboard-plan.output")
+  require_contains "$clipboard_plan" 'cliphist' 'Hyprland plan provisions clipboard history'
+  require_contains "$clipboard_plan" '.config/clipboard-history/store' 'Hyprland deploys bounded capture'
+  require_contains "$clipboard_plan" '.config/cliphist/config' 'Hyprland deploys history policy'
+  require_contains "$clipboard_plan" '.config/systemd/user/cliphist.service.d/override.conf' 'Hyprland deploys text watcher override'
+}
+
+run_clipboard_service_tests() {
+  if python3 - "$bootstrap" "$test_tmp" <<'CLIPBOARD_SERVICE_TEST'
+from pathlib import Path
+import os, subprocess, sys
+source, scratch = map(Path, sys.argv[1:])
+root = scratch/'clipboard-services'
+root.mkdir(mode=0o700)
+# Load the real function definitions, without the CLI's process-wide traps.
+text = source.read_text().split('\ntransaction_active=false\ntransaction_run=\n', 1)[0]
+text = text[:text.index('mode=dry-run\n')] + text[text.index('detect_platform() {\n'):]
+# Direct harnesses strip CLI parsing; include the same coordination library.
+text += (source.parent/'lib/ownership.sh').read_text()
+text += '\nownership_acquire || exit 98\ntrap ownership_release 0\n'
+harness = root/'service-harness'
+harness.write_text(text + r'''
+transaction_run=$SERVICE_TEST_ROOT/journal
+mkdir -p "$transaction_run"
+case $1 in
+  select) emit_selected_services "$2" "$3" ;;
+  identifier) validate_service_identifier "$2" "$3" ;;
+  inventory) validate_service_inventory "$2" "$SERVICE_TEST_ROOT/inventory" ;;
+  apply)
+    record_initial_service_state "$2" "$3"
+    trap 'service_exit=$?; trap - 0; if [ "$service_exit" -ne 0 ]; then preflight_transaction_service && stop_deployed_service && restore_previous_service_state; fi; ownership_release; exit "$service_exit"' 0
+    activate_login_service "$2"
+    ;;
+  rollback) preflight_transaction_service && stop_deployed_service && restore_previous_service_state ;;
+esac
+''')
+harness.chmod(0o700)
+base_env = dict(os.environ, DOTFILES_BOOTSTRAP_TESTING='1', WAYLAND_DISPLAY='',
+    DOTFILES_BOOTSTRAP_TEST_SERVICE_ENABLED='false', DOTFILES_BOOTSTRAP_TEST_SERVICE_ACTIVE='false',
+    DOTFILES_BOOTSTRAP_TEST_SERVICE_LOADED='false')
+
+def fixture(name):
+    path=root/name
+    home=path/'home'
+    assets={'.config/tmux/scripts/workspace':'#!/bin/sh\n',
+        '.config/systemd/user/tmux-workspace.service':'[Service]\nExecStart=/bin/true\n',
+        '.config/clipboard-history/store':'#!/bin/sh\n', '.config/cliphist/config':'max-items 500\n',
+        '.config/systemd/user/cliphist.service.d/override.conf':'[Service]\n',
+        'Library/LaunchAgents/dev.ruohao.tmux-workspace.plist':'fixture'}
+    for relative,data in assets.items():
+        p=home/relative;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(data);p.chmod(0o700)
+    unit=path/'cliphist.service';unit.write_text('[Service]\nExecStart=/bin/true\n')
+    return path, dict(base_env, HOME=str(home), SERVICE_TEST_ROOT=str(path),
+        DOTFILES_BOOTSTRAP_TEST_CLIPHIST_UNIT_PATH=str(unit), DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG=str(path/'commands'))
+
+def run(env, *args):
+    return subprocess.run([str(harness),*args],env=env,capture_output=True,text=True,timeout=5)
+
+def actions(path):
+    p=path/'commands'
+    return p.read_text().splitlines() if p.exists() else []
+
+def state(path, service, key):
+    return (path/'journal/services'/service/key).read_text().strip()
+
+p,e=fixture('selection')
+for platform,profile,expected in [('linux','hypr',['tmux-workspace.service','cliphist.service']),
+    ('linux','none',['tmux-workspace.service']),('linux','i3',['tmux-workspace.service']),
+    ('macos','aerospace',['dev.ruohao.tmux-workspace'])]:
+    r=run(e,'select',platform,profile)
+    assert r.returncode==0 and r.stdout.splitlines()==expected, 'service selection is not profile-specific'
+for platform,identifier in [('linux','cliphist.service'),('linux','tmux-workspace.service'),('macos','dev.ruohao.tmux-workspace')]:
+    assert run(e,'identifier',platform,identifier).returncode==0
+for platform,identifier in [('linux',''),('linux','../cliphist.service'),('linux','other.service'),('macos','cliphist.service'),('other','tmux-workspace.service')]:
+    assert run(e,'identifier',platform,identifier).returncode!=0, 'unsupported service identifier accepted'
+for inventory in ['', 'tmux-workspace.service\ntmux-workspace.service\n','tmux-workspace.service\n\n','../cliphist.service\n']:
+    (p/'inventory').write_text(inventory)
+    assert run(e,'inventory','linux').returncode!=0, 'invalid inventory accepted'
+
+p,e=fixture('deferred')
+r=run(e,'apply','linux','hypr');assert r.returncode==0, 'Hyprland service apply failed'
+assert (p/'journal/services.list').read_text().splitlines()==['tmux-workspace.service','cliphist.service']
+assert state(p,'cliphist.service','enabled-by-transaction')=='true'
+assert state(p,'cliphist.service','started-by-transaction')=='false'
+assert 'systemctl --user enable cliphist.service' in actions(p)
+assert 'systemctl --user start cliphist.service' not in actions(p), 'headless apply started capture'
+assert run(e,'rollback').returncode==0
+assert actions(p)[-4:]==['systemctl --user disable cliphist.service','systemctl --user stop tmux-workspace.service',
+    'systemctl --user disable tmux-workspace.service','systemctl --user daemon-reload'], 'rollback order is not reversed'
+
+p,e=fixture('wayland')
+e.update(WAYLAND_DISPLAY='test-wayland',DOTFILES_BOOTSTRAP_TEST_GRAPHICAL_ACTIVE='true')
+assert run(e,'apply','linux','hypr').returncode==0
+assert 'systemctl --user start cliphist.service' in actions(p), 'active Wayland session did not start capture'
+(p/'commands').write_text('')
+assert run(e,'rollback').returncode==0
+assert actions(p)==['systemctl --user stop cliphist.service','systemctl --user disable cliphist.service',
+    'systemctl --user stop tmux-workspace.service','systemctl --user disable tmux-workspace.service',
+    'systemctl --user daemon-reload']
+# Repeating service rollback must not repeat owned actions.
+(p/'commands').write_text('');assert run(e,'rollback').returncode==0
+assert actions(p)==[]
+
+p,e=fixture('inactive-graphical')
+e['WAYLAND_DISPLAY']='test-wayland'
+assert run(e,'apply','linux','hypr').returncode==0
+assert 'systemctl --user start cliphist.service' not in actions(p)
+
+for tmux_enabled,tmux_active,clip_enabled,clip_active in [(True,True,False,False),(False,True,True,False),(True,False,False,True),(True,True,True,True)]:
+    p,e=fixture('mixed-'+''.join(str(int(v)) for v in (tmux_enabled,tmux_active,clip_enabled,clip_active)))
+    e.update(WAYLAND_DISPLAY='test-wayland', DOTFILES_BOOTSTRAP_TEST_GRAPHICAL_ACTIVE='true',
+        DOTFILES_BOOTSTRAP_TEST_SERVICE_ENABLED=str(tmux_enabled).lower(),DOTFILES_BOOTSTRAP_TEST_SERVICE_ACTIVE=str(tmux_active).lower(),
+        DOTFILES_BOOTSTRAP_TEST_CLIPHIST_ENABLED=str(clip_enabled).lower(),DOTFILES_BOOTSTRAP_TEST_CLIPHIST_ACTIVE=str(clip_active).lower())
+    assert run(e,'apply','linux','hypr').returncode==0
+    (p/'commands').write_text('');assert run(e,'rollback').returncode==0
+    for service,enabled,active in [('tmux-workspace.service',tmux_enabled,tmux_active),('cliphist.service',clip_enabled,clip_active)]:
+        assert ('systemctl --user disable '+service in actions(p)) != enabled, 'rollback changed pre-existing enablement'
+        assert ('systemctl --user stop '+service in actions(p)) != active, 'rollback stopped a pre-existing service'
+
+for missing in ['cliphist.service','home/.config/clipboard-history/store','home/.config/cliphist/config',
+    'home/.config/systemd/user/cliphist.service.d/override.conf','home/.config/tmux/scripts/workspace']:
+    p,e=fixture('missing-'+str(len(list(root.iterdir()))));(p/missing).unlink()
+    assert run(e,'apply','linux','hypr').returncode!=0, 'missing service asset accepted'
+    assert not actions(p), 'asset preflight mutated service manager'
+
+for operation in ['enable','start']:
+    p,e=fixture('failed-'+operation)
+    e.update(WAYLAND_DISPLAY='test-wayland',DOTFILES_BOOTSTRAP_TEST_GRAPHICAL_ACTIVE='true',
+        DOTFILES_BOOTSTRAP_TEST_SERVICE_FAIL=operation,DOTFILES_BOOTSTRAP_TEST_SERVICE_FAIL_UNIT='cliphist.service')
+    assert run(e,'apply','linux','hypr').returncode!=0, 'manager failure ignored'
+    assert 'systemctl --user disable cliphist.service' in actions(p), 'partial enable failure not unwound'
+    assert 'systemctl --user stop tmux-workspace.service' in actions(p), 'earlier service start not unwound'
+    if operation=='start':
+        assert 'systemctl --user stop cliphist.service' in actions(p), 'partial start failure not unwound'
+
+p,e=fixture('macos')
+e['DOTFILES_BOOTSTRAP_TEST_SERVICE_LOADED']='true'
+assert run(e,'apply','macos','aerospace').returncode==0
+assert state(p,'dev.ruohao.tmux-workspace','was-active')=='true'
+(p/'commands').write_text('');assert run(e,'rollback').returncode==0
+assert 'bootout' in actions(p)[0] and 'bootstrap' in actions(p)[1] and 'kickstart' in actions(p)[2], 'macOS service restoration changed'
+
+# Stateful manager failures exercise full file/service rollback, before and after effects.
+mac_harness=root/'macos-failure-harness'
+mac_harness.write_text(text + r"""
+transaction_run=$SERVICE_TEST_ROOT/journal
+run_service_command() {
+  [ "$1" = launchctl ] || return 97
+  printf '%s\n' "$*" >>"$SERVICE_TEST_ROOT/commands"
+  case $2 in
+    print)
+      [ "${MAC_QUERY_UNAVAILABLE:-0}" != 1 ] || return 5
+      case $3 in
+        gui/*/dev.ruohao.tmux-workspace) [ -f "$SERVICE_TEST_ROOT/loaded" ] ;;
+        gui/*) return 0 ;;
+        *) return 97 ;;
+      esac
+      return $?
+      ;;
+  esac
+  fail_this_call=false
+  selected_failure=${MAC_FAIL_OPERATION:-}
+  if [ "$selected_failure" = rollback-bootout ] && [ "$2" = bootout ] \
+    && [ "$(cat "$SERVICE_TEST_ROOT/loaded" 2>/dev/null)" = new ]; then
+    selected_failure=bootout
+  fi
+  if [ "$2" = "$selected_failure" ] && [ ! -e "$SERVICE_TEST_ROOT/failed-once" ]; then
+    : >"$SERVICE_TEST_ROOT/failed-once"
+    fail_this_call=true
+    [ "$MAC_FAIL_PHASE" != before ] || return 5
+  fi
+  case $2 in
+    bootout)
+      [ -f "$SERVICE_TEST_ROOT/loaded" ] || return 5
+      rm "$SERVICE_TEST_ROOT/loaded"
+      ;;
+    bootstrap)
+      [ ! -f "$SERVICE_TEST_ROOT/loaded" ] || return 5
+      cp "$4" "$SERVICE_TEST_ROOT/loaded"
+      ;;
+    kickstart) [ -f "$SERVICE_TEST_ROOT/loaded" ] || return 5 ;;
+    *) return 97 ;;
+  esac
+  [ "$fail_this_call" = false ] || return 5
+}
+if [ "$1" = rollback ]; then
+  rollback_transaction "$transaction_run"
+  exit $?
+fi
+record_initial_service_state macos aerospace
+trap 'service_exit=$?; trap - 0; rollback_transaction "$transaction_run"; printf "%s\n" "$?" >"$SERVICE_TEST_ROOT/rollback-exit"; ownership_release; exit "$service_exit"' 0
+activate_login_service macos
+die 'fixture failure after activation'
+""")
+mac_harness.chmod(0o700)
+
+def mac_fixture(name, loaded=True):
+    p,e=fixture(name)
+    e['DOTFILES_BOOTSTRAP_TEST_SERVICE_LOADED']=str(loaded).lower()
+    relative='Library/LaunchAgents/dev.ruohao.tmux-workspace.plist'
+    (p/'home'/relative).write_text('new')
+    j=p/'journal';j.mkdir()
+    backup=j/'backup'/relative;backup.parent.mkdir(parents=True);backup.write_text('old')
+    for key,value in {'status':'active','platform':'macos','managed.paths':relative,'backed-up.paths':relative}.items():
+        (j/key).write_text(value+'\n')
+    if loaded: (p/'loaded').write_text('old')
+    return p,e,relative
+
+def mac_run(env, mode='apply'):
+    return subprocess.run([str(mac_harness),mode],env=env,capture_output=True,text=True,timeout=5)
+
+for loaded in [True,False]:
+    operations=['bootstrap','kickstart'] + (['bootout'] if loaded else [])
+    for operation in operations:
+        for phase in ['before','after']:
+            name=f'macos-{loaded}-{operation}-{phase}'
+            p,e,relative=mac_fixture(name,loaded)
+            e.update(MAC_FAIL_OPERATION=operation,MAC_FAIL_PHASE=phase)
+            assert mac_run(e).returncode!=0, name+': manager failure ignored'
+            assert (p/'rollback-exit').read_text().strip()=='0', name+': automatic rollback failed'
+            assert (p/'journal/status').read_text().strip()=='rolled-back', name+': rollback incomplete'
+            assert (p/'home'/relative).read_text()=='old', name+': old configuration not restored'
+            if loaded:
+                assert (p/'loaded').read_text()=='old', name+': previous service not restored'
+            else:
+                assert not (p/'loaded').exists(), name+': new service remained loaded'
+            before=actions(p)
+            assert mac_run(e,'rollback').returncode==0 and actions(p)==before, name+': retry was not idempotent'
+
+for phase,unavailable in [('before',False),('after',False),('after',True)]:
+    p,e,relative=mac_fixture(f'macos-cleanup-{phase}-{unavailable}')
+    e.update(MAC_FAIL_OPERATION='rollback-bootout',MAC_FAIL_PHASE=phase)
+    if unavailable: e['MAC_QUERY_UNAVAILABLE']='1'
+    assert mac_run(e).returncode!=0
+    if phase=='before' or unavailable:
+        assert (p/'rollback-exit').read_text().strip()!='0', 'rollback ignored loaded/unknown manager state'
+        assert (p/'home'/relative).read_text()=='new', 'configuration restored before safe service cleanup'
+        e.pop('MAC_QUERY_UNAVAILABLE',None)
+        assert mac_run(e,'rollback').returncode==0, 'rollback retry failed'
+    else:
+        assert (p/'rollback-exit').read_text().strip()=='0', 'verified absent service prevented rollback'
+    assert (p/'home'/relative).read_text()=='old' and (p/'loaded').read_text()=='old', 'retry did not restore previous state'
+
+p,e=fixture('legacy')
+j=p/'journal';j.mkdir()
+for key,value in {'service-platform':'linux','service-was-installed':'true','service-was-enabled':'true',
+    'service-was-active':'true','service-new-loaded':'false'}.items(): (j/key).write_text(value+'\n')
+assert run(e,'rollback').returncode==0
+assert actions(p)==['systemctl --user disable --now tmux-workspace.service','systemctl --user daemon-reload',
+    'systemctl --user enable tmux-workspace.service','systemctl --user start tmux-workspace.service'], 'legacy rollback compatibility broke'
+
+p,e=fixture('corrupt')
+assert run(e,'apply','linux','hypr').returncode==0
+(p/'commands').write_text('');(p/'journal/services.list').write_text('../other.service\n')
+assert run(e,'rollback').returncode!=0 and not actions(p), 'corrupt journal reached service manager'
+print('Clipboard service transaction assertions: ok')
+CLIPBOARD_SERVICE_TEST
+  then
+    pass 'clipboard service inventory, private injection, asset preflight, ownership, failures, and rollback'
+  else
+    fail 'clipboard service inventory, private injection, asset preflight, ownership, failures, and rollback'
+  fi
+}
+
+run_repository_url_tests() {
+  if python3 - "$bootstrap" "$test_tmp/repository-urls" <<'REPOSITORY_URL_TEST'
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+bootstrap = Path(sys.argv[1]).resolve()
+root = Path(sys.argv[2])
+root.mkdir()
+standalone = root / 'standalone' / 'bootstrap'
+standalone.parent.mkdir()
+shutil.copyfile(bootstrap, standalone)
+guard = root / 'guard'
+guard.mkdir()
+for command in ('dirname', 'uname', 'git', 'mktemp', 'id'):
+    stub = guard / command
+    stub.write_text('#!/bin/sh\nprintf "external command\\n" >>"$REPO_URL_TEST_COMMAND_LOG"\nexit 97\n')
+    stub.chmod(0o700)
+
+marker = 'repo-url-synthetic-secret'
+rejected = [
+    ('password', f'https://user:{marker}@example.invalid/dotfiles.git'),
+    ('username', f'http://{marker}@example.invalid/dotfiles.git'),
+    ('mixed-case', f'hTtPs://user:{marker}@example.invalid/dotfiles.git'),
+    ('empty-user', f'HTTPS://:{marker}@example.invalid/dotfiles.git'),
+    ('encoded-user', f'https://user%40mail:{marker}@example.invalid/dotfiles.git'),
+    ('query', f'https://example.invalid/dotfiles.git?token={marker}'),
+    ('fragment', f'http://example.invalid/dotfiles.git#{marker}'),
+    ('root-query', f'https://example.invalid?token={marker}'),
+    ('empty-query', 'https://example.invalid/dotfiles.git?'),
+    ('empty-fragment', 'https://example.invalid/dotfiles.git#'),
+    ('empty-userinfo', 'https://@example.invalid/dotfiles.git'),
+    ('http-helper', f'http::http://user:{marker}@example.invalid/dotfiles.git'),
+    ('https-helper', f'https::https://user:{marker}@example.invalid/dotfiles.git'),
+    ('helper-query', f'http::https://example.invalid/dotfiles.git?token={marker}'),
+    ('helper-fragment', f'https::https://example.invalid/dotfiles.git#{marker}'),
+]
+for name, prefix in [
+    ('http-one-slash', 'http:/'),
+    ('https-one-slash', 'https:/'),
+    ('http-three-slashes', 'http:///'),
+    ('https-three-slashes-mixed-case', 'HtTpS:///'),
+]:
+    rejected.extend([
+        (f'{name}-userinfo', f'{prefix}user:{marker}@example.invalid/dotfiles.git'),
+        (f'{name}-query', f'{prefix}example.invalid/dotfiles.git?token={marker}'),
+        (f'{name}-fragment', f'{prefix}example.invalid/dotfiles.git#{marker}'),
+    ])
+accepted = [
+    'https://example.invalid/dotfiles.git',
+    'http://example.invalid/dotfiles.git',
+    'hTtPs://example.invalid/dotfiles.git',
+    'https://example.invalid:8443/dotfiles.git',
+    'https://[::1]:8443/dotfiles.git',
+    'https://example.invalid/team@work/dotfiles.git',
+    'https://example.invalid/team%40work/repo%3Fname%23tag.git',
+    'ssh://git@example.invalid/dotfiles.git',
+    'git@example.invalid:team/dotfiles.git',
+    'file:///tmp/dotfiles.git',
+    '/tmp/dotfiles.git',
+    './dotfiles.git',
+    '../team@work/dotfiles.git',
+    '/tmp/dotfiles?copy#local.git',
+]
+
+def environment(case_root, platform, manager):
+    env = os.environ.copy()
+    env.update(
+        HOME=str(case_root / 'home'),
+        XDG_STATE_HOME=str(case_root / 'state'),
+        TMPDIR=str(case_root / 'tmp'),
+        DOTFILES_BOOTSTRAP_TESTING='1',
+        DOTFILES_BOOTSTRAP_TEST_PLATFORM=platform,
+        DOTFILES_BOOTSTRAP_TEST_MANAGER=manager,
+        DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES='1',
+        DOTFILES_BOOTSTRAP_TEST_PREPARE_DRY_RUN='0',
+    )
+    return env
+
+rejection_count = 0
+acceptance_count = 0
+errors = []
+for platform, manager in [('linux', 'pacman'), ('macos', 'homebrew')]:
+    for entrypoint in (bootstrap, standalone):
+        for mode in ('dry-run', 'apply'):
+            for name, url in rejected:
+                case = root / f'rejected-{rejection_count}'
+                case.mkdir()
+                env = environment(case, platform, manager)
+                command_log = case / 'commands'
+                env.update(PATH=str(guard), REPO_URL_TEST_COMMAND_LOG=str(command_log))
+                args = ['/bin/sh', str(entrypoint), '--window-manager', 'none', '--repo', url]
+                if mode == 'apply':
+                    args.append('--apply')
+                result = subprocess.run(args, env=env, capture_output=True, timeout=10)
+                output = result.stdout + result.stderr
+                label = f'{platform}/{entrypoint.parent.name}/{mode}/{name}'
+                if result.returncode != 2:
+                    errors.append(f'{label}: expected usage rejection')
+                if result.stdout or b'repository URL' not in result.stderr:
+                    errors.append(f'{label}: expected only a repository-input diagnostic')
+                if marker.encode() in output or url.encode() in output:
+                    errors.append(f'{label}: repository input leaked into output')
+                if command_log.exists():
+                    errors.append(f'{label}: reached an external command')
+                if any((case / path).exists() for path in ('home', 'state', 'tmp')):
+                    errors.append(f'{label}: created persistent or temporary state')
+                rejection_count += 1
+
+    for url in accepted:
+        case = root / f'accepted-{acceptance_count}'
+        case.mkdir()
+        result = subprocess.run(
+            ['/bin/sh', str(bootstrap), '--window-manager', 'none', '--repo', url],
+            env=environment(case, platform, manager), capture_output=True, timeout=10,
+        )
+        expected = f'Repository: {url}\n'.encode()
+        if result.returncode or expected not in result.stdout or result.stderr:
+            errors.append(f'{platform}/accepted-{acceptance_count}: supported repository form rejected or changed')
+        if any((case / path).exists() for path in ('home', 'state', 'tmp')):
+            errors.append(f'{platform}/accepted-{acceptance_count}: dry-run created state')
+        acceptance_count += 1
+
+for error in errors:
+    print(error, file=sys.stderr)
+print(f'Repository URL cases: {rejection_count} rejected, {acceptance_count} accepted, {len(errors)} failures')
+sys.exit(bool(errors))
+REPOSITORY_URL_TEST
+  then
+    pass 'repository URLs reject credentials before output, commands, or state and preserve supported forms'
+  else
+    fail 'repository URLs reject credentials before output, commands, or state and preserve supported forms'
+  fi
+}
+
 test_real_env=$(resolve_test_executable env) \
   || { printf '%s\n' 'test harness requires an absolute executable env' >&2; exit 1; }
 test_real_setsid=$(resolve_test_executable setsid) \
@@ -2792,7 +3626,23 @@ test_real_mktemp=$(resolve_test_executable mktemp) \
   || { printf '%s\n' 'test harness requires an absolute executable mktemp' >&2; exit 1; }
 
 test_tmp=$("$test_real_mktemp" -d "${TMPDIR:-/tmp}/dotfiles-bootstrap-test.XXXXXX")
+# Discover standard utilities from the runner before fixture PATH overrides.
+# Exclude all application/version providers (uv/node/Taplo/LSPs/etc.) so negative
+# provider cases keep their original restricted resolution semantics.
+test_utilities_bin=$test_tmp/utilities
+mkdir -p "$test_utilities_bin"
+for test_utility in awk basename cat chmod cmp cp cut date dd dirname env find git \
+  grep gzip head id kill ln ls mkdir mkfifo mktemp mv od paste perl printf ps pwd readlink \
+  realpath rm rmdir sed setsid sha256sum shasum sleep sort stat tail tar timeout \
+  touch tr uname unzip wc xargs xz; do
+  test_utility_source=$(resolve_test_executable "$test_utility") || continue
+  ln -s "$test_utility_source" "$test_utilities_bin/$test_utility"
+done
+DOTFILES_BOOTSTRAP_TEST_UTILITY_PATH=$test_utilities_bin
+DOTFILES_BOOTSTRAP_TEST_REAL_STAT=$(resolve_test_executable stat)
+export DOTFILES_BOOTSTRAP_TEST_UTILITY_PATH DOTFILES_BOOTSTRAP_TEST_REAL_STAT
 cleanup() {
+  [ "${DOTFILES_BOOTSTRAP_TEST_KEEP_FIXTURES:-0}" != 1 ] || return 0
   case "$test_tmp" in
     "${TMPDIR:-/tmp}"/dotfiles-bootstrap-test.*) rm -rf "$test_tmp" ;;
   esac
@@ -2801,6 +3651,25 @@ trap cleanup 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+run_repository_url_tests
+if [ "${DOTFILES_BOOTSTRAP_TEST_FOCUS:-}" = repository-url ]; then
+  printf '1..%s\n' "$tests"
+  [ "$failures" -eq 0 ]
+  exit $?
+fi
+
+run_clipboard_capture_tests
+run_clipboard_service_tests
+# Synthetic package unit is used only by test-mode service resolution.
+DOTFILES_BOOTSTRAP_TEST_CLIPHIST_UNIT_PATH=$test_tmp/cliphist.service
+export DOTFILES_BOOTSTRAP_TEST_CLIPHIST_UNIT_PATH
+printf '%s\n' '[Service]' 'ExecStart=/bin/true' >"$DOTFILES_BOOTSTRAP_TEST_CLIPHIST_UNIT_PATH"
+if [ "${DOTFILES_BOOTSTRAP_TEST_FOCUS:-}" = clipboard ]; then
+  printf '1..%s\n' "$tests"
+  [ "$failures" -eq 0 ]
+  exit $?
+fi
 
 direct_probe_bootstrap=$test_tmp/direct-probe-bootstrap
 make_direct_probe_bootstrap "$bootstrap" "$direct_probe_bootstrap"
@@ -2820,7 +3689,7 @@ mkdir -p "$parquet_uv_selection_home/.local/bin" "$parquet_uv_selection_bin"
 make_version_command "$parquet_uv_selection_bin/uv" 'uv 0.10.0'
 make_version_command "$parquet_uv_selection_home/.local/bin/uv" 'uv 0.12.5'
 run_capture "$parquet_uv_selection_root/output" env \
-  PATH="$parquet_uv_selection_bin:/usr/bin:/bin" \
+  PATH="$parquet_uv_selection_bin:$test_utilities_bin" \
   HOME="$parquet_uv_selection_home" \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=uv-executable \
   "$parquet_function_bootstrap"
@@ -2834,7 +3703,7 @@ fi
 
 make_version_command "$parquet_uv_selection_bin/uv" 'not a uv version'
 run_capture "$parquet_uv_selection_root/malformed.output" env \
-  PATH="$parquet_uv_selection_bin:/usr/bin:/bin" \
+  PATH="$parquet_uv_selection_bin:$test_utilities_bin" \
   HOME="$parquet_uv_selection_home" \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=uv-executable \
   "$parquet_function_bootstrap"
@@ -2848,7 +3717,7 @@ fi
 
 make_version_command "$parquet_uv_selection_bin/uv" 'release 99.0.0'
 run_capture "$parquet_uv_selection_root/arbitrary-numeric.output" env \
-  PATH="$parquet_uv_selection_bin:/usr/bin:/bin" \
+  PATH="$parquet_uv_selection_bin:$test_utilities_bin" \
   HOME="$parquet_uv_selection_home" \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=uv-executable \
   "$parquet_function_bootstrap"
@@ -2862,7 +3731,7 @@ fi
 
 make_failing_version_command "$parquet_uv_selection_bin/uv" 'uv 99.0.0' 42
 run_capture "$parquet_uv_selection_root/nonzero-version.output" env \
-  PATH="$parquet_uv_selection_bin:/usr/bin:/bin" \
+  PATH="$parquet_uv_selection_bin:$test_utilities_bin" \
   HOME="$parquet_uv_selection_home" \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=uv-executable \
   "$parquet_function_bootstrap"
@@ -2878,7 +3747,7 @@ make_version_command \
   "$parquet_uv_selection_bin/uv" \
   '  uv 0.11.6 (x86_64-unknown-linux-gnu)  '
 run_capture "$parquet_uv_selection_root/suffixed-version.output" env \
-  PATH="$parquet_uv_selection_bin:/usr/bin:/bin" \
+  PATH="$parquet_uv_selection_bin:$test_utilities_bin" \
   HOME="$parquet_uv_selection_home" \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=uv-executable \
   "$parquet_function_bootstrap"
@@ -2899,7 +3768,7 @@ make_parquet_uv_tool_command "$parquet_probe_bin/uv"
 prepare_parquet_tool_environment "$parquet_probe_tools"
 : >"$parquet_probe_marker"
 run_capture "$parquet_probe_root/exact.output" env \
-  PATH="$parquet_probe_bin:/usr/bin:/bin" \
+  PATH="$parquet_probe_bin:$test_utilities_bin" \
   HOME="$parquet_probe_root/home" \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=viewer-satisfied \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_ROOT="$parquet_probe_tools" \
@@ -2912,7 +3781,7 @@ else
 fi
 
 run_capture "$parquet_probe_root/mismatch.output" env \
-  PATH="$parquet_probe_bin:/usr/bin:/bin" \
+  PATH="$parquet_probe_bin:$test_utilities_bin" \
   HOME="$parquet_probe_root/home" \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=viewer-satisfied \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_ROOT="$parquet_probe_tools" \
@@ -2925,7 +3794,7 @@ else
 fi
 
 run_capture "$parquet_probe_root/malformed.output" env \
-  PATH="$parquet_probe_bin:/usr/bin:/bin" \
+  PATH="$parquet_probe_bin:$test_utilities_bin" \
   HOME="$parquet_probe_root/home" \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=viewer-satisfied \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_ROOT=relative/tool-root \
@@ -2951,7 +3820,7 @@ for parquet_missing_executable in python vd; do
       ;;
   esac
   run_capture "$parquet_probe_root/missing-$parquet_missing_executable.output" env \
-    PATH="$parquet_probe_bin:/usr/bin:/bin" \
+    PATH="$parquet_probe_bin:$test_utilities_bin" \
     HOME="$parquet_probe_root/home" \
     DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=viewer-satisfied \
     DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_ROOT="$parquet_missing_root" \
@@ -2967,7 +3836,7 @@ done
 parquet_install_actions=$parquet_probe_root/install.actions
 : >"$parquet_install_actions"
 run_capture "$parquet_probe_root/install-failure.output" env \
-  PATH="$parquet_probe_bin:/usr/bin:/bin" \
+  PATH="$parquet_probe_bin:$test_utilities_bin" \
   HOME="$parquet_probe_root/home" \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=install \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_ROOT="$parquet_probe_tools" \
@@ -2983,7 +3852,7 @@ fi
 
 : >"$parquet_install_actions"
 run_capture "$parquet_probe_root/install-mismatch.output" env \
-  PATH="$parquet_probe_bin:/usr/bin:/bin" \
+  PATH="$parquet_probe_bin:$test_utilities_bin" \
   HOME="$parquet_probe_root/home" \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=install \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_TOOL_ROOT="$parquet_probe_tools" \
@@ -3000,7 +3869,7 @@ fi
 parquet_unsafe_install_marker=$parquet_probe_root/unsafe-install.invoked
 : >"$parquet_install_actions"
 run_capture "$parquet_probe_root/unsafe-tool-root.output" env \
-  PATH="$parquet_probe_bin:/usr/bin:/bin" \
+  PATH="$parquet_probe_bin:$test_utilities_bin" \
   HOME="$parquet_probe_root/home" \
   UV_TOOL_DIR=/ \
   DOTFILES_BOOTSTRAP_TEST_PARQUET_FUNCTION=install \
@@ -3057,7 +3926,7 @@ printf '%s\n' 'managed venv sentinel' \
 parquet_project_before=$(project_state_fingerprint "$parquet_project_root")
 run_capture_in_directory \
   "$parquet_probe_root/install-sanitized.output" "$parquet_project_root" env \
-  PATH="$parquet_probe_bin:/usr/bin:/bin" \
+  PATH="$parquet_probe_bin:$test_utilities_bin" \
   HOME="$parquet_probe_root/home" \
   UV_TOOL_DIR="$parquet_probe_tools" \
   UV_TOOL_BIN_DIR="$parquet_probe_root/custom-bin" \
@@ -3111,6 +3980,12 @@ if [ "$parquet_project_after" = "$parquet_project_before" ]; then
   pass 'data-query tool repair preserves project and virtual-environment state'
 else
   fail 'data-query tool repair preserves project and virtual-environment state'
+fi
+
+if [ "${DOTFILES_BOOTSTRAP_TEST_FOCUS:-}" = parquet ]; then
+  printf '1..%s\n' "$tests"
+  [ "$failures" -eq 0 ]
+  exit $?
 fi
 
 run_capture "$test_tmp/help" "$bootstrap" --help
@@ -3237,7 +4112,7 @@ require_contains "$linux_output" '.config/systemd/user/tmux-workspace.service' \
   'Linux plan includes the tmux workspace user service'
 require_contains "$linux_output" 'systemctl --user daemon-reload' \
   'Linux dry-run reports the user daemon reload'
-require_contains "$linux_output" 'systemctl --user enable --now tmux-workspace.service' \
+require_contains "$linux_output" 'systemctl --user enable tmux-workspace.service' \
   'Linux dry-run reports service enablement and startup'
 require_excludes "$linux_output" '.config/tmux/conf/platform/macos.conf' 'Linux plan excludes macOS tmux adapter'
 require_excludes "$linux_output" 'Library/Application Support/com.mitchellh.ghostty/config.ghostty' 'Linux plan excludes macOS Ghostty entrypoint'
@@ -3425,6 +4300,7 @@ run_capture "$test_tmp/apt-apply.output" env \
   DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
   DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
   DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS= \
   DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=0 \
   DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES=1 \
   DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$apt_apply_log" \
@@ -3623,7 +4499,7 @@ for runtime_apply_kind in setsid env; do
     || runtime_apply_pass=false
   [ "$runtime_apply_seed_preserved" = true ] \
     || runtime_apply_pass=false
-  [ ! -e "$runtime_apply_home/.local" ] || runtime_apply_pass=false
+  only_ownership_coordination "$runtime_apply_home" || runtime_apply_pass=false
   [ "$runtime_apply_residue" = true ] || runtime_apply_pass=false
   case "$runtime_apply_kind" in
     setsid)
@@ -3648,7 +4524,7 @@ for runtime_apply_kind in setsid env; do
       run_direct_probe_case \
         setsid-contract "$setsid_contract_command" \
         "$direct_probe_bootstrap" \
-        PATH="$setsid_contract_bin:/usr/bin:/bin"
+        PATH="$setsid_contract_bin:$test_utilities_bin"
       [ "$run_status" -eq 42 ] || runtime_apply_pass=false
       grep -Fqx "capability|setsid|$setsid_contract_bin/setsid|-f|-w|/bin/sh|-c|exit 0" \
         "$setsid_contract_log" 2>/dev/null \
@@ -3687,11 +4563,11 @@ for runtime_apply_kind in setsid env; do
       run_direct_probe_case \
         stored-runtime-reuse "$stored_runtime_command" \
         "$direct_probe_bootstrap" \
-        PATH="$stored_runtime_bin:/usr/bin:/bin" \
+        PATH="$stored_runtime_bin:$test_utilities_bin" \
         DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_RUNTIME_AUDIT="$stored_runtime_audit" \
         DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_EXPECTED_SETSID="$stored_runtime_bin/setsid" \
         DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_EXPECTED_ENV="$stored_runtime_bin/env" \
-        DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_POST_GATE_PATH="$stored_runtime_poison_bin:/usr/bin:/bin"
+        DOTFILES_BOOTSTRAP_TEST_DIRECT_PROBE_POST_GATE_PATH="$stored_runtime_poison_bin:$test_utilities_bin"
       stored_runtime_expected_paths=$(printf '%s\n' \
         "setsid|$stored_runtime_bin/setsid" \
         "env|$stored_runtime_bin/env")
@@ -3769,7 +4645,7 @@ for runtime_boundary_kind in setsid env; do
       || runtime_boundary_pass=false
     [ "$runtime_boundary_seed_preserved" = true ] \
       || runtime_boundary_pass=false
-    [ ! -e "$runtime_boundary_home/.local" ] \
+    only_ownership_coordination "$runtime_boundary_home" \
       || runtime_boundary_pass=false
     [ "$runtime_boundary_residue" = true ] \
       || runtime_boundary_pass=false
@@ -4440,7 +5316,8 @@ for child_exit_kind in exit-zero-child exit-nonzero-child; do
     = "$child_exit_pid|$child_exit_child_pid" ] || child_exit_pass=false
   [ "$(cat "$child_exit_relation_file.ready" 2>/dev/null || true)" = ready ] \
     || child_exit_pass=false
-  if grep -Fq 'group-term|' "$child_exit_audit_file" 2>/dev/null; then
+  # A target that exits before its child still requires owned group cleanup.
+  if [ "$(grep -Fc 'group-term|' "$child_exit_audit_file" 2>/dev/null || true)" -ne 1 ]; then
     child_exit_pass=false
   fi
   case "$child_exit_child_pid" in
@@ -4706,7 +5583,7 @@ make_term_ignoring_stdio_command \
   "$probe_signal_ready_file"
 set +e
 env \
-  PATH="$probe_signal_bin:/usr/bin:/bin" \
+  PATH="$probe_signal_bin:$test_utilities_bin" \
   TMPDIR="$probe_signal_tmp" \
   HOME="$probe_signal_home" \
   XDG_STATE_HOME="$probe_signal_state" \
@@ -4830,7 +5707,7 @@ prepare_satisfaction_commands "$probe_race_bin" \
   22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 0.11.6
 set +e
 env \
-  PATH="$probe_race_bin:/usr/bin:/bin" \
+  PATH="$probe_race_bin:$test_utilities_bin" \
   TMPDIR="$probe_race_tmp" \
   HOME="$probe_race_home" \
   XDG_STATE_HOME="$probe_race_state" \
@@ -4932,7 +5809,7 @@ make_probe_temp_signal_bootstrap "$bootstrap" "$probe_temp_bootstrap"
 prepare_satisfaction_commands "$probe_temp_bin" \
   22.0.0 10.0.0 5.6.0 wait 3.19.1 wait 1.1.411 1.24.0 0.11.6
 run_capture "$probe_temp_root/output" env \
-  PATH="$probe_temp_bin:/usr/bin:/bin" \
+  PATH="$probe_temp_bin:$test_utilities_bin" \
   TMPDIR="$probe_temp_tmp" \
   HOME="$probe_temp_home" \
   XDG_STATE_HOME="$probe_temp_state" \
@@ -4996,7 +5873,7 @@ make_term_ignoring_stdio_command \
   "$probe_repeat_ready_file"
 set +e
 env \
-  PATH="$probe_repeat_bin:/usr/bin:/bin" \
+  PATH="$probe_repeat_bin:$test_utilities_bin" \
   TMPDIR="$probe_repeat_tmp" \
   HOME="$probe_repeat_home" \
   XDG_STATE_HOME="$probe_repeat_state" \
@@ -5199,6 +6076,525 @@ awk -F '\t' -v OFS='\t' \
   >"$managed_fixture_root/manifests/packages-direct.tsv.new"
 mv "$managed_fixture_root/manifests/packages-direct.tsv.new" \
   "$managed_fixture_root/manifests/packages-direct.tsv"
+
+managed_scope_root=$test_tmp/managed-tool-dry-run
+managed_scope_home=$managed_scope_root/home
+managed_scope_tmp=$managed_scope_root/tmp
+managed_scope_output=$managed_scope_root/output
+managed_scope_probe_pid=$managed_scope_root/taplo-probe.pid
+mkdir -p "$managed_scope_home" "$managed_scope_tmp"
+managed_scope_roots_before=$(managed_probe_root_set "$managed_scope_tmp")
+managed_scope_processes_before=$(managed_probe_process_set "$managed_scope_tmp")
+run_capture "$managed_scope_output" env \
+  PATH="$managed_scope_home/.local/bin:$test_utilities_bin" \
+  TMPDIR="$managed_scope_tmp" \
+  HOME="$managed_scope_home" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_ARCH=x86_64 \
+  DOTFILES_BOOTSTRAP_TEST_TAPLO_PROBE_PID_FILE="$managed_scope_probe_pid" \
+  "$managed_fixture_root/bootstrap" --managed-tool taplo
+managed_scope_text=$(cat "$managed_scope_output")
+if [ "$run_status" -eq 0 ] \
+  && printf '%s\n' "$managed_scope_text" | grep -Fq 'Managed tool: taplo' \
+  && printf '%s\n' "$managed_scope_text" | grep -Fq 'State: missing' \
+  && printf '%s\n' "$managed_scope_text" | grep -Fq 'Action: install' \
+  && [ ! -e "$managed_scope_home/.local" ] \
+  && managed_probe_state_matches \
+    "$managed_scope_tmp" \
+    "$managed_scope_roots_before" \
+    "$managed_scope_processes_before" \
+    "$managed_scope_probe_pid"; then
+  pass 'managed Taplo dry-run is accepted without a window-manager and leaves no persistent or probe state'
+else
+  fail 'managed Taplo dry-run is accepted without a window-manager and leaves no persistent or probe state'
+fi
+
+managed_apply_root=$test_tmp/managed-tool-apply
+managed_apply_home=$managed_apply_root/home
+managed_apply_tmp=$managed_apply_root/tmp
+managed_apply_output=$managed_apply_root/output
+managed_apply_log=$managed_apply_root/commands
+managed_apply_probe_pid=$managed_apply_root/taplo-probe.pid
+mkdir -p "$managed_apply_home" "$managed_apply_tmp"
+managed_apply_roots_before=$(managed_probe_root_set "$managed_apply_tmp")
+managed_apply_processes_before=$(managed_probe_process_set "$managed_apply_tmp")
+run_capture "$managed_apply_output" env \
+  PATH="$managed_apply_home/.local/bin:$test_utilities_bin" \
+  TMPDIR="$managed_apply_tmp" \
+  HOME="$managed_apply_home" \
+  DOTFILES_BOOTSTRAP_TESTING=1 \
+  DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+  DOTFILES_BOOTSTRAP_TEST_ARCH=x86_64 \
+  DOTFILES_BOOTSTRAP_TEST_REAL_MANAGED_INSTALL=1 \
+  DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$managed_fixture_download" \
+  DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$managed_apply_log" \
+  DOTFILES_BOOTSTRAP_TEST_TAPLO_PROBE_PID_FILE="$managed_apply_probe_pid" \
+  "$managed_fixture_root/bootstrap" --apply --managed-tool taplo
+managed_apply_text=$(cat "$managed_apply_output")
+managed_apply_target=$managed_apply_home/.local/opt/taplo-0.10.0-x86_64
+managed_apply_link=$managed_apply_home/.local/bin/taplo
+if [ "$run_status" -eq 0 ] \
+  && printf '%s\n' "$managed_apply_text" | grep -Fqx 'Mode: apply' \
+  && printf '%s\n' "$managed_apply_text" | grep -Fqx 'State: missing' \
+  && printf '%s\n' "$managed_apply_text" | grep -Fqx 'Action: install' \
+  && [ -x "$managed_apply_target/taplo" ] \
+  && [ ! -L "$managed_apply_target/taplo" ] \
+  && [ "$(readlink "$managed_apply_link")" = "$managed_apply_target/taplo" ] \
+  && [ "$("$managed_apply_link" --version)" = 'taplo 0.10.0' ] \
+  && [ -s "$managed_apply_probe_pid" ] \
+  && managed_probe_state_matches \
+    "$managed_apply_tmp" \
+    "$managed_apply_roots_before" \
+    "$managed_apply_processes_before" \
+    "$managed_apply_probe_pid"; then
+  pass 'managed Taplo apply publishes only the verified Arch asset and leaves no probe residue'
+else
+  fail 'managed Taplo apply publishes only the verified Arch asset and leaves no probe residue'
+fi
+
+managed_apply_entries=$(find "$managed_apply_home" -mindepth 1 -printf '%P\n' | LC_ALL=C sort)
+managed_apply_expected_entries=$(printf '%s\n' \
+  '.local' '.local/bin' '.local/bin/taplo' '.local/opt' \
+  '.local/opt/taplo-0.10.0-x86_64' '.local/opt/taplo-0.10.0-x86_64/taplo' \
+  '.local/state' '.local/state/dotfiles-ownership')
+if [ "$managed_apply_entries" = "$managed_apply_expected_entries" ] \
+  && [ "$(stat -c '%a' "$managed_apply_target/taplo")" = 755 ] \
+  && ! grep -Eq 'pacman|apt-get|brew|npm|uv|git|systemctl|launchctl' \
+    "$managed_apply_log"; then
+  pass 'managed Taplo apply creates exactly its permitted paths and excludes unrelated commands'
+else
+  fail 'managed Taplo apply creates exactly its permitted paths and excludes unrelated commands'
+fi
+
+# Managed-scope parser checks include explicit empty values and both flag orders.
+prepare_managed_scope_case parser
+assert_managed_scope_readonly 2 '--managed-tool requires a tool name' \
+  'managed scope rejects a missing tool' --managed-tool
+assert_managed_scope_readonly 2 '--managed-tool may be specified only once' \
+  'managed scope rejects duplicate selection' --managed-tool taplo --managed-tool taplo
+assert_managed_scope_readonly 2 '--managed-tool may be specified only once' \
+  'managed scope rejects duplicate empty selection' --managed-tool '' --managed-tool taplo
+assert_managed_scope_readonly 2 'unsupported managed tool:' \
+  'managed scope rejects an empty tool' --managed-tool ''
+assert_managed_scope_readonly 2 'unsupported managed tool: unknown' \
+  'managed scope rejects an unknown tool' --managed-tool unknown
+assert_managed_scope_readonly 2 'unknown option: unexpected' \
+  'managed scope rejects positional arguments' --managed-tool taplo unexpected
+assert_managed_scope_readonly 2 'positional arguments are not supported' \
+  'managed scope rejects arguments after the separator' --managed-tool taplo -- unexpected
+for scope_flag in window-manager repo ref rollback allow-community-packages; do
+  case $scope_flag in
+    window-manager) set -- --window-manager none ;;
+    repo) set -- --repo https://example.invalid/repo ;;
+    ref) set -- --ref main ;;
+    rollback) set -- --rollback latest ;;
+    allow-community-packages) set -- --allow-community-packages ;;
+  esac
+  assert_managed_scope_readonly 2 "--managed-tool cannot be combined with --$scope_flag" \
+    "managed scope rejects --$scope_flag after selection" --managed-tool taplo "$@"
+  assert_managed_scope_readonly 2 "--managed-tool cannot be combined with --$scope_flag" \
+    "managed scope rejects --$scope_flag before selection" "$@" --managed-tool taplo
+done
+assert_managed_scope_readonly 2 '--managed-tool cannot be combined with --window-manager' \
+  'managed scope rejects an explicitly empty window manager' --managed-tool taplo --window-manager ''
+
+for scope_case in external-satisfied external-newer managed-satisfied external-old \
+  external-prerelease external-malformed external-empty external-missing-lsp \
+  external-hanging-lsp external-failing-version external-hanging-version \
+  target-only link-only target-file target-symlink link-file wrong-link \
+  hidden-managed wrong-version missing-lsp extra-file executable-symlink \
+  not-executable parent-file parent-symlink missing-path
+do
+  prepare_managed_scope_case "$scope_case"
+  scope_expected=1
+  scope_text='conflicting managed Taplo state'
+  scope_expect_probe=false
+  case $scope_case in
+    external-*)
+      scope_version='taplo 0.10.0'
+      scope_lsp=success
+      scope_text='existing Taplo command is unsatisfactory'
+      case $scope_case in
+        external-satisfied) scope_expected=0; scope_text='Action: skip external'; scope_expect_probe=true ;;
+        external-newer) scope_version='taplo 0.11.0'; scope_expected=0; scope_text='Action: skip external'; scope_expect_probe=true ;;
+        external-old) scope_version='taplo 0.9.3' ;;
+        external-prerelease) scope_version='taplo 0.10.0-rc.1' ;;
+        external-malformed) scope_version='unexpected taplo 0.10.0' ;;
+        external-empty) scope_version= ;;
+        external-missing-lsp) scope_lsp=fail; scope_expect_probe=true ;;
+        external-hanging-lsp) scope_lsp=hang; scope_expect_probe=true ;;
+      esac
+      make_taplo_command "$scope_bin/taplo" "$scope_version" "$scope_lsp"
+      case $scope_case in
+        external-failing-version)
+          printf '%s\n' '#!/bin/sh' 'printf "%s\n" "taplo 0.10.0"; exit 7' >"$scope_bin/taplo"
+          ;;
+        external-hanging-version)
+          # shellcheck disable=SC2016 # Expanded by the generated executable.
+          printf '%s\n' '#!/bin/sh' \
+            'printf "%s\n" "$$" >"$DOTFILES_BOOTSTRAP_TEST_TAPLO_PROBE_PID_FILE"' \
+            'exec sleep 30' >"$scope_bin/taplo"
+          scope_expect_probe=true
+          ;;
+      esac
+      ;;
+    parent-file) printf '%s\n' sentinel >"$scope_home/.local"; scope_text='parent must be a real directory' ;;
+    parent-symlink) mkdir "$scope_home/elsewhere"; ln -s "$scope_home/elsewhere" "$scope_home/.local"; scope_text='parent must be a real directory' ;;
+    missing-path) scope_path=$scope_bin:$test_utilities_bin; scope_text='activation directory is not present in PATH' ;;
+    *)
+      make_exact_managed_scope_layout
+      case $scope_case in
+        managed-satisfied) scope_expected=0; scope_text='Action: skip managed'; scope_expect_probe=true ;;
+        target-only) rm "$scope_link" ;;
+        link-only) rm -r "$scope_target" ;;
+        target-file) rm -r "$scope_target"; printf '%s\n' sentinel >"$scope_target" ;;
+        target-symlink) mv "$scope_target" "$scope_target.original"; ln -s "$scope_target.original" "$scope_target" ;;
+        link-file) rm "$scope_link"; printf '%s\n' sentinel >"$scope_link" ;;
+        wrong-link) rm "$scope_link"; ln -s "$scope_home/missing" "$scope_link" ;;
+        hidden-managed) scope_path=$scope_bin:$test_utilities_bin ;;
+        wrong-version) make_taplo_command "$scope_target/taplo" 'taplo 0.9.3' success ;;
+        missing-lsp) make_taplo_command "$scope_target/taplo" 'taplo 0.10.0' fail; scope_expect_probe=true ;;
+        extra-file) printf '%s\n' sentinel >"$scope_target/.unexpected" ;;
+        executable-symlink) mv "$scope_target/taplo" "$scope_home/elsewhere"; ln -s "$scope_home/elsewhere" "$scope_target/taplo" ;;
+        not-executable) chmod 0644 "$scope_target/taplo" ;;
+      esac
+      ;;
+  esac
+  for scope_mode in dry-run apply; do
+    set -- --managed-tool taplo
+    [ "$scope_mode" != apply ] || set -- --apply "$@"
+    scope_mode_text=$scope_text
+    case "$scope_mode:$scope_case" in
+      apply:parent-file|apply:parent-symlink) scope_mode_text="ownership: unsafe directory: $scope_home/.local" ;;
+    esac
+    assert_managed_scope_readonly "$scope_expected" "$scope_mode_text" \
+      "managed Taplo $scope_case $scope_mode preserves state and cleans probes" "$@"
+    if [ "$scope_expect_probe" = true ]; then
+      if [ -s "$scope_pid_file" ]; then
+        pass "managed Taplo $scope_case $scope_mode exercised the bounded probe"
+      else
+        fail "managed Taplo $scope_case $scope_mode exercised the bounded probe"
+      fi
+    fi
+  done
+done
+
+for scope_case in macos architecture standalone; do
+  prepare_managed_scope_case "$scope_case"
+  case $scope_case in
+    macos) scope_platform=macos; scope_text='supported only on Linux' ;;
+    architecture) scope_arch=riscv64; scope_text='unsupported architecture: riscv64' ;;
+    standalone) rm -r "$managed_failure_harness/manifests"; scope_text='requires local bootstrap manifests' ;;
+  esac
+  assert_managed_scope_readonly 1 "$scope_text" \
+    "managed Taplo rejects $scope_case before mutation" --apply --managed-tool taplo
+done
+
+prepare_managed_scope_case arm64
+scope_arch=arm64
+run_managed_scope --managed-tool taplo
+scope_arm_dry_status=$run_status
+run_managed_scope --apply --managed-tool taplo
+if [ "$scope_arm_dry_status" -eq 0 ] && [ "$run_status" -eq 0 ] \
+  && [ -x "$scope_home/.local/opt/taplo-0.10.0-arm64/taplo" ] \
+  && [ ! -e "$scope_target" ] && managed_scope_is_clean; then
+  pass 'managed Taplo installs the arm64 asset in its exact target'
+else
+  fail 'managed Taplo installs the arm64 asset in its exact target'
+fi
+assert_managed_scope_readonly 0 'Action: skip managed' \
+  'managed Taplo repeated dry-run preserves installed identities' --managed-tool taplo
+assert_managed_scope_readonly 0 'Action: skip managed' \
+  'managed Taplo repeated apply preserves installed identities' --apply --managed-tool taplo
+
+for scope_case in manifest-missing manifest-duplicate manifest-version manifest-format \
+  manifest-http manifest-sha manifest-sha-length checksum gzip empty wrong-staged-version \
+  missing-staged-lsp hanging-staged-version failing-staged-version publish-directory publish-link
+do
+  prepare_managed_scope_case "$scope_case"
+  scope_asset=$managed_failure_download/taplo-linux-x86_64.gz
+  case $scope_case in
+    manifest-missing) remove_failure_case_taplo_record; scope_text='missing direct asset' ;;
+    manifest-duplicate) duplicate_failure_case_taplo_record; scope_text='malformed direct asset entry' ;;
+    manifest-version) set_failure_case_taplo_field 4 0.11.0; scope_text='unexpected managed Taplo version' ;;
+    manifest-format) set_failure_case_taplo_field 5 tar.gz; scope_text='unexpected managed Taplo archive format' ;;
+    manifest-http) set_failure_case_taplo_field 6 http://fixtures.invalid/taplo.gz; scope_text='must use HTTPS' ;;
+    manifest-sha) set_failure_case_taplo_field 7 zzz; scope_text='invalid SHA-256' ;;
+    manifest-sha-length) set_failure_case_taplo_field 7 abc; scope_text='invalid SHA-256 length' ;;
+    checksum) printf '%s\n' damaged >>"$scope_asset"; scope_text='checksum mismatch' ;;
+    gzip) printf '%s\n' 'not gzip' >"$scope_asset"; scope_text='not valid gzip' ;;
+    empty) printf '' | gzip >"$scope_asset"; scope_text='did not produce one regular executable' ;;
+    wrong-staged-version|missing-staged-lsp|hanging-staged-version|failing-staged-version)
+      scope_version='taplo 0.10.0'
+      scope_lsp=success
+      scope_text='staged Taplo version does not match'
+      case $scope_case in
+        wrong-staged-version) scope_version='taplo 0.9.3' ;;
+        missing-staged-lsp) scope_lsp=fail; scope_text='does not expose lsp stdio' ;;
+      esac
+      make_taplo_command "$managed_failure_source/taplo" "$scope_version" "$scope_lsp"
+      case $scope_case in
+        hanging-staged-version)
+          # shellcheck disable=SC2016 # Expanded by the generated executable.
+          printf '%s\n' '#!/bin/sh' \
+            'printf "%s\n" "$$" >"$DOTFILES_BOOTSTRAP_TEST_TAPLO_PROBE_PID_FILE"' \
+            'exec sleep 30' >"$managed_failure_source/taplo"
+          ;;
+        failing-staged-version)
+          printf '%s\n' '#!/bin/sh' 'printf "%s\n" "taplo 0.10.0"; exit 7' \
+            >"$managed_failure_source/taplo"
+          ;;
+      esac
+      gzip -c "$managed_failure_source/taplo" >"$scope_asset"
+      ;;
+    publish-directory) scope_publish_failure=taplo-directory; scope_text='forced managed publication failure' ;;
+    publish-link) scope_publish_failure=taplo-link; scope_text='forced managed publication failure' ;;
+  esac
+  case $scope_case in
+    gzip|empty|wrong-staged-version|missing-staged-lsp|hanging-staged-version|failing-staged-version)
+      set_failure_case_taplo_field 7 "$(file_sha256_for_test "$scope_asset")"
+      ;;
+  esac
+  prepare_managed_scope_snapshot --apply
+  scope_tree_before=$(managed_scope_tree)
+  run_managed_scope --apply --managed-tool taplo
+  if [ "$run_status" -ne 0 ] && grep -Fq "$scope_text" "$scope_output" \
+    && [ "$(managed_scope_tree)" = "$scope_tree_before" ] \
+    && managed_scope_is_clean; then
+    pass "managed Taplo $scope_case failure removes only invocation-created state"
+  else
+    fail "managed Taplo $scope_case failure removes only invocation-created state"
+    sed 's/^/  scoped output: /' "$scope_output" >&2
+  fi
+done
+
+for scope_phase in before-journal after-journal; do
+  for scope_kind in regular directory; do
+    prepare_managed_scope_case "replacement-$scope_phase-$scope_kind"
+    scope_mutation_phase=$scope_phase
+    scope_mutation_kind=$scope_kind
+    scope_publish_failure=taplo-link
+    run_managed_scope --apply --managed-tool taplo
+    case $scope_kind in
+      regular) scope_replacement=$(cat "$scope_link" 2>/dev/null || true); scope_expected_replacement='mutated Taplo link bytes' ;;
+      directory) scope_replacement=$(cat "$scope_link/sentinel" 2>/dev/null || true); scope_expected_replacement='mutated Taplo link directory' ;;
+    esac
+    if [ "$run_status" -ne 0 ] && [ "$scope_replacement" = "$scope_expected_replacement" ] \
+      && [ ! -e "$scope_target" ] && managed_scope_is_clean \
+      && grep -Fq 'cleanup was incomplete' "$scope_output"; then
+      pass "managed Taplo preserves the $scope_phase $scope_kind replacement"
+    else
+      fail "managed Taplo preserves the $scope_phase $scope_kind replacement"
+      sed 's/^/  scoped output: /' "$scope_output" >&2
+    fi
+  done
+done
+
+for scope_registration_shell in sh bash; do
+for scope_signal in HUP INT TERM; do
+  case $scope_signal in
+    HUP) scope_signal_status=129 ;;
+    INT) scope_signal_status=130 ;;
+    TERM) scope_signal_status=143 ;;
+  esac
+  for scope_signal_at in 1 2; do
+    prepare_managed_scope_case "registration-$scope_registration_shell-$scope_signal-$scope_signal_at"
+    make_scoped_registration_signal_fixture
+    run_managed_scope --apply --managed-tool taplo
+    scope_interrupted_path=$(cat "$managed_failure_root/interrupted.path" 2>/dev/null || true)
+    if [ "$run_status" -eq "$scope_signal_status" ] \
+      && [ -n "$scope_interrupted_path" ] \
+      && [ ! -e "$scope_interrupted_path" ] && only_ownership_coordination "$scope_home" \
+      && managed_scope_is_clean; then
+      pass "managed Taplo $scope_registration_shell $scope_signal registration $scope_signal_at removes its exact root"
+    else
+      fail "managed Taplo $scope_registration_shell $scope_signal registration $scope_signal_at removes its exact root"
+      sed 's/^/  scoped output: /' "$scope_output" >&2
+    fi
+  done
+done
+done
+
+for scope_signal in HUP INT TERM; do
+  case $scope_signal in
+    HUP) scope_signal_status=129 ;;
+    INT) scope_signal_status=130 ;;
+    TERM) scope_signal_status=143 ;;
+  esac
+  for scope_phase in before-journal after-journal; do
+    prepare_managed_scope_case "publication-$scope_signal-$scope_phase"
+    awk -v phase="$scope_phase" -v signal_name="$scope_signal" \
+      -v marker="$managed_failure_root/signal.reached" '
+      { print }
+      $0 == "mutate_managed_link_for_test() {" {
+        print "  if [ \"$1\" = \"" phase "\" ]; then"
+        print "    printf \"%s\\n\" reached >\"" marker "\""
+        print "    kill -" signal_name " \"$$\""
+        print "  fi"
+        injected += 1
+      }
+      END { if (injected != 1) exit 1 }
+    ' "$scope_bootstrap" >"$scope_bootstrap.new"
+    mv "$scope_bootstrap.new" "$scope_bootstrap"
+    chmod 0755 "$scope_bootstrap"
+    run_managed_scope --apply --managed-tool taplo
+    if [ "$run_status" -eq "$scope_signal_status" ] \
+      && [ -s "$managed_failure_root/signal.reached" ] \
+      && only_ownership_coordination "$scope_home" && managed_scope_is_clean; then
+      pass "managed Taplo $scope_signal $scope_phase publication cleans its paths and probes"
+    else
+      fail "managed Taplo $scope_signal $scope_phase publication cleans its paths and probes"
+      sed 's/^/  scoped output: /' "$scope_output" >&2
+    fi
+  done
+  for scope_mode in dry-run apply; do
+    prepare_managed_scope_case "probe-$scope_signal-$scope_mode"
+    if [ "$scope_mode" = dry-run ]; then
+      make_taplo_command "$scope_bin/taplo" 'taplo 0.10.0' hang
+      set -- --managed-tool taplo
+    else
+      make_taplo_command "$managed_failure_source/taplo" 'taplo 0.10.0' hang
+      gzip -c "$managed_failure_source/taplo" >"$managed_failure_download/taplo-linux-x86_64.gz"
+      set_failure_case_taplo_field 7 "$(file_sha256_for_test "$managed_failure_download/taplo-linux-x86_64.gz")"
+      set -- --apply --managed-tool taplo
+    fi
+    # Reset async-shell inherited SIGINT before launching the real owner.
+    "$test_real_env" --default-signal=HUP,INT,TERM \
+      PATH="$scope_path" HOME="$scope_home" TMPDIR="$scope_tmp" \
+      DOTFILES_BOOTSTRAP_TESTING=1 \
+      DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
+      DOTFILES_BOOTSTRAP_TEST_ARCH=x86_64 \
+      DOTFILES_BOOTSTRAP_TEST_TAPLO_PROBE_PID_FILE="$scope_pid_file" \
+      DOTFILES_BOOTSTRAP_TEST_DOWNLOAD_ROOT="$managed_failure_download" \
+      "$scope_bootstrap" "$@" >"$scope_output" 2>&1 &
+    scope_owner=$!
+    scope_attempt=0
+    while [ ! -s "$scope_pid_file" ] && [ "$scope_attempt" -lt 100 ]; do
+      sleep 0.05
+      scope_attempt=$((scope_attempt + 1))
+    done
+    scope_signal_delivered=false
+    if [ -s "$scope_pid_file" ] \
+      && capture_test_process "$scope_owner" "$scope_bootstrap" \
+      && signal_verified_test_process "$scope_signal" "$scope_owner" \
+        "$captured_process_identity" "$captured_process_command"; then
+      scope_signal_delivered=true
+    else
+      kill_matching_test_process "$scope_owner" "$scope_bootstrap"
+    fi
+    set +e
+    wait "$scope_owner"
+    scope_probe_status=$?
+    set -e
+    if [ "$scope_signal_delivered" = true ] \
+      && [ "$scope_probe_status" -eq "$scope_signal_status" ] \
+      && only_ownership_coordination "$scope_home" && managed_scope_is_clean; then
+      pass "managed Taplo $scope_signal during $scope_mode probe leaves no owned state"
+    else
+      fail "managed Taplo $scope_signal during $scope_mode probe leaves no owned state"
+      sed 's/^/  scoped output: /' "$scope_output" >&2
+    fi
+  done
+done
+
+for scope_race in replace-link-before replace-link-after replace-directory-before \
+  replace-directory-after target-collision link-collision
+do
+  prepare_managed_scope_case "$scope_race"
+  make_scoped_publication_race_fixture
+  run_managed_scope --apply --managed-tool taplo
+  scope_race_preserved=false
+  case $scope_race in
+    replace-link-*)
+      [ "$(readlink "$scope_link" 2>/dev/null || true)" = "$scope_home/replacement" ] \
+        && scope_race_preserved=true
+      ;;
+    replace-directory-*|target-collision)
+      [ "$(cat "$scope_target/sentinel" 2>/dev/null || true)" = replacement ] \
+        && scope_race_preserved=true
+      ;;
+    link-collision)
+      [ "$(cat "$scope_link/sentinel" 2>/dev/null || true)" = replacement ] \
+        && [ "$(find "$scope_link" -mindepth 1 -maxdepth 1 -printf '%f\n')" = sentinel ] \
+        && scope_race_preserved=true
+      ;;
+  esac
+  if [ "$run_status" -ne 0 ] && [ "$scope_race_preserved" = true ] \
+    && [ -s "$managed_failure_root/race.reached" ] && managed_scope_is_clean; then
+    pass "managed Taplo $scope_race preserves the competing artifact"
+  else
+    fail "managed Taplo $scope_race preserves the competing artifact"
+    sed 's/^/  scoped output: /' "$scope_output" >&2
+  fi
+done
+
+prepare_managed_scope_case cross-device
+make_scoped_cross_device_commands
+run_managed_scope --apply --managed-tool taplo
+if [ "$run_status" -eq 0 ] && [ -x "$scope_target/taplo" ] \
+  && [ "$(stat -c '%a' "$scope_target/taplo")" = 755 ] \
+  && [ ! -e "$managed_failure_root/copy-fallback" ] \
+  && [ "$(find "$scope_home/.local/opt" -mindepth 1 -maxdepth 1 -printf '%f\n')" = taplo-0.10.0-x86_64 ] \
+  && managed_scope_is_clean; then
+  pass 'managed Taplo stages across devices before atomic final publication'
+else
+  fail 'managed Taplo stages across devices before atomic final publication'
+  sed 's/^/  scoped output: /' "$scope_output" >&2
+fi
+
+for scope_device_mode in target link; do
+  for scope_device_outcome in success failure HUP INT TERM; do
+    prepare_managed_scope_case "device-$scope_device_mode-$scope_device_outcome"
+    scope_device_case=$scope_device_mode
+    make_scoped_cross_device_commands
+    case $scope_device_outcome in
+      success) scope_device_status=0 ;;
+      failure) scope_publish_failure=taplo-link; scope_device_status=1 ;;
+      *)
+        scope_signal=$scope_device_outcome
+        scope_signal_at=3
+        scope_signal_parent=$scope_device_parent
+        scope_registration_shell='sh'
+        make_scoped_registration_signal_fixture
+        case $scope_signal in
+          HUP) scope_device_status=129 ;;
+          INT) scope_device_status=130 ;;
+          TERM) scope_device_status=143 ;;
+        esac
+        ;;
+    esac
+    run_managed_scope --apply --managed-tool taplo
+    scope_device_clean=true
+    case $scope_device_outcome in
+      success)
+        [ "$(stat -c '%a' "$scope_target/taplo")" = 755 ] \
+          && [ "$(readlink "$scope_link")" = "$scope_target/taplo" ] \
+          || scope_device_clean=false
+        [ "$(find "$scope_home/.local" -name 'dotfiles-bootstrap.*' -print)" = '' ] \
+          || scope_device_clean=false
+        ;;
+      failure) only_ownership_coordination "$scope_home" || scope_device_clean=false ;;
+      *)
+        only_ownership_coordination "$scope_home" \
+          && [ -s "$managed_failure_root/interrupted.path" ] \
+          || scope_device_clean=false
+        case $(cat "$managed_failure_root/interrupted.path" 2>/dev/null || true) in
+          "$scope_device_parent"/dotfiles-bootstrap.*) ;;
+          *) scope_device_clean=false ;;
+        esac
+        ;;
+    esac
+    if [ "$run_status" -eq "$scope_device_status" ] \
+      && [ "$scope_device_clean" = true ] && managed_scope_is_clean \
+      && [ ! -e "$managed_failure_root/copy-fallback" ]; then
+      pass "managed Taplo separate $scope_device_mode filesystem $scope_device_outcome cleans owned staging"
+    else
+      fail "managed Taplo separate $scope_device_mode filesystem $scope_device_outcome cleans owned staging"
+      sed 's/^/  scoped output: /' "$scope_output" >&2
+    fi
+  done
+done
 
 managed_stage_race_root=$test_tmp/managed-stage-registration-race
 managed_stage_race_harness=$managed_stage_race_root/harness
@@ -5534,7 +6930,7 @@ chmod 0755 "$standalone_collision_bin/git" "$standalone_collision_root/bootstrap
 printf '%s\n' 'standalone collision sentinel' \
   >"$standalone_collision_target/sentinel"
 run_capture "$standalone_collision_root/output" env \
-  PATH="$standalone_collision_bin:/usr/bin:/bin" \
+  PATH="$standalone_collision_bin:$test_utilities_bin" \
   HOME="$standalone_collision_home" \
   XDG_STATE_HOME="$standalone_collision_root/state" \
   DOTFILES_BOOTSTRAP_TESTING=1 \
@@ -5658,8 +7054,8 @@ do
   [ "$(cat "$managed_failure_home/preexisting-sentinel" 2>/dev/null || true)" \
     = 'pre-journal signal sentinel' ] || signal_cleanup_pass=false
   if [ "$signal_token" = parent-directory ]; then
-    path_exists_for_test "$managed_failure_home/.local" \
-      && signal_cleanup_pass=false
+    only_ownership_coordination "$managed_failure_home" \
+      || signal_cleanup_pass=false
   else
     [ -d "$signal_parent_one" ] && [ ! -L "$signal_parent_one" ] \
       || signal_cleanup_pass=false
@@ -5717,7 +7113,7 @@ for control_link_character in lf cr tab; do
     esac
     : >"$control_link_audit"
     run_capture "$control_link_root/$control_link_character-$control_link_position.output" env \
-      PATH="$control_link_bin:/usr/bin:/bin" \
+      PATH="$control_link_bin:$test_utilities_bin" \
       TMPDIR="$control_link_root" \
       HOME="$control_link_home" \
       XDG_STATE_HOME="$control_link_root/state" \
@@ -5762,7 +7158,7 @@ printf '%s\n' '#!/bin/sh' 'exit 0' >"$idempotent_bin/apt-cache"
 chmod 0755 "$idempotent_bin/dpkg-query" "$idempotent_bin/apt-cache"
 idempotent_before=$(managed_tree_digest "$idempotent_home")
 run_capture "$idempotent_root/output" env \
-  PATH="$idempotent_bin:/usr/bin:/bin" \
+  PATH="$idempotent_bin:$test_utilities_bin" \
   HOME="$idempotent_home" \
   XDG_STATE_HOME="$idempotent_root/state" \
   DOTFILES_BOOTSTRAP_TESTING=1 \
@@ -5902,7 +7298,7 @@ chmod 0755 "$rishot_plan_bin/pacman"
 for rishot_plan_profile in hypr i3 none; do
   rishot_plan_log=$rishot_plan_root/$rishot_plan_profile.commands
   run_capture "$rishot_plan_root/$rishot_plan_profile.output" env \
-    PATH="$rishot_plan_bin:/usr/bin:/bin" \
+    PATH="$rishot_plan_bin:$test_utilities_bin" \
     HOME="$rishot_plan_root/$rishot_plan_profile-home" \
     XDG_STATE_HOME="$rishot_plan_root/$rishot_plan_profile-state" \
     DOTFILES_BOOTSTRAP_TESTING=1 \
@@ -5979,7 +7375,7 @@ run_rishot_case() {
   mkdir -p "$rishot_case_home" "$rishot_case_tmp"
   : >"$rishot_case_log"
   run_capture "$rishot_fixture_root/$rishot_case_name.output" "$test_real_env" \
-    PATH="$rishot_case_bin:/usr/bin:/bin" \
+    PATH="$rishot_case_bin:$test_utilities_bin" \
     TMPDIR="$rishot_case_tmp" \
     HOME="$rishot_case_home" \
     XDG_STATE_HOME="$rishot_case_state" \
@@ -6144,7 +7540,7 @@ for rishot_signal_boundary in stage directory launcher; do
     "$rishot_signal_real_command"
   set +e
   "$test_real_env" \
-    PATH="$rishot_signal_bin:/usr/bin:/bin" \
+    PATH="$rishot_signal_bin:$test_utilities_bin" \
     TMPDIR="$rishot_signal_tmp" \
     HOME="$rishot_signal_home" \
     XDG_STATE_HOME="$rishot_signal_root/state" \
@@ -6177,7 +7573,8 @@ done
 
 rishot_directory_collision_home=$rishot_fixture_root/collision-directory-home
 rishot_directory_collision_root=$rishot_directory_collision_home/.local/share/rishot
-mkdir -p "$rishot_directory_collision_root"
+mkdir -p "$rishot_directory_collision_root" \
+  "$rishot_directory_collision_home/.local/state/dotfiles-ownership"
 printf '%s\n' sentinel >"$rishot_directory_collision_root/sentinel"
 rishot_collision_before=$(project_state_fingerprint \
   "$rishot_directory_collision_home/.local")
@@ -6199,7 +7596,8 @@ fi
 
 rishot_launcher_collision_home=$rishot_fixture_root/collision-launcher-home
 rishot_launcher_collision_path=$rishot_launcher_collision_home/.local/bin/rishot
-mkdir -p "$rishot_launcher_collision_home/.local/bin"
+mkdir -p "$rishot_launcher_collision_home/.local/bin" \
+  "$rishot_launcher_collision_home/.local/state/dotfiles-ownership"
 printf '%s\n' sentinel >"$rishot_launcher_collision_path"
 rishot_collision_before=$(project_state_fingerprint \
   "$rishot_launcher_collision_home/.local")
@@ -6226,7 +7624,7 @@ for rishot_parent_kind in local bin share; do
   case "$rishot_parent_kind" in
     local)
       rishot_parent_link=$rishot_parent_home/.local
-      rishot_parent_diagnostic='the Rishot local-data parent must be a real directory'
+      rishot_parent_diagnostic="dotfiles ownership: unsafe directory: $rishot_parent_link"
       ;;
     bin)
       mkdir -p "$rishot_parent_home/.local"
@@ -6404,6 +7802,8 @@ cp "$workspace_root/.codex/hooks.json" "$fixture_work/.codex/hooks.json"
 cp "$workspace_root/.local/bin/t" "$fixture_work/.local/bin/t"
 cp -R \
   "$workspace_root/.config/aerospace" \
+  "$workspace_root/.config/clipboard-history" \
+  "$workspace_root/.config/cliphist" \
   "$workspace_root/.config/ghostty" \
   "$workspace_root/.config/herdr" \
   "$workspace_root/.config/hypr" \
@@ -6431,6 +7831,7 @@ cp "$workspace_root/.config/tmux/tmux.conf" "$fixture_work/.config/tmux/tmux.con
 cp -R "$workspace_root/.config/tmux/scripts/." "$fixture_work/.config/tmux/scripts/"
 cp "$workspace_root/.config/tmux/tests/project-session.sh" \
   "$fixture_work/.config/tmux/tests/project-session.sh"
+cp -R "$workspace_root/.config/systemd/user/cliphist.service.d" "$fixture_work/.config/systemd/user/"
 cp "$workspace_root/.config/systemd/user/tmux-workspace.service" \
   "$fixture_work/.config/systemd/user/tmux-workspace.service"
 cp "$workspace_root/Library/Application Support/com.mitchellh.ghostty/config.ghostty" \
@@ -7119,9 +8520,12 @@ transaction_service_commands=$(cat "$transaction_service_log" 2>/dev/null || tru
 require_contains "$transaction_service_commands" \
   'systemctl --user daemon-reload' \
   'transactional apply reloads the systemd user manager'
-require_contains "$transaction_service_commands" \
-  'systemctl --user enable --now tmux-workspace.service' \
-  'transactional apply enables and starts the workspace service'
+require_excludes "$transaction_service_commands" \
+  'systemctl --user enable tmux-workspace.service' \
+  'transactional apply preserves existing workspace enablement'
+require_excludes "$transaction_service_commands" \
+  'systemctl --user start tmux-workspace.service' \
+  'transactional apply preserves an active workspace service'
 if [ -L "$transaction_home/.local/bin/tmux-workspace" ] \
   && [ "$(readlink "$transaction_home/.local/bin/tmux-workspace")" = \
     "$transaction_home/.config/tmux/scripts/workspace" ]; then
@@ -7131,9 +8535,9 @@ else
 fi
 transaction_run=$transaction_state/dotfiles-bootstrap/transaction-success
 if [ "$(cat "$transaction_run/service-platform" 2>/dev/null || true)" = linux ] \
-  && [ "$(cat "$transaction_run/service-was-installed" 2>/dev/null || true)" = true ] \
-  && [ "$(cat "$transaction_run/service-was-enabled" 2>/dev/null || true)" = true ] \
-  && [ "$(cat "$transaction_run/service-was-active" 2>/dev/null || true)" = true ]; then
+  && [ "$(cat "$transaction_run/services/tmux-workspace.service/was-installed" 2>/dev/null || true)" = true ] \
+  && [ "$(cat "$transaction_run/services/tmux-workspace.service/was-enabled" 2>/dev/null || true)" = true ] \
+  && [ "$(cat "$transaction_run/services/tmux-workspace.service/was-active" 2>/dev/null || true)" = true ]; then
   pass 'transaction records the previous workspace service state'
 else
   fail 'transaction records the previous workspace service state'
@@ -7181,19 +8585,19 @@ else
   fail 'manual rollback by run ID succeeds'
 fi
 transaction_rollback_service_commands=$(cat "$transaction_service_log" 2>/dev/null || true)
-require_contains "$transaction_rollback_service_commands" \
-  'systemctl --user disable --now tmux-workspace.service' \
-  'rollback stops and disables the deployed workspace service'
+require_excludes "$transaction_rollback_service_commands" \
+  'systemctl --user disable tmux-workspace.service' \
+  'rollback preserves existing workspace enablement'
+require_excludes "$transaction_rollback_service_commands" \
+  'systemctl --user stop tmux-workspace.service' \
+  'rollback preserves an already active workspace service'
 require_contains "$transaction_rollback_service_commands" \
   'systemctl --user daemon-reload' \
   'rollback reloads the restored systemd user configuration'
-if printf '%s\n' "$transaction_rollback_service_commands" \
-    | grep -Fqx 'systemctl --user enable tmux-workspace.service' \
-  && printf '%s\n' "$transaction_rollback_service_commands" \
-    | grep -Fqx 'systemctl --user start tmux-workspace.service'; then
-  pass 'rollback restores the previous enabled and active service state'
+if [ "$transaction_rollback_service_commands" = 'systemctl --user daemon-reload' ]; then
+  pass 'rollback leaves pre-existing workspace service state intact'
 else
-  fail 'rollback restores the previous enabled and active service state'
+  fail 'rollback leaves pre-existing workspace service state intact'
 fi
 if [ "$(cat "$transaction_home/.config/nvim/init.lua" 2>/dev/null || true)" = 'original nvim' ]; then
   pass 'rollback restores the original conflicting file'
@@ -7627,6 +9031,7 @@ run_capture "$test_tmp/package-report-apply.output" env \
   DOTFILES_BOOTSTRAP_TEST_PLATFORM=linux \
   DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
   DOTFILES_BOOTSTRAP_TEST_ALL_PACKAGES_MISSING=1 \
+  DOTFILES_BOOTSTRAP_TEST_SATISFIED_TOOLS= \
   DOTFILES_BOOTSTRAP_TEST_APT_GHOSTTY_OFFICIAL=0 \
   DOTFILES_BOOTSTRAP_TEST_COMMAND_LOG="$package_report_log" \
   DOTFILES_BOOTSTRAP_TEST_RUN_ID=package-report \

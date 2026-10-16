@@ -556,7 +556,27 @@ local function new(deps)
     end
     local lexical_root = lexical_module:sub(1, #lexical_module - #suffix)
 
-    local canonical_root, root_error = canonical_absolute(lexical_root, false)
+    -- File-level deployment leaves lexical_root writable and real. Trust the
+    -- canonical module's complete source tree, never a store-prefix heuristic.
+    local canonical_module, canonical_module_error = canonical_absolute(lexical_module, false)
+    if not canonical_module then
+      report.runner = { ok = false }
+      append_unique(
+        report.errors,
+        "could not resolve canonical data-query tool source: " .. tostring(canonical_module_error)
+      )
+      return
+    end
+    if canonical_module:sub(-#suffix) ~= suffix then
+      report.runner = { ok = false }
+      append_unique(
+        report.errors,
+        "data-query tool source does not match the expected nvim/lua/data_query/tool.lua layout"
+      )
+      return
+    end
+    local source_root = canonical_module:sub(1, #canonical_module - #suffix)
+    local canonical_root, root_error = canonical_absolute(source_root, false)
     if not canonical_root then
       report.runner = { ok = false }
       append_unique(

@@ -1,14 +1,107 @@
 #!/bin/sh
 set -eu
 
+# Keep parsing deterministic without passing the C locale to interactive programs.
+workspace_inherited_lc_all=${LC_ALL-}
+workspace_process_locale=
 LC_ALL=C
 export LC_ALL
 umask 077
 
-if [ "${TMUX_WORKSPACE_TESTING:-0}" != 1 ]; then
-  PATH=$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
-fi
-export PATH
+# Resolve the selected generation before touching any mutable workspace state.
+# Initial discovery uses only readlink; all subsequent tools come from the
+# selected HM profile whose immutable workspace source matches this helper.
+# The profile is switched before service activation; current-home is switched
+# afterwards, so either retained GCroot may corroborate that exact generation.
+canonical_workspace() (
+  source_path=$1
+  case $source_path in
+    */*) ;;
+    *) source_path=./$source_path ;;
+  esac
+  source_links=0
+  while [ -L "$source_path" ]; do
+    source_links=$((source_links + 1))
+    [ "$source_links" -le 40 ] || exit 1
+    # Native command -p lookup is preferable; minimal Nix builder images may
+    # provide readlink only in the inherited package environment.
+    source_target=$(command -p readlink "$source_path" 2>/dev/null \
+      || command readlink "$source_path") || exit 1
+    case $source_target in
+      /*) source_path=$source_target ;;
+      *) source_path=${source_path%/*}/$source_target ;;
+    esac
+  done
+  source_parent=${source_path%/*}
+  [ "$source_parent" != "$source_path" ] || source_parent=.
+  source_parent=$(CDPATH='' cd -P "$source_parent" && pwd -P) || exit 1
+  printf '%s/%s\n' "$source_parent" "${source_path##*/}"
+)
+workspace_source=
+workspace_generation=
+workspace_source_root=
+initialize_workspace_source() {
+workspace_source=$(canonical_workspace "$0") || exit 1
+workspace_generation=
+workspace_source_root=
+case $workspace_source in
+  /nix/store/*-dotfiles-runtime/.config/tmux/scripts/workspace)
+    workspace_source_root=${workspace_source%/.config/tmux/scripts/workspace}
+    workspace_profile_state=${XDG_STATE_HOME:-$HOME/.local/state}
+    if [ -d "$workspace_profile_state/nix/profiles" ]; then
+      workspace_pointer=$workspace_profile_state/nix/profiles/home-manager
+    else
+      workspace_username=$(command -p id -un 2>/dev/null || command id -un) || exit 1
+      workspace_pointer=/nix/var/nix/profiles/per-user/$workspace_username/home-manager
+    fi
+    workspace_generation=$(CDPATH='' cd -P "$workspace_pointer" && pwd -P) || {
+      printf '%s\n' 'tmux-workspace: selected Home Manager generation is unavailable' >&2
+      exit 1
+    }
+    case $workspace_generation in
+      /nix/store/*-home-manager-generation) ;;
+      *) printf '%s\n' 'tmux-workspace: selected generation is not immutable' >&2; exit 1 ;;
+    esac
+    # Native application paths are intentional fallbacks for resumed programs.
+    # The selected profile owns shared tools; inherited PATH never precedes it.
+    PATH=$workspace_generation/home-path/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+    export PATH
+    selected_workspace=$(canonical_workspace "$workspace_generation/home-files/.config/tmux/scripts/workspace") || exit 1
+    [ "$selected_workspace" = "$workspace_source" ] || {
+      printf '%s\n' 'tmux-workspace: selected generation does not match this helper' >&2
+      exit 1
+    }
+    python3 - "$workspace_pointer" "$workspace_generation" "$workspace_profile_state" <<'PYPROFILE'
+import os
+from pathlib import Path
+import stat
+import sys
+try:
+    pointer, generation, state = map(Path, sys.argv[1:])
+    # Owned links/directories only, including the mutable pointer's ancestors.
+    # The store generation itself must retain immutable root ownership/modes.
+    for path in [pointer, *pointer.parents]:
+        info = path.lstat()
+        if info.st_uid not in {0, os.geteuid()} or (not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
+            raise ValueError("unsafe selected-generation pointer")
+    info = generation.stat()
+    if info.st_uid != 0 or info.st_mode & 0o022 or pointer.resolve(strict=True) != generation:
+        raise ValueError("unsafe immutable generation")
+    retained = [state / "home-manager/gcroots" / name for name in ["current-home", "new-home"]]
+    if not any(path.exists() and path.lstat().st_uid in {0, os.geteuid()} and path.resolve(strict=True) == generation for path in retained):
+        raise ValueError("selected generation has no matching retained GCroot")
+except (OSError, RuntimeError, ValueError) as error:
+    sys.exit(f"tmux-workspace: {error}")
+PYPROFILE
+    ;;
+  *)
+    if [ "${TMUX_WORKSPACE_TESTING:-0}" != 1 ]; then
+      PATH=$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+    fi
+    export PATH
+    ;;
+esac
+}
 
 program=tmux-workspace
 schema=1
@@ -87,12 +180,27 @@ require_test_socket() {
   fi
 }
 
+select_process_locale() {
+  [ -z "$workspace_process_locale" ] || return 0
+  for locale_candidate in "$workspace_inherited_lc_all" "${LC_CTYPE-}" "${LANG-}" \
+    C.UTF-8 en_US.UTF-8; do
+    [ -n "$locale_candidate" ] || continue
+    if locale_charmap=$(LC_ALL="$locale_candidate" command locale charmap 2>/dev/null) \
+      && [ "$locale_charmap" = UTF-8 ]; then
+      workspace_process_locale=$locale_candidate
+      return 0
+    fi
+  done
+  die 'an available UTF-8 locale is required for tmux and resumed programs' 1
+}
+
 tmux_run() {
   require_test_socket
+  select_process_locale
   if [ -n "${TMUX_WORKSPACE_SOCKET-}" ]; then
-    command tmux -S "$TMUX_WORKSPACE_SOCKET" "$@"
+    LC_ALL="$workspace_process_locale" command tmux -S "$TMUX_WORKSPACE_SOCKET" "$@"
   else
-    command tmux "$@"
+    LC_ALL="$workspace_process_locale" command tmux "$@"
   fi
 }
 
@@ -149,12 +257,24 @@ pid_is_live() {
   kill -0 "$owner_pid" >/dev/null 2>&1
 }
 
+create_lock_directory() {
+  # Some multicall mkdir versions return success to concurrent creators.
+  # GNU compatibility names are available alongside them on those systems.
+  if command -v gnumkdir >/dev/null 2>&1; then
+    command gnumkdir "$1"
+  elif command -v gmkdir >/dev/null 2>&1; then
+    command gmkdir "$1"
+  else
+    command mkdir "$1"
+  fi
+}
+
 acquire_lock() {
   lock_name=$1
   lock_path=$workspace_runtime/$lock_name.lock
   lock_held=0
 
-  if mkdir "$lock_path" 2>/dev/null; then
+  if create_lock_directory "$lock_path" 2>/dev/null; then
     printf '%s\n' "$$" >"$lock_path/owner"
     chmod 0600 "$lock_path/owner"
     lock_held=1
@@ -164,13 +284,16 @@ acquire_lock() {
   [ ! -L "$lock_path" ] || return 1
   [ -d "$lock_path" ] || return 1
   lock_owner=$(sed -n '1p' "$lock_path/owner" 2>/dev/null || :)
+  # mkdir wins the lock before the PID is published. An ownerless lock may
+  # still be initializing; reclaim only a recorded, demonstrably dead owner.
+  case $lock_owner in ''|*[!0-9]*) return 1 ;; esac
   if pid_is_live "$lock_owner"; then
     return 1
   fi
 
   rm -f "$lock_path/owner"
   rmdir "$lock_path" 2>/dev/null || return 1
-  if mkdir "$lock_path" 2>/dev/null; then
+  if create_lock_directory "$lock_path" 2>/dev/null; then
     printf '%s\n' "$$" >"$lock_path/owner"
     chmod 0600 "$lock_path/owner"
     lock_held=1
@@ -204,11 +327,29 @@ generation_is_valid() {
   fi
 }
 
+line_pins_directory() {
+  printf '%s\n' "${workspace_source%/*}"
+}
+
+workspace_line_pins() {
+  workspace_pin_action=$1
+  workspace_pin_session=$2
+  workspace_pin_socket=$(tmux_run display-message -p -t "$workspace_pin_session:" '#{socket_path}' </dev/null) \
+    || return 1
+  workspace_pin_pid=$(tmux_run display-message -p -t "$workspace_pin_session:" '#{pid}' </dev/null) \
+    || return 1
+  "$(line_pins_directory)/location-pins" "$workspace_pin_action" \
+    --socket "$workspace_pin_socket" --session "$workspace_pin_session" --server-pid "$workspace_pin_pid"
+}
+
 validate_snapshot() {
   snapshot_file=$1
   [ -f "$snapshot_file" ] && [ ! -L "$snapshot_file" ] || return 1
   [ "$(file_mode "$snapshot_file" 2>/dev/null || :)" = 600 ] || return 1
-  jq -e '
+  pin_module_dir=$(line_pins_directory) || return 1
+  iconv -f UTF-8 -t UTF-8 "$snapshot_file" >/dev/null 2>&1 || return 1
+  jq -L "$pin_module_dir" -e '
+    include "location-pins";
     def safe_text($limit):
       type == "string"
       and utf8bytelength <= $limit
@@ -237,7 +378,8 @@ validate_snapshot() {
       and (.path | safe_text(8192) and startswith("/"))
       and (.group == null or (.group | safe_text(256) and length > 0))
       and (.active_window_index | positive)
-      and (.last_window_index | positive))
+      and (.last_window_index | positive)
+      and ((has("line_pins") | not) or (.line_pins | line_pin_state)))
     and all(.windows[];
       (.key | type == "string" and test("^@[0-9]+$"))
       and (.name | safe_text(512))
@@ -259,6 +401,11 @@ validate_snapshot() {
       and (.index | positive)
       and (.path | safe_text(8192) and startswith("/"))
       and (.title | safe_text(1024))
+      and ((has("line_pin_session_key") | not) or (
+        . as $pane
+        | (.line_pin_session_key | type == "string" and test("^\\$[0-9]+$"))
+        and any($root.windows[]; .key == $pane.window_key
+          and any(.links[]; .session_key == $pane.line_pin_session_key))))
       and (.process | type == "object")
       and (.process.kind == "shell"
         or .process.kind == "nvim"
@@ -297,7 +444,13 @@ validate_snapshot() {
           | if $left.group != null and $left.group == $right.group then
               topology($root; $left.key) == topology($root; $right.key)
             else true end))
-  ' "$snapshot_file" >/dev/null 2>&1
+  ' "$snapshot_file" >/dev/null 2>&1 || return 1
+  # Check canonical identities before any restored tmux server is created.
+  jq -c '.sessions[] | select(has("line_pins")) | .line_pins' "$snapshot_file" |
+    while IFS= read -r snapshot_pin_state; do
+      printf '%s\n' "$snapshot_pin_state" | "$pin_module_dir/location-pins" validate >/dev/null 2>&1 \
+        || exit 1
+    done
 }
 
 safe_text() {
@@ -369,9 +522,47 @@ checkpoint_nvim() {
   chmod 0700 "$staging_dir/nvim"
   encoded_checkpoint=$(jq -Rn --arg path "$checkpoint_file" '$path')
   checkpoint_expression="luaeval(\"require('integrations.tmux_persistence').checkpoint(_A)\",$encoded_checkpoint)"
-  if ! checkpoint_result=$(nvim --server "$checkpoint_server" --remote-expr \
-    "$checkpoint_expression" 2>/dev/null); then
-    append_warning 'a Neovim checkpoint RPC failed; a clean editor will be restored'
+  # Message pagers defer RPC evaluation. Bound the client wait so one editor
+  # cannot hold the checkpoint lock indefinitely; leave the editor untouched.
+  if checkpoint_result=$(python3 - "$checkpoint_server" "$checkpoint_expression" 2>/dev/null <<'PY'
+import signal
+import subprocess
+import sys
+
+
+def interrupted(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(signum, interrupted)
+try:
+    result = subprocess.run(
+        ["nvim", "--server", sys.argv[1], "--remote-expr", sys.argv[2]],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+        check=False,
+    )
+except subprocess.TimeoutExpired:
+    sys.exit(124)
+except OSError:
+    sys.exit(1)
+sys.stdout.buffer.write(result.stdout)
+sys.exit(result.returncode)
+PY
+  ); then
+    :
+  else
+    case $? in
+      124)
+        append_warning "Neovim checkpoint timed out in pane $checkpoint_pane; a clean editor will be restored"
+        ;;
+      *)
+        append_warning 'a Neovim checkpoint RPC failed; a clean editor will be restored'
+        ;;
+    esac
     return 1
   fi
   if [ "$checkpoint_result" != ok ] \
@@ -438,6 +629,8 @@ capture_snapshot() {
     fi
     require_positive "$last_window_index" 'last window index'
 
+    session_line_pins=$(workspace_line_pins list "$session_key") \
+      || die 'could not capture session line pins' 1
     if [ -n "$session_group" ]; then
       jq -n \
         --arg key "$session_key" \
@@ -446,7 +639,8 @@ capture_snapshot() {
         --arg group "$session_group" \
         --argjson active_window_index "$active_window_index" \
         --argjson last_window_index "$last_window_index" \
-        '{key:$key,name:$name,path:$path,group:$group,
+        --argjson line_pins "$session_line_pins" \
+        '{line_pins:$line_pins,key:$key,name:$name,path:$path,group:$group,
           active_window_index:$active_window_index,last_window_index:$last_window_index}' \
         >>"$sessions_file"
     else
@@ -456,7 +650,8 @@ capture_snapshot() {
         --arg path "$session_path" \
         --argjson active_window_index "$active_window_index" \
         --argjson last_window_index "$last_window_index" \
-        '{key:$key,name:$name,path:$path,group:null,
+        --argjson line_pins "$session_line_pins" \
+        '{line_pins:$line_pins,key:$key,name:$name,path:$path,group:null,
           active_window_index:$active_window_index,last_window_index:$last_window_index}' \
         >>"$sessions_file"
     fi
@@ -537,6 +732,17 @@ capture_snapshot() {
     esac
     pane_title=$(display_field "$pane_key" '#{pane_title}' 'pane title' 1024)
     pane_command=$(display_field "$pane_key" '#{pane_current_command}' 'pane command' 256)
+    pane_pin_session=$(tmux_run show-options -pqv -t "$pane_key" \
+      @dotfiles_line_pin_session 2>/dev/null || :)
+    # An editor records its explicit origin; old/unseen panes use the first
+    # saved window link. Ignore stale metadata after a pane moves sessions.
+    if ! jq -se --arg window "$pane_window" --arg session "$pane_pin_session" '
+      any(.[]; .key == $window and any(.links[]; .session_key == $session))
+    ' "$windows_file" >/dev/null; then
+      pane_pin_session=$(jq -ser --arg window "$pane_window" '
+        .[] | select(.key == $window) | .links[0].session_key
+      ' "$windows_file")
+    fi
     codex_session_id=
     nvim_session=
     case ${pane_command##*/} in
@@ -575,6 +781,7 @@ capture_snapshot() {
       --argjson index "$pane_index" \
       --arg path "$pane_path" \
       --arg title "$pane_title" \
+      --arg line_pin_session_key "$pane_pin_session" \
       --arg process_kind "$process_kind" \
       --arg codex_session_id "$codex_session_id" \
       --arg nvim_session "$nvim_session" \
@@ -584,6 +791,7 @@ capture_snapshot() {
         index:$index,
         path:$path,
         title:$title,
+        line_pin_session_key:$line_pin_session_key,
         process:{
           kind:$process_kind,
           codex_session_id:(if $codex_session_id == "" then null else $codex_session_id end),
@@ -927,12 +1135,47 @@ doctor_service_enabled() {
   esac
 }
 
+doctor_config_source() {
+  doctor_path=$1
+  doctor_relative=$2
+  shift 2
+  if [ -n "$workspace_generation" ]; then
+    doctor_expected=$(canonical_workspace "$workspace_generation/home-files/$doctor_relative") || return 1
+    python3 "$workspace_source_root/.config/dotfiles/lib/config-source.py" \
+      --path "$doctor_path" --expected "$doctor_expected" "$@"
+  else
+    [ -f "$doctor_path" ] && [ ! -L "$doctor_path" ] || return 1
+    if [ "$#" -gt 0 ]; then [ -x "$doctor_path" ]; fi
+  fi
+}
+
+doctor_launchd_copy() {
+  doctor_expected=$(canonical_workspace "$workspace_generation/LaunchAgents/dev.ruohao.tmux-workspace.plist") || return 1
+  python3 "$workspace_source_root/.config/dotfiles/lib/config-source.py" \
+    --path "$doctor_expected" --expected "$doctor_expected" || return 1
+  python3 - "$doctor_service" "$doctor_expected" <<'PYCOPY'
+import os
+from pathlib import Path
+import stat
+import sys
+try:
+    path, expected = map(Path, sys.argv[1:])
+    info = path.lstat()
+    valid = stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o444 and path.read_bytes() == expected.read_bytes()
+except OSError:
+    valid = False
+sys.exit(0 if valid else 1)
+PYCOPY
+}
+
 doctor_workspace() {
   set_root_paths
   doctor_failure=0
   doctor_has_jq=1
   command -v tmux >/dev/null 2>&1 \
     || doctor_fail 'tmux dependency is missing'
+  command -v python3 >/dev/null 2>&1 \
+    || doctor_fail 'python3 dependency is missing'
   if ! command -v jq >/dev/null 2>&1; then
     doctor_fail 'jq dependency is missing'
     doctor_has_jq=0
@@ -952,13 +1195,12 @@ doctor_workspace() {
   fi
 
   doctor_helper=$HOME/.config/tmux/scripts/workspace
-  if [ ! -f "$doctor_helper" ] || [ -L "$doctor_helper" ] \
-    || [ ! -x "$doctor_helper" ]; then
+  if ! doctor_config_source "$doctor_helper" .config/tmux/scripts/workspace --executable; then
     doctor_fail 'workspace helper is missing or not executable'
   fi
 
   doctor_nvim=$HOME/.config/nvim/lua/integrations/tmux_persistence.lua
-  if [ ! -f "$doctor_nvim" ] || [ -L "$doctor_nvim" ]; then
+  if ! doctor_config_source "$doctor_nvim" .config/nvim/lua/integrations/tmux_persistence.lua; then
     doctor_fail 'Neovim integration file is missing'
   fi
 
@@ -976,7 +1218,13 @@ doctor_workspace() {
       ;;
   esac
   if [ -n "$doctor_service" ]; then
-    if [ ! -f "$doctor_service" ] || [ -L "$doctor_service" ]; then
+    doctor_service_valid=0
+    if [ -n "$workspace_generation" ] && [ "$doctor_platform" = Darwin ]; then
+      doctor_launchd_copy && doctor_service_valid=1
+    elif doctor_config_source "$doctor_service" .config/systemd/user/tmux-workspace.service; then
+      doctor_service_valid=1
+    fi
+    if [ "$doctor_service_valid" -ne 1 ]; then
       doctor_fail 'platform service file is missing'
     elif ! doctor_service_enabled "$doctor_platform"; then
       doctor_fail 'platform login service is not enabled'
@@ -1181,6 +1429,9 @@ build_restored_windows() {
 
     tmux_run select-layout -t "$actual_window_id" "$saved_layout" \
       >/dev/null || die 'could not apply a restored window layout' 1
+    # resize-window forces manual sizing while the saved layout is rebuilt.
+    # Inherit the configured policy again so attached clients can resize it.
+    tmux_run set-option -wu -t "$actual_window_id" window-size
     tmux_run rename-window -t "$actual_window_id" "$saved_window_name"
     saved_automatic_rename=$(printf '%s\n' "$window_json" | \
       jq -r 'if .automatic_rename then "on" else "off" end')
@@ -1280,6 +1531,10 @@ build_restored_sessions() {
       fi
     fi
 
+    printf '%s\n' "$session_json" | jq -c '.line_pins // {version:1,pins:[]}' |
+      workspace_line_pins import "$actual_session_id" \
+      || die 'could not restore session line pins' 1
+
     jq -n \
       --arg saved "$saved_session_key" \
       --arg actual "$actual_session_id" \
@@ -1287,6 +1542,33 @@ build_restored_sessions() {
       '{saved:$saved,actual:$actual,name:$name}' >>"$restore_session_map"
   done <"$restore_sessions_file"
   rm -f "$restore_sessions_file"
+}
+
+start_restored_panes() {
+  # Only panes created by this restore are restarted. Their staging shells
+  # inherited a temporary TMUX session, so start them in the mapped origin
+  # before resuming any editor. A linked pane must have one explicit origin.
+  jq -c '. as $root | .panes[] as $pane
+    | ($root.windows[] | select(.key == $pane.window_key)) as $window
+    | ($pane.line_pin_session_key // $window.links[0].session_key) as $origin
+    | ($window.links[] | select(.session_key == $origin)) as $link
+    | $pane + {origin:$origin,window_index:$link.index}
+  ' "$selected_manifest" |
+  while IFS= read -r start_pane; do
+    saved_pane_key=$(printf '%s\n' "$start_pane" | jq -er '.key')
+    saved_origin=$(printf '%s\n' "$start_pane" | jq -er '.origin')
+    actual_origin=$(map_lookup "$restore_session_map" "$saved_origin") \
+      || die 'missing restored originating session' 1
+    actual_pane_id=$(map_lookup "$restore_pane_map" "$saved_pane_key") \
+      || die 'missing restored pane mapping' 1
+    start_window_index=$(printf '%s\n' "$start_pane" | jq -er '.window_index')
+    start_pane_index=$(tmux_run display-message -p -t "$actual_pane_id" '#{pane_index}')
+    tmux_run respawn-pane -k -t "$actual_origin:$start_window_index.$start_pane_index" \
+      || die 'could not start a pane in its restored session' 1
+    tmux_run set-option -p -t "$actual_pane_id" @dotfiles_line_pin_session "$actual_origin"
+    start_title=$(printf '%s\n' "$start_pane" | jq -er '.title')
+    tmux_run select-pane -t "$actual_pane_id" -T "$start_title"
+  done
 }
 
 restore_focus_and_metadata() {
@@ -1440,6 +1722,7 @@ resume_pane() {
     | if length == 1 then .[0] else error("pane not found") end
   ' "$requested_manifest") || die 'resume pane is absent from snapshot' 1
   process_kind=$(printf '%s\n' "$pane_record" | jq -er '.process.kind')
+  select_process_locale
   case $process_kind in
     codex)
       if ! executable_available codex; then
@@ -1451,9 +1734,9 @@ resume_pane() {
       if [ -n "$codex_session_id" ]; then
         session_id_is_valid "$codex_session_id" \
           || die 'invalid Codex session identifier in snapshot' 1
-        exec codex resume "$codex_session_id"
+        LC_ALL="$workspace_process_locale" exec codex resume "$codex_session_id"
       fi
-      exec codex resume
+      LC_ALL="$workspace_process_locale" exec codex resume
       ;;
     nvim)
       if ! executable_available nvim; then
@@ -1470,10 +1753,10 @@ resume_pane() {
           && [ ! -L "$nvim_session_file" ] \
           && [ -s "$nvim_session_file" ] \
           && [ "$(file_mode "$nvim_session_file" 2>/dev/null || :)" = 600 ]; then
-          exec nvim -S "$nvim_session_file"
+          LC_ALL="$workspace_process_locale" exec nvim -S "$nvim_session_file"
         fi
       fi
-      exec nvim
+      LC_ALL="$workspace_process_locale" exec nvim
       ;;
     *)
       die 'pane process is not restorable' 2
@@ -1507,6 +1790,7 @@ restore_snapshot() {
   restore_committed=0
   build_restored_windows
   build_restored_sessions
+  start_restored_panes
   restore_focus_and_metadata
   publish_pane_map
 
@@ -1674,34 +1958,42 @@ case ${1-} in
     ;;
   save)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }
+    initialize_workspace_source
     save_snapshot explicit
     ;;
   restore)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }
+    initialize_workspace_source
     restore_snapshot
     ;;
   ensure)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }
+    initialize_workspace_source
     ensure_ready
     ;;
   supervise)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }
+    initialize_workspace_source
     supervise_loop
     ;;
   codex-hook)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }
+    initialize_workspace_source
     codex_hook
     ;;
   resume-pane)
     [ "$#" -eq 3 ] || { usage 0; exit 2; }
+    initialize_workspace_source
     resume_pane "$2" "$3"
     ;;
   status)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }
+    initialize_workspace_source
     status_snapshot
     ;;
   doctor)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }
+    initialize_workspace_source
     doctor_workspace
     ;;
   '')

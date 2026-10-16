@@ -1,3 +1,7 @@
+local function oil_workspace()
+  require("navigation.oil").toggle()
+end
+
 local function picker(name)
   return function()
     require("navigation.pickers")[name]()
@@ -20,6 +24,19 @@ return {
     "ibhagwan/fzf-lua",
     version = false,
     cmd = "FzfLua",
+    init = function()
+      require("clipboard.history").setup()
+      local pins = require("navigation.location_pins")
+      pins.setup()
+      for _, mapping in ipairs({
+        { "<leader>ha", pins.add, "Add line pin" },
+        { "<leader>hh", pins.find, "Find line pins" },
+        { "<leader>hd", pins.delete_current, "Delete current line pin" },
+        { "<leader>hc", pins.clear, "Clear session line pins" },
+      }) do
+        vim.keymap.set("n", mapping[1], mapping[2], { desc = mapping[3] })
+      end
+    end,
     dependencies = { "nvim-mini/mini.icons" },
     keys = {
       { "<leader>ff", picker("files"), desc = "Find files" },
@@ -32,6 +49,7 @@ return {
       { "<leader>fS", picker("workspace_symbols"), desc = "Workspace symbols" },
       { "<leader>fd", picker("document_diagnostics"), desc = "Document diagnostics" },
       { "<leader>fD", picker("all_diagnostics"), desc = "All diagnostics" },
+      { "<leader>p", picker("clipboard_history"), mode = { "n", "x" }, desc = "Paste history" },
     },
     opts = function()
       local actions = require("fzf-lua.actions")
@@ -94,7 +112,7 @@ return {
     lazy = false,
     dependencies = { "nvim-mini/mini.icons" },
     keys = {
-      { "-", "<cmd>Oil<CR>", mode = "n", desc = "Open parent directory" },
+      { "<leader><Tab>", oil_workspace, mode = "n", desc = "Toggle Oil workspace" },
     },
     opts = {
       default_file_explorer = true,
@@ -109,6 +127,8 @@ return {
       },
       watch_for_changes = false,
       use_default_keymaps = true,
+      float = { border = "rounded" },
+      keymaps_help = { border = "rounded" },
       keymaps = { ["g\\"] = false },
       view_options = { show_hidden = false },
       git = { add = never, mv = never, rm = never },

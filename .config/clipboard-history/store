@@ -1,0 +1,79 @@
+#!/bin/sh
+
+set -eu
+umask 077
+LC_ALL=C
+export LC_ALL
+
+XDG_CACHE_HOME=${XDG_CACHE_HOME:-${HOME:?}/.cache}
+case $XDG_CACHE_HOME in /*) ;; *) exit 1 ;; esac
+export XDG_CACHE_HOME
+history_dir=$XDG_CACHE_HOME/cliphist
+current_uid=$(id -u)
+
+owned_directory() {
+  [ -d "$history_dir" ] && [ ! -L "$history_dir" ] \
+    && [ "$(stat -c %u -- "$history_dir")" = "$current_uid" ]
+}
+
+owned_database() {
+  [ ! -e "$history_dir/db" ] && [ ! -L "$history_dir/db" ] && return 0
+  [ -f "$history_dir/db" ] && [ ! -L "$history_dir/db" ] \
+    && [ "$(stat -c %u -- "$history_dir/db")" = "$current_uid" ] \
+    && [ "$(stat -c %h -- "$history_dir/db")" = 1 ]
+}
+
+case ${1:-} in
+  --prepare)
+    [ "$#" -eq 1 ] || exit 1
+    [ ! -L "$history_dir" ] || exit 1
+    if [ ! -e "$history_dir" ]; then
+      mkdir -p -- "$XDG_CACHE_HOME"
+      mkdir -m 0700 -- "$history_dir"
+    fi
+    owned_directory && owned_database || exit 1
+    chmod 0700 -- "$history_dir"
+    if [ -f "$history_dir/db" ]; then chmod 0600 -- "$history_dir/db"; fi
+    exit 0
+    ;;
+  '') [ "$#" -eq 0 ] || exit 1 ;;
+  *) exit 1 ;;
+esac
+
+owned_directory && owned_database || exit 1
+[ "$(stat -c %a -- "$history_dir")" = 700 ] || exit 1
+if [ -f "$history_dir/db" ]; then
+  [ "$(stat -c %a -- "$history_dir/db")" = 600 ] || exit 1
+fi
+
+capture_file=
+child_pid=
+# shellcheck disable=SC2329 # Invoked by the exit trap.
+cleanup() {
+  if [ -n "$child_pid" ]; then
+    kill "$child_pid" 2>/dev/null || :
+    wait "$child_pid" 2>/dev/null || :
+  fi
+  [ -z "$capture_file" ] || rm -f -- "$capture_file"
+}
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+capture_file=$(mktemp "$history_dir/.store.XXXXXX")
+exec 3<&0
+head -c 1048577 <&3 3<&- >"$capture_file" &
+child_pid=$!
+exec 3<&-
+if wait "$child_pid"; then read_status=0; else read_status=$?; fi
+child_pid=
+[ "$read_status" -eq 0 ] || exit "$read_status"
+capture_size=$(wc -c <"$capture_file")
+[ "$capture_size" -gt 0 ] && [ "$capture_size" -le 1048576 ] || exit 0
+
+cliphist -db-path "$history_dir/db" store <"$capture_file" >/dev/null 2>&1 &
+child_pid=$!
+if wait "$child_pid"; then store_status=0; else store_status=$?; fi
+child_pid=
+exit "$store_status"

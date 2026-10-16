@@ -1,5 +1,8 @@
 #!/bin/sh
 set -eu
+unset TMUX TMUX_PANE
+SHELL=/bin/sh
+export SHELL
 
 fail() {
   printf 'not ok - %s\n' "$1" >&2
@@ -190,6 +193,58 @@ private_tmux select-window -t '=mirror:2'
 private_tmux select-window -t '=linked:2'
 private_tmux select-window -t '=linked:1'
 
+pin_helper=$script_dir/../scripts/location-pins
+session_pins() {
+  pin_action=$1
+  pin_name=$2
+  pin_session=$(private_tmux display-message -p -t "=$pin_name:" '#{session_id}')
+  pin_pid=$(private_tmux display-message -p -t "=$pin_name:" '#{pid}')
+  "$pin_helper" "$pin_action" --socket "$socket" --session "$pin_session" --server-pid "$pin_pid"
+}
+jq -cn --arg path "$test_root/雪 #{session_name} quote'" '{path:$path,line:12,col:3}' \
+  | session_pins add alpha >"$test_root/alpha-pin"
+printf '%s\n' '{"path":"/mirror/location","line":4,"col":0}' \
+  | session_pins add mirror >"$test_root/mirror-pin"
+# Run the real resolver inside a pane, inheriting its actual TMUX environment.
+cat >"$test_root/pin-context.lua" <<'LUA'
+vim.opt.runtimepath:prepend(vim.env.DOTFILES_NVIM_ROOT)
+require("navigation.location_pins").setup()
+local ctx, err = require("navigation.location_pin_context").resolve()
+local pins = ctx and require("navigation.location_pin_store").list(ctx) or nil
+vim.fn.writefile({ vim.json.encode({ context = ctx, error = err, pins = pins }) }, vim.env.PIN_CONTEXT_OUTPUT)
+LUA
+probe_pin_context() {
+  probe_target=$1
+  probe_output=$2
+  probe_command=$(jq -nr \
+    --arg home "$test_root/home" \
+    --arg nvim_root "$(CDPATH='' cd "$script_dir/../../nvim" && pwd -P)" \
+    --arg output "$probe_output" --arg script "$test_root/pin-context.lua" '
+      ["env", "HOME="+$home, "XDG_STATE_HOME="+$home+"/state",
+       "XDG_CACHE_HOME="+$home+"/cache", "XDG_RUNTIME_DIR="+$home+"/runtime",
+       "DOTFILES_NVIM_ROOT="+$nvim_root, "PIN_CONTEXT_OUTPUT="+$output,
+       "nvim", "--clean", "--headless", "-u", "NONE", "-i", "NONE", "-l", $script] | @sh')
+  private_tmux send-keys -t "$probe_target" -l "$probe_command"
+  private_tmux send-keys -t "$probe_target" Enter
+  probe_attempt=0
+  while [ "$probe_attempt" -lt 500 ]; do
+    probe_process=$(private_tmux display-message -p -t "$probe_target" '#{pane_current_command}')
+    if [ -s "$probe_output" ] && [ "$probe_process" = sh ]; then return 0; fi
+    sleep 0.01
+    probe_attempt=$((probe_attempt + 1))
+  done
+  private_tmux capture-pane -p -t "$probe_target" >&2
+  fail 'pin context probe did not finish in the actual pane'
+}
+# Give two linked panes distinct real originating sessions before checkpointing.
+private_tmux respawn-pane -k -t '=alpha:1.1' /bin/sh
+private_tmux respawn-pane -k -t '=mirror:1.2' /bin/sh
+private_tmux select-pane -t '=alpha:1.1' -T left
+private_tmux select-pane -t '=alpha:1.2' -T right
+probe_pin_context '=alpha:1.1' "$test_root/alpha-context.before"
+probe_pin_context '=mirror:1.2' "$test_root/mirror-context.before"
+session_pins list alpha >"$test_root/alpha-pins.before"
+session_pins list mirror >"$test_root/mirror-pins.before"
 summarize >"$before"
 run_workspace save
 [ "$status" -eq 0 ] || sed -n '1,120p' "$stderr" >&2
@@ -205,6 +260,23 @@ if ! cmp -s "$before" "$after"; then
   diff -u "$before" "$after" >&2 || :
   fail "round-trip topology"
 fi
+
+session_pins list alpha >"$test_root/alpha-pins.after"
+session_pins list mirror >"$test_root/mirror-pins.after"
+cmp "$test_root/alpha-pins.before" "$test_root/alpha-pins.after" || fail 'alpha line-pin round trip'
+cmp "$test_root/mirror-pins.before" "$test_root/mirror-pins.after" || fail 'grouped-session line-pin round trip'
+assert_equal 0 "$(session_pins list linked | jq '.pins|length')" 'empty linked session pins'
+pass 'workspace restores independent line pins to mapped sessions'
+probe_pin_context '=alpha:1.1' "$test_root/alpha-context.after"
+probe_pin_context '=mirror:1.2' "$test_root/mirror-context.after"
+for probe_name in alpha mirror; do
+  expected_session=$(private_tmux display-message -p -t "=$probe_name:" '#{session_id}')
+  jq -e --arg session "$expected_session" --slurpfile expected "$test_root/$probe_name-pins.before" '
+    .context.session == $session and .pins == $expected[0].pins
+  ' "$test_root/$probe_name-context.after" >/dev/null \
+    || { cat "$test_root/$probe_name-context.after" >&2; fail 'restored pane lost its explicit line-pin session'; }
+done
+pass 'real restored editors retain independent originating sessions in linked panes'
 
 assert_equal "$generation" \
   "$(private_tmux show-options -gqv @dotfiles_workspace_generation)" \
@@ -226,6 +298,70 @@ counts_after=$(printf '%s|%s|%s' \
   "$(private_tmux list-windows -a -F '#{window_id}' | sort -u | wc -l | tr -d '[:space:]')" \
   "$(private_tmux list-panes -a -F '#{pane_id}' | sort -u | wc -l | tr -d '[:space:]')")
 assert_equal "$counts_before" "$counts_after" "idempotent topology counts"
+
+# A detached layout round trip misses windows left at a fixed restore size.
+# Real control-mode clients exercise attachment and subsequent terminal resizes.
+python3 - "$real_tmux" "$socket" <<'PY'
+import subprocess
+import sys
+import time
+
+tmux_command = [sys.argv[1], "-S", sys.argv[2]]
+
+
+def tmux(*args):
+    return subprocess.check_output([*tmux_command, *args], text=True).strip()
+
+
+for session in ("alpha", "linked"):
+    client = subprocess.Popen(
+        [*tmux_command, "-C", "attach-session", "-t", "=" + session],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        for size in ("94x42", "112x48", "70x30"):
+            client.stdin.write("refresh-client -C " + size + "\n")
+            client.stdin.flush()
+            deadline = time.monotonic() + 5
+            while True:
+                windows = tmux(
+                    "list-windows", "-t", "=" + session,
+                    "-F", "#{window_index}:#{window_width}x#{window_height}",
+                ).splitlines()
+                if windows and all(window.split(":", 1)[1] == size for window in windows):
+                    break
+                if client.poll() is not None:
+                    raise SystemExit("not ok - resize client exited: " + client.stderr.read())
+                if time.monotonic() >= deadline:
+                    raise SystemExit(
+                        "not ok - restored windows must follow client size " + size
+                        + " in " + session + ": " + ", ".join(windows)
+                    )
+                time.sleep(0.02)
+    finally:
+        client.terminate()
+        client.communicate(timeout=5)
+PY
+pass 'restored windows follow attached clients as they grow and shrink'
+
+stop_private_server
+legacy_dir=$state/dotfiles/tmux/snapshots/legacy-no-pins
+mkdir -m 700 "$legacy_dir"
+jq 'del(.sessions[].line_pins, .panes[].line_pin_session_key)' "$state/dotfiles/tmux/snapshots/$generation/snapshot.json" >"$legacy_dir/snapshot.json"
+chmod 600 "$legacy_dir/snapshot.json"
+printf '%s\n' legacy-no-pins >"$state/dotfiles/tmux/current"
+run_workspace restore
+assert_equal 0 "$status" 'legacy snapshot without line pins restores'
+assert_equal 0 "$(session_pins list alpha | jq '.pins|length')" 'legacy snapshot has empty pins'
+probe_pin_context '=alpha:1.1' "$test_root/legacy-context"
+legacy_origin=$(private_tmux display-message -p -t '=alpha:' '#{session_id}')
+jq -e --arg origin "$legacy_origin" '.context.session == $origin and .pins == []' \
+  "$test_root/legacy-context" >/dev/null || fail 'legacy pane lacks a valid explicit origin'
+rm -rf "$legacy_dir"
+pass 'legacy workspace snapshots remain readable'
 
 stop_private_server
 missing_generation=missing-cwd
@@ -268,9 +404,14 @@ stop_private_server
   new-session -d -s local-only
 private_tmux rename-window -t '=local-only:1' local
 private_tmux set-option -w -t '=local-only:1' automatic-rename off
+printf '%s\n' '{"path":"/live/keep","line":2,"col":0}' \
+  | session_pins add local-only >"$test_root/live-pin"
+session_pins list local-only >"$test_root/live-pins.before"
 session_count_before=$(private_tmux list-sessions -F '#{session_id}' | wc -l | tr -d '[:space:]')
 run_workspace restore
 assert_equal 0 "$status" "live server adoption"
+session_pins list local-only >"$test_root/live-pins.after"
+cmp "$test_root/live-pins.before" "$test_root/live-pins.after" || fail 'adoption overwrote live pins'
 session_count_after=$(private_tmux list-sessions -F '#{session_id}' | wc -l | tr -d '[:space:]')
 assert_equal "$session_count_before" "$session_count_after" "adoption session count"
 assert_equal 1 "$(private_tmux show-options -gqv @dotfiles_workspace_adopted)" \
@@ -496,22 +637,77 @@ assert_no_checkpoint_residue "unavailable-server final checkpoint"
   || fail "unavailable-server supervisor lock remained after stop"
 
 rm -f "$runtime/dotfiles-tmux/ready"
+# Pause the winning mkdir before its owner PID is published. A second ensure
+# must wait for this initializing lock, never reclaim it and restore in parallel.
+ensure_bin=$test_root/ensure-bin
+mkdir -p "$ensure_bin"
+ENSURE_REAL_MKDIR=$(command -v gnumkdir || command -v gmkdir || command -v mkdir)
+ENSURE_REAL_SLEEP=$(command -v sleep)
+ENSURE_BARRIER=$test_root/ensure-barrier
+ENSURE_LOCK=$runtime/dotfiles-tmux/restore.lock
+export ENSURE_REAL_MKDIR ENSURE_REAL_SLEEP ENSURE_BARRIER ENSURE_LOCK
+cat >"$ensure_bin/mkdir" <<'SHIM'
+#!/bin/sh
+"$ENSURE_REAL_MKDIR" "$@"
+result=$?
+if [ "$result" -eq 0 ] && [ "$#" -eq 1 ] && [ "$1" = "$ENSURE_LOCK" ] \
+  && [ "${ENSURE_OWNER:-0}" = 1 ]; then
+  : >"$ENSURE_BARRIER.started"
+  attempt=0
+  while [ ! -f "$ENSURE_BARRIER.release" ] && [ "$attempt" -lt 1000 ]; do
+    "$ENSURE_REAL_SLEEP" 0.01
+    attempt=$((attempt + 1))
+  done
+  [ -f "$ENSURE_BARRIER.release" ] || exit 1
+fi
+exit "$result"
+SHIM
+cat >"$ensure_bin/sleep" <<'SHIM'
+#!/bin/sh
+if [ "$#" -eq 1 ] && [ "$1" = 1 ] && [ "${ENSURE_OWNER:-0}" = 0 ]; then
+  : >"$ENSURE_BARRIER.waiter"
+fi
+exec "$ENSURE_REAL_SLEEP" "$@"
+SHIM
+chmod 755 "$ensure_bin/mkdir" "$ensure_bin/sleep"
+ln -s mkdir "$ensure_bin/gnumkdir"
+ln -s mkdir "$ensure_bin/gmkdir"
 set +e
 HOME=$test_root/home SHELL=/bin/sh XDG_STATE_HOME=$state XDG_RUNTIME_DIR=$runtime \
   TMUX_WORKSPACE_TESTING=1 TMUX_WORKSPACE_SOCKET=$socket \
+  PATH=$ensure_bin:$PATH ENSURE_OWNER=1 \
   "$workspace" ensure >"$test_root/ensure-one.stdout" 2>"$test_root/ensure-one.stderr" &
 ensure_one_pid=$!
+barrier_attempt=0
+while [ ! -f "$ENSURE_BARRIER.started" ] && [ "$barrier_attempt" -lt 500 ]; do
+  sleep 0.01
+  barrier_attempt=$((barrier_attempt + 1))
+done
 HOME=$test_root/home SHELL=/bin/sh XDG_STATE_HOME=$state XDG_RUNTIME_DIR=$runtime \
   TMUX_WORKSPACE_TESTING=1 TMUX_WORKSPACE_SOCKET=$socket \
+  PATH=$ensure_bin:$PATH ENSURE_OWNER=0 \
   "$workspace" ensure >"$test_root/ensure-two.stdout" 2>"$test_root/ensure-two.stderr" &
 ensure_two_pid=$!
+barrier_attempt=0
+while [ ! -f "$ENSURE_BARRIER.waiter" ] && [ ! -f "$runtime/dotfiles-tmux/ready" ] \
+  && [ "$barrier_attempt" -lt 500 ]; do
+  sleep 0.01
+  barrier_attempt=$((barrier_attempt + 1))
+done
+waiter_observed=0
+[ ! -f "$ENSURE_BARRIER.waiter" ] || waiter_observed=1
+: >"$ENSURE_BARRIER.release"
 wait "$ensure_one_pid"
 ensure_one_status=$?
 wait "$ensure_two_pid"
 ensure_two_status=$?
 set -e
+if [ "$ensure_one_status" -ne 0 ] || [ "$ensure_two_status" -ne 0 ]; then
+  cat "$test_root/ensure-one.stderr" "$test_root/ensure-two.stderr" >&2
+fi
 assert_equal 0 "$ensure_one_status" "first concurrent ensure"
 assert_equal 0 "$ensure_two_status" "second concurrent ensure"
+assert_equal 1 "$waiter_observed" 'initializing restore lock is not stolen'
 [ -f "$runtime/dotfiles-tmux/ready" ] || fail "concurrent ensure ready marker"
 assert_equal 1 \
   "$(private_tmux list-sessions -F '#{session_id}' | wc -l | tr -d '[:space:]')" \
@@ -526,7 +722,9 @@ codex_log_directory=$test_root/codex-logs
 mkdir -p "$shim_directory" "$codex_log_directory" \
   "$test_root/home/.config/tmux/scripts"
 ln -s "$workspace" "$test_root/home/.config/tmux/scripts/workspace"
-cp "$(command -v sleep)" "$shim_directory/codex"
+# A multicall sleep binary cannot be renamed to codex. Prefer GNU on those hosts.
+fixture_sleep=$(command -v gnusleep || command -v sleep)
+cp "$fixture_sleep" "$shim_directory/codex"
 chmod 0755 "$shim_directory/codex"
 PATH=$shim_directory:$PATH
 CODEX_TEST_LOG_DIRECTORY=$codex_log_directory
@@ -534,9 +732,9 @@ export PATH CODEX_TEST_LOG_DIRECTORY
 
 "$real_tmux" -f "$script_dir/../conf/options.conf" -S "$socket" \
   new-session -d -s codex-work -c "$test_root/projects/alpha" \
-  -n conversations 'codex 300'
+  -n conversations 'exec codex 300'
 private_tmux split-window -d -t '=codex-work:1' \
-  -c "$test_root/projects/alpha" 'codex 300'
+  -c "$test_root/projects/alpha" 'exec codex 300'
 codex_alpha_pane=$(private_tmux display-message -p -t '=codex-work:1.1' '#{pane_id}')
 codex_beta_pane=$(private_tmux display-message -p -t '=codex-work:1.2' '#{pane_id}')
 wait_attempt=0
@@ -616,6 +814,7 @@ case $* in
   'resume') output=$CODEX_TEST_LOG_DIRECTORY/picker ;;
   *) output=$CODEX_TEST_LOG_DIRECTORY/unexpected ;;
 esac
+locale charmap >"$output.locale"
 for argument
 do
   printf '%s\n' "$argument"
@@ -639,6 +838,10 @@ assert_equal "$(printf 'resume\nthr_alpha')" \
   "exact Codex resume argv"
 assert_equal resume "$(cat "$codex_log_directory/picker")" \
   "Codex picker argv"
+assert_equal UTF-8 "$(cat "$codex_log_directory/alpha.locale")" \
+  "resumed Codex preserves a UTF-8 process locale"
+assert_equal UTF-8 "$(cat "$codex_log_directory/picker.locale")" \
+  "Codex picker preserves a UTF-8 process locale"
 [ ! -e "$codex_log_directory/unexpected" ] || fail "unexpected Codex resume argv"
 if grep -R -F '/ignored/a.jsonl' "$state/dotfiles/tmux" >/dev/null 2>&1 \
   || grep -R -F '/ignored/b.jsonl' "$state/dotfiles/tmux" >/dev/null 2>&1; then
@@ -683,7 +886,7 @@ SHIM
 chmod 0755 "$shim_directory/nvim-source"
 HOME=$test_root/home XDG_STATE_HOME=$state XDG_RUNTIME_DIR=$runtime \
   PATH=$PATH "$real_tmux" -f "$script_dir/../conf/options.conf" -S "$socket" \
-  new-session -d -s nvim-work -c "$nvim_project" -n editor nvim-source
+  new-session -d -s nvim-work -c "$nvim_project" -n editor 'exec nvim-source'
 nvim_pane=$(private_tmux display-message -p -t '=nvim-work:1.1' '#{pane_id}')
 wait_attempt=0
 nvim_server=
@@ -733,6 +936,7 @@ stop_private_server
 cat >"$shim_directory/nvim" <<'SHIM'
 #!/bin/sh
 set -eu
+locale charmap >"$CODEX_TEST_LOG_DIRECTORY/nvim.locale"
 for argument
 do
   printf '%s\n' "$argument"
@@ -751,6 +955,8 @@ done
 assert_equal "$(printf '%s\n%s' -S "$nvim_session_file")" \
   "$(cat "$codex_log_directory/nvim")" \
   "native Neovim restore argv"
+assert_equal UTF-8 "$(cat "$codex_log_directory/nvim.locale")" \
+  "restored Neovim preserves a UTF-8 process locale"
 
 nvim_pane_key=$(jq -er '
   .panes[] | select(.process.kind == "nvim") | .key
@@ -758,11 +964,13 @@ nvim_pane_key=$(jq -er '
 mv "$nvim_session_file" "$nvim_session_file.private"
 ln -s "$nvim_session_file.private" "$nvim_session_file"
 rm -f "$codex_log_directory/nvim"
-run_workspace resume-pane "$nvim_generation" "$nvim_pane_key"
+LC_ALL=C LANG=C LC_CTYPE=C run_workspace resume-pane "$nvim_generation" "$nvim_pane_key"
 assert_equal 0 "$status" "symlinked Neovim session fallback"
 [ -f "$codex_log_directory/nvim" ] || fail "symlink fallback Neovim invocation"
 assert_equal '' "$(cat "$codex_log_directory/nvim")" \
   "symlinked Neovim session starts a clean editor"
+assert_equal UTF-8 "$(cat "$codex_log_directory/nvim.locale")" \
+  "clean Neovim falls back to an available UTF-8 locale from C"
 rm -f "$nvim_session_file"
 mv "$nvim_session_file.private" "$nvim_session_file"
 

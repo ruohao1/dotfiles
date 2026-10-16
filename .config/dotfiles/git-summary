@@ -126,7 +126,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 if set -m 2>/dev/null; then
-  git_process_group=true
+  case $- in
+    *m*) git_process_group=true ;;
+  esac
 fi
 git --no-optional-locks -C "$start_path" status \
   --porcelain=v2 --branch --untracked-files=normal \
@@ -136,11 +138,31 @@ if [ "$git_process_group" = true ]; then
   set +m 2>/dev/null || true
 fi
 if set -m 2>/dev/null; then
-  watchdog_process_group=true
+  case $- in
+    *m*) watchdog_process_group=true ;;
+  esac
 fi
 (
-  sleep 3
-  kill_git_job
+  watchdog_sleep_pid=
+  watchdog_stopping=false
+  stop_watchdog_sleep() {
+    [ -n "$watchdog_sleep_pid" ] || return 0
+    kill -TERM "$watchdog_sleep_pid" >/dev/null 2>&1 || true
+    wait "$watchdog_sleep_pid" >/dev/null 2>&1 || true
+  }
+  # Defer cancellation until the sleep PID is registered for cleanup.
+  trap 'watchdog_stopping=true' HUP INT TERM
+  sleep 3 &
+  watchdog_sleep_pid=$!
+  trap 'stop_watchdog_sleep; exit 0' HUP INT TERM
+  if [ "$watchdog_stopping" = true ]; then
+    stop_watchdog_sleep
+    exit 0
+  fi
+  if wait "$watchdog_sleep_pid"; then
+    watchdog_sleep_pid=
+    kill_git_job
+  fi
 ) &
 watchdog_pid=$!
 if [ "$watchdog_process_group" = true ]; then

@@ -413,6 +413,13 @@ local function picker_harness(options)
       fzf_calls = fzf_calls + 1
       return api
     end,
+    history = function()
+      return {
+        open = function()
+          table.insert(calls, { name = "clipboard_history" })
+        end,
+      }
+    end,
     root = function()
       root_calls = root_calls + 1
       return options.root or "/project"
@@ -625,12 +632,34 @@ local lsp_ok, lsp_error = pcall(exploding_lsp.controller.lsp_locations)
 assert(not lsp_ok, "unexpected LSP picker error must propagate")
 assert(tostring(lsp_error):find("LSP picker exploded", 1, true), "LSP picker error changed")
 
+local pin_without_fzf = picker_harness({ available = {} })
+pin_without_fzf.controller.line_pins({
+  list = function()
+    error("pin finder reached the store without fzf")
+  end,
+})
+eq(#pin_without_fzf.calls, 0, "missing fzf blocks the pin finder")
+
+local clipboard_dispatch = picker_harness()
+clipboard_dispatch.controller.clipboard_history()
+eq(clipboard_dispatch.calls, { { name = "clipboard_history" } }, "clipboard history dispatch")
+for _, options in ipairs({
+  { available = {} },
+  { version_result = { code = 0, stdout = "0.35.0" } },
+}) do
+  local unavailable = picker_harness(options)
+  unavailable.controller.clipboard_history()
+  eq(#unavailable.calls, 0, "Fzf gate blocks clipboard loading")
+end
+
 local expected_public_pickers = {
   "files",
   "grep",
   "buffers",
   "recent",
   "projects",
+  "line_pins",
+  "clipboard_history",
   "help",
   "lsp_locations",
   "document_symbols",
@@ -691,9 +720,41 @@ eq(fzf_keys, {
   "<leader>fS",
   "<leader>fd",
   "<leader>fD",
+  "<leader>p",
 }, "FzfLua mapping surface")
 assert(not contains(fzf_keys, "<leader>fk"), "keymap picker must remain absent")
 assert(not contains(fzf_keys, "<leader>fR"), "resume picker must remain absent")
+
+local clipboard_mapping
+for _, mapping in ipairs(fzf_spec.keys) do
+  if mapping[1] == "<leader>p" then
+    assert(not clipboard_mapping, "duplicate clipboard mapping")
+    clipboard_mapping = mapping
+  end
+end
+assert(clipboard_mapping, "missing clipboard history mapping")
+eq(clipboard_mapping.mode, { "n", "x" }, "clipboard mapping modes")
+eq(clipboard_mapping.desc, "Paste history", "clipboard mapping description")
+local previous_history = package.loaded["clipboard.history"]
+local setup_calls = 0
+package.loaded["clipboard.history"] = {
+  setup = function()
+    setup_calls = setup_calls + 1
+  end,
+}
+fzf_spec.init()
+package.loaded["clipboard.history"] = previous_history
+eq(setup_calls, 1, "Fzf initializer must set up clipboard alongside line pins")
+local previous_dispatch = package.loaded["navigation.pickers"]
+local clipboard_calls = 0
+package.loaded["navigation.pickers"] = {
+  clipboard_history = function()
+    clipboard_calls = clipboard_calls + 1
+  end,
+}
+clipboard_mapping[2]()
+package.loaded["navigation.pickers"] = previous_dispatch
+eq(clipboard_calls, 1, "clipboard mapping must use navigation dispatch")
 
 local expected_fzf_lsp_mappings = {
   {
@@ -840,8 +901,32 @@ eq(oil_spec.version, false, "Oil version policy")
 eq(oil_spec.lazy, false, "Oil eager loading")
 eq(oil_spec.dependencies, { "nvim-mini/mini.icons" }, "Oil MiniIcons dependency")
 eq(#oil_spec.keys, 1, "Oil global mapping count")
-eq(oil_spec.keys[1][1], "-", "Oil global mapping")
-eq(oil_spec.keys[1].mode, "n", "Oil mapping mode")
+eq(oil_spec.keys[1][1], "<leader><Tab>", "Oil workspace mapping")
+eq(oil_spec.keys[1].mode, "n", "Oil workspace mapping mode")
+eq(oil_spec.keys[1].desc, "Toggle Oil workspace", "Oil workspace mapping description")
+assert(type(oil_spec.keys[1][2]) == "function", "Oil workspace mapping must use a callback")
+
+local previous_oil_workspace = package.loaded["navigation.oil"]
+local oil_toggle_calls = 0
+package.loaded["navigation.oil"] = {
+  toggle = function()
+    oil_toggle_calls = oil_toggle_calls + 1
+  end,
+}
+local oil_callback_ok, oil_callback_error = xpcall(oil_spec.keys[1][2], debug.traceback)
+package.loaded["navigation.oil"] = previous_oil_workspace
+if not oil_callback_ok then
+  error(oil_callback_error, 0)
+end
+eq(oil_toggle_calls, 1, "Oil workspace mapping callback")
+
+if package.loaded["lazy"] ~= nil then
+  local workspace_mapping = vim.fn.maparg("<leader><Tab>", "n", false, true)
+  assert(type(workspace_mapping) == "table" and next(workspace_mapping), "missing live Oil mapping")
+  eq(workspace_mapping.desc, "Toggle Oil workspace", "live Oil mapping description")
+  eq(vim.fn.maparg("-", "n", false, true), {}, "global Oil dash mapping removed")
+end
+
 eq(oil_spec.opts.default_file_explorer, true, "Oil default explorer")
 eq(oil_spec.opts.columns, { "icon" }, "Oil columns")
 eq(oil_spec.opts.delete_to_trash, true, "Oil trash policy")

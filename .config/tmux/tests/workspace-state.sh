@@ -167,6 +167,7 @@ status=$?
 set -e
 assert_equal 1 "$status" "doctor aggregates missing requirements"
 assert_contains 'tmux dependency is missing' "$stdout" "doctor missing tmux"
+assert_contains 'python3 dependency is missing' "$stdout" "doctor missing python3"
 assert_contains 'jq dependency is missing' "$stdout" "doctor missing jq"
 assert_contains 'Codex hook JSON is missing or invalid' "$stdout" \
   "doctor missing Codex hooks"
@@ -183,12 +184,16 @@ mkdir -p \
   "$test_root/home/.config/nvim/lua/integrations" \
   "$test_root/home/.config/systemd/user" \
   "$test_root/home/.config/tmux/scripts"
-cp "$source_config_root/../.codex/hooks.json" \
-  "$test_root/home/.codex/hooks.json"
+# Codex hooks and native service templates are intentionally not adopted by
+# the selected runtime. These fixtures model their retained native contracts.
+jq -n --arg command '"$HOME/.config/tmux/scripts/workspace" codex-hook' \
+  '{hooks: {SessionStart: [{hooks: [{type:"command",command:$command}]}],
+            SessionEnd: [{hooks: [{type:"command",command:$command}]}]}}' \
+  >"$test_root/home/.codex/hooks.json"
 cp "$source_config_root/nvim/lua/integrations/tmux_persistence.lua" \
   "$test_root/home/.config/nvim/lua/integrations/tmux_persistence.lua"
-cp "$source_config_root/systemd/user/tmux-workspace.service" \
-  "$test_root/home/.config/systemd/user/tmux-workspace.service"
+printf '%s\n' '[Service]' 'ExecStart=%h/.config/tmux/scripts/workspace supervise' \
+  >"$test_root/home/.config/systemd/user/tmux-workspace.service"
 cp "$workspace" "$test_root/home/.config/tmux/scripts/workspace"
 chmod 0600 "$test_root/home/.codex/hooks.json"
 chmod 0755 "$test_root/home/.config/tmux/scripts/workspace"
@@ -251,7 +256,10 @@ jq -e '
   and all(.panes[]; .process.kind == "shell")
 ' "$manifest" >/dev/null || fail "captured topology"
 
+jq -e 'all(.sessions[]; .line_pins == {version:1,pins:[]})' "$manifest" >/dev/null \
+  || fail 'checkpoint omits empty per-session line-pin state'
 valid_generation=$generation
+valid_pin_manifest=$manifest
 TMUX_WORKSPACE_TEST_FAIL_CAPTURE=1
 export TMUX_WORKSPACE_TEST_FAIL_CAPTURE
 run_workspace_generation bad-capture save
@@ -265,6 +273,31 @@ assert_equal "$valid_generation" "$(cat "$state/dotfiles/tmux/current")" \
   || fail "failed capture retained its staging generation"
 
 "$real_tmux" -S "$socket" kill-server
+original_state=$state
+state=$test_root/invalid-pin-state
+invalid_snapshot=$state/dotfiles/tmux/snapshots/invalid/snapshot.json
+mkdir -p "$(dirname "$invalid_snapshot")"
+chmod 700 "$state/dotfiles/tmux" "$state/dotfiles/tmux/snapshots" "$state/dotfiles/tmux/snapshots/invalid"
+printf '%s\n' invalid >"$state/dotfiles/tmux/current"
+for pin_filter in \
+  '.panes[0].line_pin_session_key=null' \
+  '.panes[0].line_pin_session_key="\u0024999999"' \
+  '.panes[0].line_pin_session_key=1' \
+  '.sessions[0].line_pins=null' \
+  '.sessions[0].line_pins={version:2,pins:[]}' \
+  '.sessions[0].line_pins={version:1,pins:[{id:("0"*64),path:"/x",line:1,col:0}]}' \
+  '.sessions[0].line_pins={version:1,pins:[],extra:true}'
+do
+  jq "$pin_filter" "$valid_pin_manifest" >"$invalid_snapshot"
+  chmod 600 "$invalid_snapshot"
+  run_workspace restore
+  assert_equal 1 "$status" "invalid line-pin snapshot rejection: $pin_filter"
+  if "$real_tmux" -S "$socket" list-sessions >/dev/null 2>&1; then
+    fail 'invalid pin snapshot created a server before validation'
+  fi
+done
+state=$original_state
+pass 'invalid and future pin snapshots fail before restore'
 generation_number=1
 while [ "$generation_number" -le 12 ]; do
   padded=$(printf '%02d' "$generation_number")
@@ -282,3 +315,5 @@ assert_equal \
   "ten-generation retention"
 
 pass "workspace state boundary"
+
+python3 "$script_dir/workspace-checkpoint.py"

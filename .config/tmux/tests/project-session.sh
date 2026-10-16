@@ -46,6 +46,7 @@ real_tmux=$(command -v tmux) || fail "tmux is required"
 real_git=$(command -v git) || fail "git is required"
 
 unset TMUX TMUX_PANE
+unset TMUX_WORKSPACE_STATE_ROOT TMUX_WORKSPACE_RUNTIME_ROOT
 export SHELL=/bin/sh
 
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-t-test.XXXXXX") || fail "could not create a temporary directory"
@@ -55,6 +56,7 @@ attach_log=$test_root/attach.log
 native_log=$test_root/native.log
 state_root=$test_root/state
 runtime_root=$test_root/runtime
+test_home=$test_root/home
 ready_file=$runtime_root/dotfiles-tmux/ready
 stdout_file=$test_root/stdout
 stderr_file=$test_root/stderr
@@ -81,11 +83,19 @@ cleanup() {
 
 trap cleanup 0 HUP INT TERM
 
-mkdir -p "$shim_directory"
+mkdir -p "$shim_directory" "$test_home/.config/tmux/scripts"
+for helper in workspace project-session; do
+  cp "$script_directory/../scripts/$helper" "$test_home/.config/tmux/scripts/$helper"
+done
 
 cat >"$shim_directory/tmux" <<'SHIM'
 #!/bin/sh
 set -eu
+
+if [ "${1-}" = -S ]; then
+  [ "${2-}" = "$T_TEST_SOCKET" ] || exit 91
+  shift 2
+fi
 
 if [ "$#" -eq 0 ]; then
   [ -f "$T_TEST_READY_FILE" ] || {
@@ -151,6 +161,8 @@ run_t() {
   (
     cd "$run_directory" || exit 125
     PATH="$shim_directory:$PATH" \
+      HOME="$test_home" \
+      XDG_CONFIG_HOME="$test_home/.config" \
       TMUX="$run_tmux_value" \
       T_TEST_REAL_TMUX="$real_tmux" \
       T_TEST_SOCKET="$socket_path" \
@@ -188,7 +200,7 @@ assert_equal "$space_root" "$(private_tmux display-message -p -t '=project_alpha
 assert_equal 1 "$(private_tmux list-windows -t '=project_alpha' -F '#{window_id}' | wc -l | tr -d '[:space:]')" "single window"
 assert_equal 1 "$(private_tmux list-panes -t '=project_alpha' -F '#{pane_id}' | wc -l | tr -d '[:space:]')" "single pane"
 space_session_id=$(private_tmux display-message -p -t '=project_alpha:' '#{session_id}')
-expected_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<=project_alpha>' "$space_root")
+expected_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<%s>' "$space_root" "$space_session_id")
 assert_equal "$expected_attach" "$(cat "$attach_log")" "exact attach arguments"
 assert_empty "$native_log" "Git launch native fallback"
 
@@ -221,16 +233,15 @@ private_tmux new-session -d -s "$reuse_session_name" -c "$reuse_root"
 reuse_session_id=$(private_tmux display-message -p -t "=$reuse_session_name:" '#{session_id}')
 
 run_t "$reuse_root"
-assert_equal 0 "$run_status" "reused-name exact-directory launch"
+assert_equal 1 "$run_status" "reused-name exact-directory launch refuses a vanished target"
 [ -f "$reuse_done_file" ] || fail "reused-name fixture did not replace the session"
-expected_reuse_attach=$(printf 'attach\n<-c>\n<%s>\n<-t>\n<%s>' "$reuse_root" "$reuse_session_id")
-assert_equal "$expected_reuse_attach" "$(cat "$attach_log")" "reused-name stable session target"
+assert_empty "$attach_log" "reused-name never attaches to the replacement session"
+assert_contains 'could not resolve the shell session' "$stderr_file" "reused-name diagnostic"
 assert_equal "$reuse_replacement_root" "$(private_tmux display-message -p -t "=$reuse_session_name:" '#{session_path}')" "reused-name replacement root"
 if private_tmux has-session -t "$reuse_session_id" 2>/dev/null; then
   fail "reused-name fixture retained the original session ID"
 fi
 assert_empty "$native_log" "reused-name native fallback"
-assert_empty "$stderr_file" "reused-name diagnostics"
 reuse_session_name=
 reuse_session_id=
 reuse_replacement_root=
@@ -315,7 +326,8 @@ shared_collision=shared-$shared_hash
 run_t "$shared_two_root"
 assert_equal 0 "$run_status" "second shared launch"
 assert_equal "$shared_two_root" "$(private_tmux display-message -p -t "=$shared_collision:" '#{session_path}')" "collision-safe shared root"
-assert_contains "<=$shared_collision>" "$attach_log" "collision-safe attach target"
+shared_collision_id=$(private_tmux display-message -p -t "=$shared_collision:" '#{session_id}')
+assert_contains "<$shared_collision_id>" "$attach_log" "collision-safe attach target"
 
 conflict_target_root=$(init_repository "$test_root/target/conflict")
 conflict_base_root=$test_root/occupants/base
