@@ -110,7 +110,8 @@ def main(argv=None):
         if output == observed or (directory and observed in output.parents):
             raise Conflict('Output would change a migration input; choose a separate review directory')
     verify_unchanged(plan)
-    with output.open('x', encoding='utf-8') as stream:
+    fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as stream:
         json.dump(plan, stream, indent=2, sort_keys=True)
         stream.write('\n')
     print(f'Preview written to {output}: {len(plan["conflicts"])} conflict(s)')

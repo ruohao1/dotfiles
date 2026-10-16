@@ -128,15 +128,22 @@ def inspect_native(manifest, home):
         return ghostty_results[action]
 
     session_ok = False
+    backend = None
+    session = {}
     linux = manifest['system'].endswith('-linux')
     if linux:
         runtime = Path(f'/run/user/{os.getuid()}')
         display = os.environ.get('WAYLAND_DISPLAY','')
+        xdisplay = os.environ.get('DISPLAY','')
+        xmatch = re.fullmatch(r':([0-9]+)(?:\.[0-9]+)?',xdisplay)
+        session_type = 'wayland' if display else 'x11'
         bus = 'unix:path='+str(runtime/'bus')
         environment['XDG_RUNTIME_DIR'] = str(runtime)
         if (os.environ.get('XDG_RUNTIME_DIR',str(runtime)) == str(runtime)
                 and os.environ.get('DBUS_SESSION_BUS_ADDRESS',bus)==bus
-                and re.fullmatch(r'[A-Za-z0-9_.-]+',display)):
+                and not any(os.environ.get(name) for name in ['SSH_CONNECTION','SSH_CLIENT','SSH_TTY'])
+                and os.environ.get('XDG_SESSION_TYPE',session_type)==session_type
+                and (re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]*',display) if display else xmatch)):
             try:
                 info=runtime.lstat()
                 if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
@@ -145,14 +152,31 @@ def inspect_native(manifest, home):
                 # Directory entries change with ordinary session traffic. Bind
                 # identity/mode, then independently bind the exact local sockets.
                 observations[str(runtime)].pop('entries',None)
-                for path in [runtime/'bus',runtime/display]:
+                sockets = [(runtime/'bus', {os.getuid()})]
+                if display:
+                    sockets.append((runtime/display, {os.getuid()}))
+                    backend = 'wl-copy'
+                    session = {'WAYLAND_DISPLAY':display}
+                else:
+                    directory = Path('/tmp/.X11-unix')
+                    info=directory.lstat()
+                    if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=0
+                            or (info.st_mode&0o022 and not info.st_mode&stat.S_ISVTX)):
+                        raise OSError('unsafe X11 socket directory')
+                    observe(directory)
+                    observations[str(directory)].pop('entries',None)
+                    sockets.append((directory/('X'+xmatch[1]), {0,os.getuid()}))
+                    # The editor/tmux use their existing OSC 52 fallback on X11.
+                    backend = 'osc52'
+                    session = {'DISPLAY':xdisplay}
+                for path, owners in sockets:
                     info=path.lstat(); observe(path)
-                    if not stat.S_ISSOCK(info.st_mode) or info.st_uid!=os.getuid():
+                    if not stat.S_ISSOCK(info.st_mode) or info.st_uid not in owners:
                         raise OSError('foreign session socket')
                     with socket.socket(socket.AF_UNIX) as connection:
                         connection.settimeout(2); connection.connect(str(path))
                 session_ok=True
-                environment.update(WAYLAND_DISPLAY=display,DBUS_SESSION_BUS_ADDRESS=bus)
+                environment.update(session,DBUS_SESSION_BUS_ADDRESS=bus)
             except OSError:
                 pass
     else:
@@ -215,7 +239,15 @@ def inspect_native(manifest, home):
                 manager=next((x.get('systemctlPath') for x in manifest.get('serviceManagerEffects',[]) if x['manager']=='systemd'),None) or provider('systemctl')
                 state=run([manager,'--user','is-system-running']) if manager else {'status':None,'stdout':''}
                 claims[expected[0]]=state['status'] in [0,1] and state['stdout'].strip() in ['running','degraded']
-                commands=[provider(name) for name in ['wl-copy','wl-paste','cliphist']]
+                # Native capture stays outside HM ownership, including partial installs.
+                capture = [observe(home/'.config'/name)['type']!='absent' for name in [
+                    'hypr/hyprland.lua','hypr/hyprland.conf','clipboard-history/store','cliphist/config',
+                    'systemd/user/cliphist.service.d/override.conf','systemd/user/cliphist.service',
+                    'systemd/user/default.target.wants/cliphist.service',
+                    'systemd/user/graphical-session.target.wants/cliphist.service']]
+                commands=[provider(name) for name in (['wl-copy','wl-paste'] if backend=='wl-copy' or any(capture) else [])]
+                if any(capture):
+                    commands.extend([provider('cliphist'), backend=='wl-copy'])
             else:
                 state=run(['/bin/launchctl','print',f'gui/{os.getuid()}'])
                 claims[expected[0]]=state['status']==0
@@ -228,6 +260,8 @@ def inspect_native(manifest, home):
         record=dict(dependency,status='observed' if all(claims.values()) else 'unverified',
             claims=[{'claim':name,'status':'observed' if passed else 'unverified'} for name,passed in claims.items()],
             pending=PENDING,binding=binding,observations=dict(observations),queries=list(queries.values()))
+        if identity=='desktop-clipboard' and linux:
+            record.update(backend=backend,session=session)
         if command:
             record.update(command=command,selectedExecutable=selected)
             if selected is None: record['status']='missing'

@@ -6841,6 +6841,30 @@ check_clipboard_history() {
   for clipboard_command in python3 id find; do
     require_command "$clipboard_command" || return 1
   done
+  if ! python3 - "$config_root" "$0" "$checker_workspace_source" <<'CLIPBOARD_SOURCE_CHECK'
+import importlib.util
+from pathlib import Path
+import sys
+try:
+    config, checker, workspace = map(Path, sys.argv[1:])
+    source = checker.resolve(strict=True).parents[2]
+    if str(workspace).startswith('/nix/store/') and str(workspace).endswith('-dotfiles-runtime/.config/tmux/scripts/workspace'):
+        source = workspace.parents[3]
+    validator = source/'.config/dotfiles/lib/config-source.py'
+    spec = importlib.util.spec_from_file_location('config_source', validator)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for relative in ['nvim/lua/clipboard/history.lua', 'nvim/tests/clipboard_history.lua']:
+        assert module.valid_source(config/relative, source/'.config'/relative)
+except (AssertionError, ImportError, OSError, RuntimeError, ValueError):
+    sys.exit(1)
+CLIPBOARD_SOURCE_CHECK
+  then
+    fail 'clipboard history editor sources are missing or untrusted'
+    return 1
+  fi
+
+  if [ "$clipboard_capture_required" = true ]; then
   clipboard_fixture=$check_tmp/clipboard-history
   if [ -e "$clipboard_fixture" ] || [ -L "$clipboard_fixture" ] \
     || ! (umask 077 && mkdir "$clipboard_fixture"); then
@@ -6883,8 +6907,6 @@ try:
                      '.config/systemd/user/cliphist.service.d/override.conf']
     for relative in capture_paths:
         ordinary_file(config/relative.removeprefix('.config/'), relative.endswith('/store'))
-    for relative in ['nvim/lua/clipboard/history.lua', 'nvim/tests/clipboard_history.lua']:
-        ordinary_file(config/relative)
     policy = ['max-items 500','max-dedupe-search 500','min-store-length 1','preview-width 100']
     assert normalized(config/'cliphist/config') == policy, 'unexpected retention policy'
     override = ['[Service]','ExecStart=',
@@ -7016,6 +7038,10 @@ CLIPBOARD_CHECK
     fail 'clipboard history static or private runtime assertions failed'
   fi
 
+  else
+    printf '%s\n' 'SKIP  native Hyprland clipboard capture is not configured'
+  fi
+
   clipboard_nvim_root=$check_tmp/clipboard-nvim
   clipboard_nvim_output=$check_tmp/clipboard-nvim.txt
   if ! command -v nvim >/dev/null 2>&1; then
@@ -7059,7 +7085,7 @@ CLIPBOARD_LOG_CHECK
   case ${DOTFILES_CHECK_CLIPBOARD_HISTORY_LIVE+x}:${DOTFILES_CHECK_CLIPBOARD_HISTORY_LIVE:-} in
     :) printf '%s\n' 'SKIP  live clipboard history capture validation was not requested' ;;
     x:1)
-      if [ "$platform" = linux ] && [ -n "${WAYLAND_DISPLAY:-}" ] \
+      if [ "$clipboard_capture_required" = true ] && [ -n "${WAYLAND_DISPLAY:-}" ] \
         && command -v systemctl >/dev/null 2>&1 \
         && systemctl --user is-enabled --quiet cliphist.service \
         && systemctl --user is-active --quiet cliphist.service; then
@@ -7138,6 +7164,21 @@ case $checker_workspace_source in
     fi
     ;;
 esac
+# Partial or dangling native installs still require capture validation.
+clipboard_capture_required=false
+if [ "$platform" = linux ]; then
+  for clipboard_native_asset in \
+    hypr/hyprland.lua hypr/hyprland.conf \
+    clipboard-history/store cliphist/config \
+    systemd/user/cliphist.service.d/override.conf systemd/user/cliphist.service \
+    systemd/user/default.target.wants/cliphist.service \
+    systemd/user/graphical-session.target.wants/cliphist.service
+  do
+    if [ -e "$config_root/$clipboard_native_asset" ] || [ -L "$config_root/$clipboard_native_asset" ]; then
+      clipboard_capture_required=true
+    fi
+  done
+fi
 macos_ghostty_entry="$HOME/Library/Application Support/com.mitchellh.ghostty/config.ghostty"
 
 check_tmp=$(mktemp -d "${TMPDIR:-/tmp}/terminal-stack-check.XXXXXX") || exit 1
@@ -7459,10 +7500,15 @@ else
   fail "Git summary helper is not executable"
 fi
 
+if [ "$clipboard_capture_required" = true ]; then
+  for clipboard_native_asset in \
+    clipboard-history/store cliphist/config systemd/user/cliphist.service.d/override.conf
+  do
+    require_file "$config_root/$clipboard_native_asset" || static_lint_files_ready=false
+  done
+fi
+
 for static_lint_file in \
-  "$config_root/clipboard-history/store" \
-  "$config_root/cliphist/config" \
-  "$config_root/systemd/user/cliphist.service.d/override.conf" \
   "$terminal_stack_checker" \
   "$nvim_root/.stylua.toml" \
   "$nvim_root/init.lua" \
@@ -7592,6 +7638,10 @@ if [ "$static_lint_files_ready" = true ]; then
   shell_syntax_ok=true
   : > "$check_tmp/shell-syntax.txt"
   for static_shell_file in "$git_summary" "$terminal_stack_checker" "$config_root/clipboard-history/store"; do
+    if [ "$static_shell_file" = "$config_root/clipboard-history/store" ] \
+      && [ "$clipboard_capture_required" = false ]; then
+      continue
+    fi
     if ! sh -n "$static_shell_file" >> "$check_tmp/shell-syntax.txt" 2>&1; then
       shell_syntax_ok=false
     fi
@@ -7720,11 +7770,14 @@ fi
 
 if [ "$static_shellcheck_ready" = true ] \
   && [ "$static_lint_files_ready" = true ]; then
-  if shellcheck -s sh "$git_summary" "$terminal_stack_checker" "$config_root/clipboard-history/store" \
+  if { [ "$clipboard_capture_required" = false ] \
+      || shellcheck -s sh "$config_root/clipboard-history/store"; } \
+    > "$check_tmp/shellcheck.txt" 2>&1 \
+    && shellcheck -s sh "$git_summary" "$terminal_stack_checker" \
     "$tmux_root/scripts/location-pins" "$tmux_root/scripts/workspace" \
     "$tmux_root/tests/location-pins.sh" "$tmux_root/tests/workspace-state.sh" \
     "$tmux_root/tests/workspace-restore.sh" "$tmux_root/tests/project-session.sh" "$HOME/.local/bin/t" \
-    > "$check_tmp/shellcheck.txt" 2>&1 \
+    >> "$check_tmp/shellcheck.txt" 2>&1 \
     && [ ! -s "$check_tmp/shellcheck.txt" ]; then
     pass "POSIX ShellCheck is exact and silent"
   else

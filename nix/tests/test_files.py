@@ -33,7 +33,7 @@ class FileDeploymentTests(unittest.TestCase):
 
     def test_complete_trees_and_platform_selection(self):
         files = {item["target"]: Path(item["source"]) for item in MANIFEST["files"]}
-        for target in [".config/nvim/init.lua", ".config/nvim/lua/data_query/tool.lua",
+        for target in [".config/nvim/init.lua", ".config/nvim/.stylua.toml", ".config/nvim/lua/data_query/tool.lua",
                        ".config/nvim/scripts/data-query-runner.py", ".config/nvim/python/pyproject.toml",
                        ".config/nvim/python/uv.lock", ".config/nvim/tests/data_query_tool.lua",
                        ".config/nvim/LINE-PINS.md", ".config/tmux/scripts/workspace",

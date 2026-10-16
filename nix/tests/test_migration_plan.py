@@ -357,6 +357,18 @@ class MigrationPlanTests(unittest.TestCase):
             self.run_cli_output(self.generation / 'plan.json')
         self.assertEqual(snapshot(self.generation), before)
 
+    def test_cli_preview_under_permissive_umask_is_readable_by_apply(self):
+        from migration.transaction import read_json
+        output = self.root / 'plan.json'
+        previous_umask = os.umask(0o002)
+        try:
+            self.assertEqual(self.run_cli_output(output), 0)
+        finally:
+            os.umask(previous_umask)
+        preview = read_json(output)
+        self.assertEqual(preview['home'], str(self.home))
+        self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+
     def test_cli_valid_output_with_outside_ancestor_alias_remains_exclusive(self):
         reviews = self.root / 'reviews/nested'
         reviews.mkdir(parents=True)

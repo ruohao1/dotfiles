@@ -12,7 +12,7 @@ let
       else throw "Non-regular application source: ${relative}"
     ) (builtins.attrNames (builtins.readDir (root + "/${prefix}"))));
   nvimPaths = builtins.filter (p:
-    p == "init.lua" || builtins.match "[^/]+\\.md" p != null
+    builtins.elem p [ "init.lua" ".stylua.toml" ] || builtins.match "[^/]+\\.md" p != null
     || builtins.match "(lua|lsp)/.*\\.lua" p != null
     || p == "scripts/data-query-runner.py"
     || builtins.elem p [ "python/pyproject.toml" "python/uv.lock" ]

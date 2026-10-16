@@ -38,5 +38,6 @@ jobs:
               python3 -B nix/tests/check-packages.py --self-test
               python3 -B -m unittest discover -v -s nix/tests -p test_entrypoint.py
               python3 -B -m unittest discover -v -s nix/tests -p test_ownership.py
+              python3 -B -m unittest discover -v -s nix/tests -p test_checker_clipboard.py
               python3 -B -m unittest discover -v -s nix/tests -p "test_migration_*.py"
             '

@@ -135,6 +135,13 @@ target host before activation:
   `>=3.10,<3.15`. Package installation does not recreate or overwrite that project.
 - Clipboard services, desktop/window-manager integration, OS preferences, and
   permissions appropriate to the native host.
+  Linux preview accepts a verified local Wayland or X11 session and current-user
+  service manager. Wayland uses `wl-copy`/`wl-paste`; X11 retains the editor's
+  tmux/OSC52 fallback. Cliphist and Wayland capture tools are required only when
+  native Hyprland configuration or clipboard capture assets/services are present.
+  Partial capture installations remain errors. Remote/SSH sessions do not satisfy
+  local desktop readiness, and full clipboard/terminal behavior still needs native
+  workflow validation.
 - Linux: root-owned, executable Bubblewrap without group/world write permissions,
   plus a successful real namespace probe. Installing a store binary alone cannot
   prove this requirement. Keep GNU `timeout` discoverable through `command -p`,
@@ -148,7 +155,7 @@ preview/platform validation; listing them here does not make them optional.
 ## Verification
 
 The [Nix source tests workflow](../.github/workflows/nix-source-tests.yml) runs
-the package-checker self-test, entrypoint, ownership and migration source suites
+the package-checker self-test, entrypoint, ownership, clipboard checker and migration source suites
 on Ubuntu pull requests and pushes to `main`. It uses private fixture homes,
 reports test results and skips, and needs no Nix installation. These checks substitute
 activation and service managers; a passing CI job does not establish Nix builds
@@ -254,17 +261,21 @@ extensions, tmux state, `.cfg`, bootstrap journals, native packages and unrelate
 files. The preview does not automatically adopt an unrelated Home Manager
 installation or reconcile differing local service files.
 
-From any caller directory, choose an unused explicit review file:
+From any caller directory, create a private temporary review directory outside
+HOME and use an unused absolute plan path:
 
 ```sh
+review_dir=$(mktemp -d /tmp/dotfiles-review.XXXXXX)
 /path/to/checkout/.config/dotfiles/bootstrap-nix --source-root /path/to/checkout -- \
-  plan --profile your-host --output 'reviews/plan.json'
-# Inspect the JSON, resolve every conflict and re-preview after changes.
+  plan --profile your-host --output "$review_dir/plan.json"
+# Inspect the JSON, resolve every conflict and re-preview to an unused plan path.
 /path/to/checkout/.config/dotfiles/bootstrap-nix --source-root /path/to/checkout -- \
-  apply --plan 'reviews/plan.json'
+  apply --plan "$review_dir/plan.json"
 ```
 
-Create the review directory first. Relative paths retain the caller's meaning.
+The preview observes all of HOME, so writing a plan anywhere inside HOME would
+change a recorded migration input and is refused. Keep the review directory
+outside HOME and every other recorded input (including the source and generation).
 Preview builds/inspects the generation and writes only the chosen plan (plus Nix
 store/evaluator cache effects). Existing output files are refused. Apply checks
 exact reviewed evidence again under the ownership lock. Reapplying that plan is
