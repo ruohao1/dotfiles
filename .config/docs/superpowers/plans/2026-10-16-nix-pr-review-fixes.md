@@ -79,3 +79,24 @@ existing private-fixture trust checks; the correct isolated run above passed.
 
 Independent review found no must-fix defects in the combined repair. Bash/POSIX
 shell syntax, ShellCheck, Python syntax, and diff whitespace checks passed.
+
+## Review follow-up at `1b70ad1`
+
+The follow-up review found that generic preview evidence restored the shared
+X11 directory entries deliberately omitted by the native collector. An unrelated
+display could therefore invalidate the selected session's preview.
+
+- [x] Add an integration regression for unrelated X11 display creation/removal;
+  retain failures for selected socket and directory identity/permission changes.
+- [x] Keep shared session directories' filtered native evidence authoritative
+  when collecting generic preview evidence.
+- [x] Clarify that preview checks session/providers while the terminal checker
+  validates capture-file completeness.
+- [x] Run focused and isolated source checks, independently review the small
+  follow-up, and update the existing draft PR.
+
+Follow-up verification: the new integration regression failed before the fix and
+passed afterward. The exact isolated source workflow then ran 149 tests:
+137 passed, 12 existing native/Nix-dependent skips, and no failures. Independent
+focused review found no issues; Python syntax and diff checks passed. Native
+activation and Nix build acceptance remain pending.

@@ -139,9 +139,10 @@ target host before activation:
   service manager. Wayland uses `wl-copy`/`wl-paste`; X11 retains the editor's
   tmux/OSC52 fallback. Cliphist and Wayland capture tools are required only when
   native Hyprland configuration or clipboard capture assets/services are present.
-  Partial capture installations remain errors. Remote/SSH sessions do not satisfy
-  local desktop readiness, and full clipboard/terminal behavior still needs native
-  workflow validation.
+  Preview verifies the session and required providers; the separate terminal
+  checker validates capture files and rejects partial capture installations.
+  Remote/SSH sessions do not satisfy local desktop readiness, and full
+  clipboard/terminal behavior still needs native workflow validation.
 - Linux: root-owned, executable Bubblewrap without group/world write permissions,
   plus a successful real namespace probe. Installing a store binary alone cannot
   prove this requirement. Keep GNU `timeout` discoverable through `command -p`,

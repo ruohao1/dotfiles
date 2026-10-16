@@ -80,6 +80,63 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertIn(str(runtime/'bus'), result['observations'])
         self.assertEqual(list(self.home.iterdir()), [])
 
+    def test_x11_plan_ignores_other_displays_but_rejects_session_drift(self):
+        _, _, x11 = self.desktop('x11')
+        from migration.plan import Conflict, inspect, verify_unchanged
+        from migration.transaction import validate_plan
+        self.enterContext(patch('migration.plan.current_system', return_value='x86_64-linux'))
+        self.home.chmod(0o700)
+        generation = self.root/'generation'
+        generation.mkdir()
+        self.manifest.update(schema=1, homeDirectory=str(self.home), username='fixture',
+            activationPackage=str(generation), mutableSeeds=[],
+            profilePaths=[], services=[], serviceManagerEffects=[])
+        preview = inspect(self.manifest, self.home)
+        self.assertEqual(preview['conflicts'], [])
+        validate_plan(preview, self.manifest)
+        verify_unchanged(preview)
+
+        other = self.enterContext(socket.socket(socket.AF_UNIX))
+        other.bind(str(x11/'X1'))
+        other.listen(1)
+        verify_unchanged(preview)
+        validate_plan(preview, self.manifest)
+        other.close()
+        (x11/'X1').unlink()
+        verify_unchanged(preview)
+        validate_plan(preview, self.manifest)
+
+        selected = x11/'X0'
+        for path, mode in [(selected, 0o600), (x11, 0o1755)]:
+            with self.subTest(changed_mode=path):
+                original = path.stat().st_mode & 0o7777
+                path.chmod(mode)
+                with self.assertRaises(Conflict):
+                    verify_unchanged(preview)
+                path.chmod(original)
+                verify_unchanged(preview)
+
+        # Keep X0's inode while replacing only the shared directory.
+        displaced = x11.with_name('previous-x11')
+        x11.rename(displaced)
+        x11.mkdir()
+        x11.chmod(0o1777)
+        (displaced/'X0').rename(selected)
+        with self.assertRaises(Conflict):
+            verify_unchanged(preview)
+        selected.rename(displaced/'X0')
+        x11.rmdir()
+        displaced.rename(x11)
+        verify_unchanged(preview)
+
+        selected.rename(x11/'previous-X0')
+        replacement = self.enterContext(socket.socket(socket.AF_UNIX))
+        replacement.bind(str(selected))
+        replacement.listen(1)
+        with self.assertRaises(Conflict):
+            verify_unchanged(preview)
+        self.assertEqual(list(self.home.iterdir()), [])
+
     def test_wayland_without_capture_does_not_require_cliphist(self):
         module, runtime, _ = self.desktop('wayland')
         result = module.inspect_native(self.manifest, self.home)[0]

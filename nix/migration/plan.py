@@ -272,8 +272,9 @@ def inspect(manifest, home, *, transaction_id=None):
     plan['nativeManifest'] = manifest
     plan['nativePrerequisites'] = inspect_native(manifest, home)
     for record in plan['nativePrerequisites']:
-        for path in record['observations']:
-            if path != f'/run/user/{os.getuid()}':
+        for path, state in record['observations'].items():
+            # Native session directories bind identity without unrelated entries.
+            if state['type'] != 'directory' or 'entries' in state:
                 observe(path)
         if record['status'] != 'observed':
             conflict('native-' + record['status'], record['id'],
