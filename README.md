@@ -88,12 +88,12 @@ Rollback intentionally keeps installed packages.
 ## Nix and Home Manager (experimental)
 
 The Nix route is available through [bootstrap-nix](.config/dotfiles/bootstrap-nix).
-It remains experimental. An offline Ubuntu 24.04.5 x86_64 smoke test passed Nix
-installation and direct Home Manager activation, a second generation, repeat and
-rollback. Migration-wrapper acceptance on Ubuntu, native prerequisites, full
-GUI/editor workflows, other Linux distributions and native macOS remain pending.
-The native route above remains the installation default. See the
-[validation record](nix/validation/2026-10-16-ubuntu-smoke.md) and
+It remains experimental. A prepared offline Ubuntu 24.04.5 x86_64 fixture verified
+public preview, apply, repeat, generation rollback and legacy restoration across
+two VM runs. Full GUI/editor workflows, X11 runtime, ARM Linux, other Linux
+distributions and native macOS remain pending. The native route above remains
+the installation default. See the
+[wrapper validation record](nix/validation/2026-10-17-ubuntu-wrapper.md) and
 [evidence matrix and migration
 instructions](nix/README.md#installation-and-migration-experimental).
 

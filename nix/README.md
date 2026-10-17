@@ -149,6 +149,12 @@ target host before activation:
   independently of the Home Manager PATH. The coreutils package does not replace
   this host prerequisite.
 
+Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor. The
+[Ubuntu validation fixture](validation/2026-10-17-ubuntu-wrapper.md) grants
+`userns` to its exact immutable Bubblewrap executable while retaining the global
+restriction. This follows [Ubuntu's per-application policy guidance](https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions).
+It is separate native preparation; migration does not install or change that policy.
+
 Darwin data queries retain the existing unsupported result. No sandbox condition
 is relaxed for single-user Nix. Essential missing native prerequisites must fail
 preview/platform validation; listing them here does not make them optional.
@@ -173,8 +179,8 @@ nix build .#checks.x86_64-linux.packages .#checks.x86_64-linux.home --no-link
 Use the corresponding target name on each matching native builder. All-system
 evaluation is distinct from a native build, and a native build is distinct from
 activation and terminal/editor runtime validation. The Ubuntu direct-activation
-smoke result is recorded below; native migration-wrapper acceptance and the
-remaining platform workflows are still pending.
+and prepared public-wrapper fixture results are recorded below. Remaining native
+platform and application workflows are still pending.
 
 Normal commands use `flake.lock`. Updates are deliberate reviewed lock changes;
 no automatic input updates occur during activation. Never activate a disposable
@@ -375,10 +381,19 @@ remain separate recorded platform gates. Never run it on a live user manager.
 
 | Target / environment | Evaluation | Native package/home build | Distro migration | Full GUI/editor workflow |
 | --- | --- | --- | --- | --- |
-| x86_64 Linux | Passed | Passed in isolated builder | NixOS integration fixture passed; Ubuntu direct Home Manager activation passed; Ubuntu wrapper and Debian/Arch migration pending | Pending |
+| x86_64 Linux | Passed | Passed in isolated builder | NixOS integration and prepared Ubuntu public-wrapper fixtures passed; Debian/Arch migration pending | Pending |
 | aarch64 Linux | Passed | Pending matching runner | Pending | Pending |
 | x86_64 Darwin | Passed with upstream warning | Pending matching runner | Pending native macOS | Pending |
 | aarch64 Darwin | Passed | Pending matching runner | Pending native macOS | Pending |
+
+On 2026-10-17, production source `c19c5810dc7d0eaba2e87e8f7f2ac6633d2dac50`,
+with fixture-only host declarations, exercised the public migration wrapper on
+an offline Ubuntu 24.04.5 x86_64 VM. Preview, apply, repeat, generation rollback
+and legacy restoration passed across two VM runs with a guarded continuation.
+Native prerequisites were prepared separately, including a scoped Bubblewrap
+AppArmor policy. The fixture kept the same package inventory; actual package
+upgrades, preservation of a nonempty native Nix package profile and full desktop
+workflows remain untested. See the [wrapper validation record](validation/2026-10-17-ubuntu-wrapper.md).
 
 On 2026-10-17, source `6fd61bc335e5342b0c83811b658b6d526eb443cf` with the unchanged
 lock evaluated all six non-VM check derivations on each of the four systems.
