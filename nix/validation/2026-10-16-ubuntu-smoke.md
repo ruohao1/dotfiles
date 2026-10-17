@@ -91,10 +91,11 @@ were removed. Existing inputs and evidence were preserved.
 
 - The public preview/apply/rollback/reverse-handoff wrapper on Ubuntu. Direct
   generation activation bypasses that wrapper and its native preflight.
-- Native prerequisites and full terminal/editor/desktop workflows. The current
-  Linux wrapper requires Wayland and clipboard tools; this headless smoke does
-  not establish X11/headless wrapper support. Native clipboard capture and
-  browser opening still require separate setup and validation.
+- Native prerequisites and full terminal/editor/desktop workflows. The source
+  tested by this smoke required Wayland and clipboard tools. Later source
+  changes accept local X11 sessions; this smoke does not validate that path or
+  headless wrapper support. Native clipboard capture and browser opening still
+  require separate setup and validation.
 - Debian, Arch, ARM Linux, and both native macOS architectures.
 - An explicit real-host profile and an actual installation, which are deferred.
 

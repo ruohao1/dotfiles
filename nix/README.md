@@ -380,6 +380,14 @@ remain separate recorded platform gates. Never run it on a live user manager.
 | x86_64 Darwin | Passed with upstream warning | Pending matching runner | Pending native macOS | Pending |
 | aarch64 Darwin | Passed | Pending matching runner | Pending native macOS | Pending |
 
+On 2026-10-17, source `6fd61bc335e5342b0c83811b658b6d526eb443cf` with the unchanged
+lock evaluated all six non-VM check derivations on each of the four systems.
+All six x86_64 Linux targets (`files`, `home`, `entrypoint`, `migration`,
+`packages`, and `terminal`) built successfully offline in the isolated builder.
+This includes the evaluated StyLua deployment and rendered terminal checks;
+11 entrypoint cases remained explicitly skipped. No home was activated, and
+native platform acceptance remains open. See the [build validation record](validation/2026-10-17-nix-builds.md).
+
 On 2026-10-16, source `cc2825595284c1a2c4f50e86b8f01bcf7993aece` with an unchanged
 lock passed 119 isolated source tests, with 12 skipped and no failures. A
 disposable offline Ubuntu 24.04.5 x86_64 VM passed Nix installation and direct
