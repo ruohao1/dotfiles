@@ -448,7 +448,7 @@ eq(
   { "p  Projects", "r  Recent files", "q  Quit" },
   "approved menu preserves all three actions"
 )
-eq(#harness.autocmds, 8, "startup event routes")
+eq(#harness.autocmds, 9, "startup event routes")
 eq(harness.augroup_calls, {
   { name = "dotfiles-startup", options = { clear = true } },
 }, "exact startup augroup")
@@ -461,6 +461,7 @@ eq(
     "VimEnter",
     "User",
     { "BufEnter", "WinEnter" },
+    "WinResized",
     "CursorMoved",
     "DirChanged",
     "FocusGained",
@@ -674,6 +675,16 @@ eq(
 lifecycle:invoke("VimResized")
 lifecycle:flush()
 eq(#lifecycle.requests, 1, "resize uses cached Git data")
+local window_refreshes = #lifecycle.refreshes
+lifecycle:invoke("WinResized")
+lifecycle:flush()
+eq(#lifecycle.refreshes, window_refreshes + 1, "window resize recomposes the visible starter")
+eq(lifecycle.selected, 3, "window resize preserves the selected action")
+eq(#lifecycle.requests, 1, "window resize uses cached Git data")
+lifecycle.current_buffer = 10
+lifecycle:invoke("WinResized")
+eq(#lifecycle.refreshes, window_refreshes + 1, "window resize skips hidden starters")
+lifecycle.current_buffer = 9
 lifecycle:invoke("FocusGained")
 local stale_focus = lifecycle.timers[1].callback
 stale_focus()
@@ -720,6 +731,9 @@ lifecycle:invoke("FocusGained")
 local closing_timer = lifecycle.timers[#lifecycle.timers]
 lifecycle:invoke("BufWipeout")
 eq(closing_timer.closed, true, "wipe closes its focus timer")
+refresh_count = #lifecycle.refreshes
+lifecycle:invoke("WinResized")
+eq(#lifecycle.refreshes, refresh_count, "window resize ignores closed starter buffers")
 local restore_navigation = new_controller_harness()
 test.new(restore_navigation.dependencies):setup()
 restore_navigation:invoke("User")
@@ -1852,6 +1866,59 @@ local live_ok, live_error = xpcall(function()
     assert_selection("q  Quit", "shared-row Quit")
     child_lua(child, [[vim.o.columns = 120; vim.api.nvim_exec_autocmds("VimResized", {})]])
     eq(assert_selection("q  Quit", "wide resize").requests, 1, "resize never recollects Git")
+    child_lua(
+      child,
+      [[
+      _G.startup_window = vim.api.nvim_get_current_win()
+      vim.cmd.vnew()
+      vim.api.nvim_win_set_width(_G.startup_window, 39)
+    ]]
+    )
+    wait_child_lua(
+      child,
+      [[
+      local buffer = vim.api.nvim_win_get_buf(_G.startup_window)
+      local width = vim.api.nvim_win_get_width(_G.startup_window)
+      for _, line in ipairs(vim.api.nvim_buf_get_lines(buffer, 0, -1, false)) do
+        if vim.fn.strdisplaywidth(line) > width then return false end
+      end
+      return true
+    ]],
+      "window resize fits cached Starter content without entering its buffer"
+    )
+    eq(
+      child_lua(child, [[return { vim.o.laststatus, #_G.startup_requests }]]),
+      { 3, 1 },
+      "background window resize preserves the regular statusline and cached Git request"
+    )
+    child_lua(child, [[vim.cmd.close()]])
+    eq(
+      assert_selection("q  Quit", "closing the adjacent split").requests,
+      1,
+      "closing an adjacent split does not collect Git"
+    )
+    child_lua(child, [[vim.cmd.vsplit(); vim.api.nvim_win_set_width(0, 80)]])
+    wait_child_lua(
+      child,
+      [[
+      local buffer = vim.api.nvim_get_current_buf()
+      for _, window in ipairs(vim.fn.win_findbuf(buffer)) do
+        local width = vim.api.nvim_win_get_width(window)
+        for _, line in ipairs(vim.api.nvim_buf_get_lines(buffer, 0, -1, false)) do
+          if vim.fn.strdisplaywidth(line) > width then return false end
+        end
+      end
+      return true
+    ]],
+      "shared Starter content fits both asymmetric windows"
+    )
+    eq(
+      assert_selection("q  Quit", "shared Starter resize").requests,
+      1,
+      "shared resize uses cached Git"
+    )
+    child_lua(child, [[vim.cmd.close()]])
+    assert_selection("q  Quit", "closing one shared Starter window")
     child_lua(child, [[require("mini.starter").open()]])
     assert_selection("p  Projects", "second buffer")
     child_lua(child, [[_G.startup_requests[1].callback({ kind = "non_repository" })]])

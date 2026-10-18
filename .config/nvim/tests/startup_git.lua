@@ -135,6 +135,7 @@ local function harness(overrides)
       return {
         PATH = "/test/bin",
         HOME = "/secret",
+        XDG_CONFIG_HOME = "/user-config",
         GIT_DIR = "/secret/repo",
         GIT_CONFIG_COUNT = "1",
       }
@@ -211,6 +212,7 @@ eq(#h.views, 0, "collector never delivers synchronously")
 eq(h.calls[1].argv, {
   "/usr/bin/git",
   "--no-pager",
+  "--no-lazy-fetch",
   "-c",
   "core.fsmonitor=false",
   "-c",
@@ -225,15 +227,19 @@ eq(h.calls[1].argv, {
 eq(h.calls[1].options.clear_env, true)
 eq(h.calls[1].options.env, {
   PATH = "/test/bin",
+  HOME = "/secret",
+  XDG_CONFIG_HOME = "/user-config",
   LC_ALL = "C",
   LANG = "C",
   GIT_CONFIG_NOSYSTEM = "1",
-  GIT_CONFIG_GLOBAL = "/dev/null",
   GIT_CONFIG_SYSTEM = "/dev/null",
   GIT_ATTR_NOSYSTEM = "1",
   GIT_OPTIONAL_LOCKS = "0",
   GIT_TERMINAL_PROMPT = "0",
   GIT_PAGER = "cat",
+  GIT_TRACE2 = "0",
+  GIT_TRACE2_PERF = "0",
+  GIT_TRACE2_EVENT = "0",
 })
 h:discover()
 eq(#h.calls, 5, "status and history launch concurrently after preflight")
@@ -477,9 +483,9 @@ local function command(cwd, arguments)
   assert(result.code == 0 and result.signal == 0, result.stderr)
   return result.stdout
 end
-local function collect(directory)
+local function collect(directory, collector)
   local views = {}
-  local request = git.collect(directory, function(view)
+  local request = (collector or git).collect(directory, function(view)
     views[#views + 1] = view
   end)
   assert(
@@ -494,6 +500,8 @@ local function collect(directory)
 end
 local inherited = {}
 for _, key in ipairs({
+  "HOME",
+  "XDG_CONFIG_HOME",
   "GIT_DIR",
   "GIT_WORK_TREE",
   "GIT_CONFIG_GLOBAL",
@@ -504,6 +512,139 @@ for _, key in ipairs({
   inherited[key] = vim.env[key] or false
 end
 local fixture_ok, fixture_error = xpcall(function()
+  local origin, partial = fixture .. "/origin", fixture .. "/partial"
+  assert(vim.fn.mkdir(origin, "p") == 1)
+  command(origin, { "init", "--initial-branch=main", "--quiet" })
+  command(origin, { "config", "uploadpack.allowFilter", "true" })
+  local lines = {}
+  for index = 1, 100 do
+    lines[index] = "original line " .. index .. " with enough shared content for rename detection\n"
+  end
+  write(origin .. "/old", table.concat(lines))
+  command(origin, { "add", "old" })
+  command(origin, { "commit", "--quiet", "-m", "partial clone fixture" })
+  command(
+    fixture,
+    { "clone", "--quiet", "--filter=blob:none", "--no-checkout", "file://" .. origin, partial }
+  )
+  command(partial, { "read-tree", "HEAD" })
+  lines[50] = "changed line\n"
+  write(partial .. "/new", table.concat(lines))
+  local new_oid = command(partial, { "hash-object", "-w", "new" }):gsub("\n$", "")
+  command(partial, { "update-index", "--force-remove", "old" })
+  command(partial, { "update-index", "--add", "--cacheinfo", "100644," .. new_oid .. ",new" })
+  assert(
+    command(partial, { "rev-list", "--objects", "--missing=print", "HEAD" }):find("\n?", 1, true)
+  )
+  local upload = fixture .. "/upload-helper"
+  write(upload, '#!/bin/sh\n: > "$0.executed"\nexec "' .. executable .. '" upload-pack "$@"\n')
+  assert(vim.uv.fs_chmod(upload, 448))
+  command(partial, { "config", "remote.origin.uploadpack", upload })
+  local packs = vim.fn.glob(partial .. "/.git/objects/pack/*", true, true)
+  local partial_view = collect(partial)
+  eq(vim.uv.fs_stat(upload .. ".executed"), nil, "collection must never start a lazy-fetch helper")
+  eq(
+    vim.fn.glob(partial .. "/.git/objects/pack/*", true, true),
+    packs,
+    "collection must not fetch missing objects"
+  )
+  eq(partial_view.kind, "error", "missing objects use the safe fallback")
+  local legacy = fixture .. "/legacy-git"
+  write(
+    legacy,
+    '#!/bin/sh\nfor argument do\nif [ "$argument" = --no-lazy-fetch ]; then\nexit 129\nfi\ndone\n: > "$0.accepted"\nexec "'
+      .. executable
+      .. '" "$@"\n'
+  )
+  assert(vim.uv.fs_chmod(legacy, 448))
+  local legacy_collector = git._test.new({
+    exepath = function()
+      return legacy
+    end,
+    system = vim.system,
+    environ = vim.fn.environ,
+    schedule = vim.schedule,
+    new_timer = vim.uv.new_timer,
+    realpath = vim.uv.fs_realpath,
+  })
+  eq(
+    collect(partial, legacy_collector).kind,
+    "error",
+    "Git without no-lazy-fetch support fails safely"
+  )
+  eq(
+    vim.uv.fs_stat(legacy .. ".accepted"),
+    nil,
+    "unsupported Git never proceeds without the safety option"
+  )
+
+  local home, config, global_repo =
+    fixture .. "/home", fixture .. "/config", fixture .. "/global-repo"
+  assert(vim.fn.mkdir(home, "p") == 1)
+  assert(vim.fn.mkdir(config .. "/git", "p") == 1)
+  assert(vim.fn.mkdir(global_repo, "p") == 1)
+  vim.env.HOME, vim.env.XDG_CONFIG_HOME = home, config
+  command(global_repo, { "init", "--initial-branch=main", "--quiet" })
+  write(global_repo .. "/tracked", "original\n")
+  command(global_repo, { "add", "tracked" })
+  command(global_repo, { "commit", "--quiet", "-m", "global configuration fixture" })
+  write(global_repo .. "/scratch.swp", "ignored editor file\n")
+  write(home .. "/ignore", "*.swp\n")
+  write(home .. "/.gitconfig", "[core]\nexcludesFile = ~/ignore\n")
+  eq(collect(global_repo).counts.total, 0, "HOME global ignore rules remain effective")
+  write(home .. "/.gitconfig", "")
+  write(config .. "/git/ignore", "*.swp\n")
+  eq(collect(global_repo).counts.total, 0, "XDG default ignore rules remain effective")
+  local trace = fixture .. "/trace"
+  write(
+    home .. "/.gitconfig",
+    "[trace2]\nnormalTarget = "
+      .. trace
+      .. "\nperfTarget = "
+      .. trace
+      .. ".perf\neventTarget = "
+      .. trace
+      .. ".event\n"
+  )
+  eq(collect(global_repo).kind, "repository", "global tracing does not prevent collection")
+  for _, path in ipairs({ trace, trace .. ".perf", trace .. ".event" }) do
+    eq(vim.uv.fs_stat(path), nil, "global tracing must not write files")
+  end
+  write(home .. "/.gitconfig", "[i18n]\nlogOutputEncoding = UTF-16\n")
+  local encoded_view = collect(global_repo)
+  eq(encoded_view.kind, "repository", "configured history encoding preserves machine output")
+  eq(
+    encoded_view.history[1].subject,
+    "global configuration fixture",
+    "history output remains UTF-8"
+  )
+  write(home .. "/.gitconfig", "")
+
+  local global_filter = fixture .. "/global-filter-helper"
+  write(global_filter, '#!/bin/sh\n: > "$0.executed"\nsed s/worktree:/stored:/\n')
+  assert(vim.uv.fs_chmod(global_filter, 448))
+  write(global_repo .. "/.gitattributes", "tracked filter=guard\n")
+  write(global_repo .. "/tracked", "worktree:one\n")
+  command(
+    global_repo,
+    { "-c", "filter.guard.clean=" .. global_filter, "add", ".gitattributes", "tracked" }
+  )
+  command(global_repo, { "commit", "--quiet", "-m", "filtered content" })
+  assert(vim.fn.delete(global_filter .. ".executed") == 0)
+  local filtered_stat = assert(vim.uv.fs_stat(global_repo .. "/tracked"))
+  assert(
+    vim.uv.fs_utime(global_repo .. "/tracked", filtered_stat.atime.sec, filtered_stat.mtime.sec + 2)
+  )
+  local global_include = fixture .. "/global-include"
+  write(global_include, '[filter "guard"]\nclean = ' .. global_filter .. "\n")
+  for _, location in ipairs({ home .. "/.gitconfig", config .. "/git/config" }) do
+    write(location, "[include]\npath = " .. global_include .. "\n")
+    eq(collect(global_repo).kind, "error", "effective global clean filters use the safe fallback")
+    eq(vim.uv.fs_stat(global_filter .. ".executed"), nil, "global filter helper never executes")
+    write(location, "")
+  end
+  vim.env.HOME, vim.env.XDG_CONFIG_HOME = inherited.HOME or nil, inherited.XDG_CONFIG_HOME or nil
+
   local repo = fixture .. "/repository\n "
   assert(vim.fn.mkdir(repo .. "/nested", "p") == 1)
   command(repo, { "init", "--initial-branch=main", "--quiet" })

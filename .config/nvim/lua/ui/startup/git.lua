@@ -278,17 +278,22 @@ local function new(dependencies)
       fail("Git executable unavailable")
       return request
     end
+    local inherited = dependencies.environ()
     local environment = {
-      PATH = dependencies.environ().PATH,
+      PATH = inherited.PATH,
+      HOME = inherited.HOME,
+      XDG_CONFIG_HOME = inherited.XDG_CONFIG_HOME,
       LC_ALL = "C",
       LANG = "C",
       GIT_CONFIG_NOSYSTEM = "1",
-      GIT_CONFIG_GLOBAL = "/dev/null",
       GIT_CONFIG_SYSTEM = "/dev/null",
       GIT_ATTR_NOSYSTEM = "1",
       GIT_OPTIONAL_LOCKS = "0",
       GIT_TERMINAL_PROMPT = "0",
       GIT_PAGER = "cat",
+      GIT_TRACE2 = "0",
+      GIT_TRACE2_PERF = "0",
+      GIT_TRACE2_EVENT = "0",
     }
     local function run(cwd, arguments, on_exit)
       if finished then
@@ -297,6 +302,8 @@ local function new(dependencies)
       local argv = {
         executable,
         "--no-pager",
+        -- Unsupported Git must fail instead of silently allowing object fetches.
+        "--no-lazy-fetch",
         "-c",
         "core.fsmonitor=false",
         "-c",
@@ -477,6 +484,7 @@ local function new(dependencies)
               "--graph",
               "--max-count=5",
               "--format=%x00%h%x00%s%x00",
+              "--encoding=UTF-8",
               "--abbrev=7",
               "--no-color",
               "--no-decorate",

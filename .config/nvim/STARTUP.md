@@ -25,14 +25,19 @@ the collected recent history, not the repository's total history. Clean and
 unborn repositories have explicit messages.
 
 The menu appears immediately while Git loads asynchronously. Git commands only
-read the repository and share a three-second deadline. Results refresh on a
-directory change and when the visible startup screen regains focus; resizing
-reuses the cached result. Closing the buffer cancels its request. A Git failure
-leaves the menu usable and reports at most one warning per startup buffer.
+read the repository and share a three-second deadline. Missing objects in partial
+clones are never fetched; collection falls back to the menu when they are needed.
+The summary requires Git 2.45 or newer; older versions use the menu-only fallback
+because they lack the no-fetch option.
+Results refresh on a directory change and when the visible startup screen regains
+focus; terminal and split-window resizing reuse the cached result. Closing the
+buffer cancels its request. A Git failure leaves the menu usable and reports at
+most one warning per startup buffer.
 Non-repository directories show the menu alone. Discovery does not fall back to
 a bare dotfiles repository such as `~/.cfg`.
 
-Repositories that configure external Git clean/process filters or track
+User-wide Git ignore rules are respected. Repositories that configure external
+Git clean/process filters, including through user-wide configuration, or track
 submodules use the menu-only fallback. Git status can run commands from those
 configurations, so automatic collection declines them before inspecting changes.
 

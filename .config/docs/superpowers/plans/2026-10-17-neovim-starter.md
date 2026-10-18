@@ -127,3 +127,26 @@ The feature branch starts from the reviewed Nix branch at the pinned base; it do
 - Scoped StyLua, shell/Python syntax, and Git whitespace checks passed. Independent Git/layout and controller reviews passed after fixes, including actual clean-filter and submodule-filter execution regressions.
 - No live activation, VM, package/input changes, or macOS runtime validation. Filter-configured and submodule repositories intentionally use the documented menu fallback.
 - Keep this plan and the implementation in one feature-branch commit. Publication remains a separate final delivery step; preserve the worktree and evidence.
+
+## PR review fixes — 2026-10-18
+
+The user requested fixes for the three reproduced findings on PR #2 at `4dd32d8`.
+Keep this follow-up on the existing feature branch and implementation PR.
+
+- [x] Prevent partial-clone collection from fetching missing objects or running transport helpers, including after the request deadline. Add a real partial-clone regression that checks repository objects and helper execution.
+- [x] Honor effective user Git ignore settings and detect global clean/process filters before status. Add private global-ignore and filter regressions while retaining inherited Git-environment isolation.
+- [x] Refresh affected visible starter buffers on split-window resize using cached data. Test native layout width, preserved selection and unchanged Git request count.
+- [x] Run focused suites, the complete isolated configured startup matrix, scoped formatting and independent review.
+
+The explicit `--no-lazy-fetch` option requires Git 2.45+ for the summary; older
+versions safely use the menu-only fallback. The alternative empty protocol
+allowlist was rejected after a private helper-execution reproduction. Global
+configuration remains effective while Trace2 output is disabled and history
+encoding is fixed to UTF-8. Shared starter buffers fit their smallest window.
+
+Validation passed on Neovim 0.12.4 and Git 2.53.0: all 18 editor source suites,
+the complete configured startup matrix with 16 locked plugin copies, scoped
+StyLua, whitespace checks and independent review. New regressions failed before
+their fixes. Unsupported-option fallback was tested with a private wrapper;
+actual older Git and macOS were not run. No live activation or dependency change.
+Deliver this as a scoped follow-up commit on the existing draft PR.

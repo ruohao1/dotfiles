@@ -440,6 +440,16 @@ local function new(dependencies)
       desc = "Synchronize startup status visibility",
       callback = synchronize_status,
     })
+    dependencies.create_autocmd("WinResized", {
+      group = state.group,
+      callback = function()
+        for bufnr, entry in pairs(state.buffers) do
+          if valid(bufnr, entry) and dependencies.buffer_visible(bufnr) then
+            refresh(bufnr, entry)
+          end
+        end
+      end,
+    })
 
     dependencies.create_autocmd("CursorMoved", {
       group = state.group,
@@ -570,11 +580,12 @@ local runtime = new({
     return buffer_window(bufnr) ~= nil
   end,
   dimensions = function(bufnr)
-    local window = buffer_window(bufnr)
-    return {
-      width = window and vim.api.nvim_win_get_width(window) or vim.o.columns,
-      height = window and vim.api.nvim_win_get_height(window) or vim.o.lines - 1,
-    }
+    local width, height = vim.o.columns, vim.o.lines - 1
+    for _, window in ipairs(vim.fn.win_findbuf(bufnr)) do
+      width = math.min(width, vim.api.nvim_win_get_width(window))
+      height = math.min(height, vim.api.nvim_win_get_height(window))
+    end
+    return { width = width, height = height }
   end,
   cursor = function(bufnr)
     local window = buffer_window(bufnr)
