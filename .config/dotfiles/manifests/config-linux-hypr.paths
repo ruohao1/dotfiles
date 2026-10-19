@@ -1,3 +1,6 @@
 .config/hypr/hyprland.lua
 .config/launcher/application-launcher
 .config/launcher/rofi.rasi
+.config/clipboard-history/store
+.config/cliphist/config
+.config/systemd/user/cliphist.service.d/override.conf

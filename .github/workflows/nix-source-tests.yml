@@ -1,0 +1,43 @@
+name: Nix source tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run isolated source suites
+        shell: bash
+        run: |
+          umask 077
+          fixture=$(mktemp -d "${RUNNER_TEMP:?}/dotfiles-source.XXXXXX")
+          mkdir -p "$fixture"/{home,tmp,entrypoint,migration}
+          env -i \
+            PATH=/usr/bin:/bin LANG=C.UTF-8 \
+            HOME="$fixture/home" TMPDIR="$fixture/tmp" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+            DOTFILES_ENTRYPOINT_TEST_ROOT="$fixture/entrypoint" \
+            DOTFILES_MIGRATION_TEST_ROOT="$fixture/migration" \
+            /bin/bash --noprofile --norc -euo pipefail -c '
+              command -v python3 git cc >/dev/null
+              python3 -B nix/tests/check-packages.py --self-test
+              python3 -B -m unittest discover -v -s nix/tests -p test_entrypoint.py
+              python3 -B -m unittest discover -v -s nix/tests -p test_ownership.py
+              python3 -B -m unittest discover -v -s nix/tests -p test_checker_clipboard.py
+              python3 -B -m unittest discover -v -s nix/tests -p "test_migration_*.py"
+            '

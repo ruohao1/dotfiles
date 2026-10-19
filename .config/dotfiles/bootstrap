@@ -27,6 +27,7 @@ usage() {
   printf '%s\n' \
     'usage: bootstrap [--apply] --window-manager (hypr|i3|aerospace|none)' \
     '                 [--allow-community-packages] [--repo URL] [--ref REF]' \
+    '       bootstrap [--apply] --managed-tool taplo' \
     '       bootstrap --rollback (latest|RUN_ID)' \
     '       bootstrap --help' \
     '' \
@@ -49,6 +50,11 @@ repo_ref=main
 npm_language_servers_lock_sha256=f01618d246ff8f53ad57e8d6a1cfe4d278f06a68d80eddbb254d910218aba4b8
 rollback_id=
 window_manager=
+managed_tool=
+managed_tool_was_set=false
+window_manager_was_set=false
+repo_was_set=false
+ref_was_set=false
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -61,17 +67,28 @@ while [ "$#" -gt 0 ]; do
       ;;
     --window-manager)
       [ "$#" -ge 2 ] || die '--window-manager requires a profile' 2
+      window_manager_was_set=true
       window_manager=$2
       shift
       ;;
     --repo)
       [ "$#" -ge 2 ] || die '--repo requires a URL' 2
+      repo_was_set=true
       repo_url=$2
       shift
       ;;
     --ref)
       [ "$#" -ge 2 ] || die '--ref requires a Git reference' 2
+      ref_was_set=true
       repo_ref=$2
+      shift
+      ;;
+    --managed-tool)
+      [ "$#" -ge 2 ] || die '--managed-tool requires a tool name' 2
+      [ "$managed_tool_was_set" = false ] \
+        || die '--managed-tool may be specified only once' 2
+      managed_tool_was_set=true
+      managed_tool=$2
       shift
       ;;
     --rollback)
@@ -98,10 +115,46 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+if [ "$managed_tool_was_set" = true ]; then
+  [ "$managed_tool" = taplo ] \
+    || die "unsupported managed tool: $managed_tool" 2
+  [ "$window_manager_was_set" = false ] \
+    || die '--managed-tool cannot be combined with --window-manager' 2
+  [ "$allow_community_packages" = false ] \
+    || die '--managed-tool cannot be combined with --allow-community-packages' 2
+  [ "$repo_was_set" = false ] \
+    || die '--managed-tool cannot be combined with --repo' 2
+  [ "$ref_was_set" = false ] \
+    || die '--managed-tool cannot be combined with --ref' 2
+  [ "$mode" != rollback ] \
+    || die '--managed-tool cannot be combined with --rollback' 2
+fi
+
 case "$repo_url" in
   ''|-*) die 'repository URL must not be empty or begin with a dash' 2 ;;
   *"
 "*|*""*|*"	"*) die 'repository URL must not contain control characters' 2 ;;
+esac
+# Reject credential-bearing HTTP(S) inputs before commands, output, or journals.
+case "$repo_url" in
+  [hH][tT][tT][pP]::*|[hH][tT][tT][pP][sS]::*)
+    die 'HTTP(S) repository URL must use standard URL syntax, not an explicit remote-helper prefix' 2
+    ;;
+  [hH][tT][tT][pP]:/*|[hH][tT][tT][pP][sS]:/*)
+    repo_address=${repo_url#*:}
+    case "$repo_address" in
+      //[!/]*) ;;
+      *) die 'HTTP(S) repository URL requires two slashes and a host' 2 ;;
+    esac
+    repo_authority=${repo_address#//}
+    repo_authority=${repo_authority%%/*}
+    case "$repo_authority" in
+      *@*) die 'HTTP(S) repository URL must not include userinfo; use Git credential helpers or SSH' 2 ;;
+    esac
+    case "$repo_url" in
+      *'?'*|*'#'*) die 'HTTP(S) repository URL must not include a query or fragment; use Git credential helpers or SSH' 2 ;;
+    esac
+    ;;
 esac
 case "$repo_ref" in
   ''|-*|*[!A-Za-z0-9._/-]*|*..*|*/)
@@ -111,6 +164,124 @@ esac
 case "$rollback_id" in
   *[!A-Za-z0-9._-]*) die 'rollback ID contains unsupported characters' 2 ;;
 esac
+
+# BEGIN embedded ownership guard
+# shellcheck shell=sh
+# Portable fixed-home coordination; embedded verbatim in standalone bootstrap.
+# mkdir is the atomic lock primitive on Linux and Darwin, also used by Python.
+ownership_lock_path=
+ownership_lock_identity=
+
+ownership_error() {
+  printf 'dotfiles ownership: %s\n' "$1" >&2
+  return 1
+}
+
+ownership_safe_directory() {
+  [ ! -L "$1" ] && [ -d "$1" ] || {
+    ownership_error "unsafe directory: $1"; return 1;
+  }
+  ownership_listing=$(LC_ALL=C ls -ldn -- "$1") || return 1
+  # Filename fields may contain spaces. Only the fixed mode/UID fields matter.
+  read -r ownership_permissions _ownership_link_count ownership_directory_uid _ownership_rest <<EOF
+$ownership_listing
+EOF
+  [ "$ownership_directory_uid" = "$ownership_uid" ] || {
+    ownership_error 'coordination directories must belong to the current user'; return 1;
+  }
+  case "$ownership_permissions" in
+    ?????w*|????????w*) ownership_error 'coordination directories must not be group/world writable'; return 1 ;;
+  esac
+}
+
+ownership_check_paths() {
+  case "${HOME:-}" in
+    /*) ;;
+    *) ownership_error 'HOME must be an absolute directory'; return 1 ;;
+  esac
+  case "$HOME" in
+    */../*|*/./*|*/..|*/.|*//*) ownership_error 'HOME must not contain traversal or empty components'; return 1 ;;
+  esac
+  [ "$HOME" != / ] || { ownership_error 'HOME must not be root'; return 1; }
+  # Reject symlinks in the complete lexical home path, including its parents.
+  ownership_ancestor=$HOME
+  while [ "$ownership_ancestor" != / ]; do
+    [ ! -L "$ownership_ancestor" ] || {
+      ownership_error "symlinked home parent: $ownership_ancestor"; return 1;
+    }
+    ownership_ancestor=${ownership_ancestor%/*}
+    [ -n "$ownership_ancestor" ] || ownership_ancestor=/
+  done
+  ownership_uid=$(id -u) || return 1
+  ownership_safe_directory "$HOME" || return 1
+  ownership_home=$(CDPATH='' cd -- "$HOME" && pwd -P) || return 1
+  ownership_root=$ownership_home/.local/state/dotfiles-ownership
+  for ownership_directory in "$ownership_home/.local" "$ownership_home/.local/state" "$ownership_root"; do
+    if [ -e "$ownership_directory" ] || [ -L "$ownership_directory" ]; then
+      ownership_safe_directory "$ownership_directory" || return 1
+    fi
+  done
+  if [ -e "$ownership_root/owner.json" ] || [ -L "$ownership_root/owner.json" ]; then
+    ownership_error 'Home Manager ownership metadata exists; legacy deployment is blocked'
+    return 1
+  fi
+}
+
+ownership_acquire() {
+  ownership_check_paths || return 1
+  # Create one component at a time; recheck before and after publication.
+  for ownership_directory in "$ownership_home/.local" "$ownership_home/.local/state" "$ownership_root"; do
+    if [ ! -e "$ownership_directory" ]; then
+      (umask 077; mkdir -- "$ownership_directory") 2>/dev/null || {
+        ownership_safe_directory "$ownership_directory" || return 1;
+      }
+    fi
+    ownership_safe_directory "$ownership_directory" || return 1
+  done
+  ownership_candidate=$ownership_root/lock
+  (umask 077; mkdir -- "$ownership_candidate") 2>/dev/null || {
+    ownership_error 'another deployer holds the per-home lock'; return 1;
+  }
+  ownership_lock_path=$ownership_candidate
+  # Keep the inode alive so a removed lock cannot be replaced with the same inode.
+  exec 9< "$ownership_lock_path" || return 1
+  ownership_lock_identity=$(ls -di -- "$ownership_lock_path") || return 1
+  read -r ownership_lock_identity _ownership_rest <<EOF
+$ownership_lock_identity
+EOF
+  ownership_recheck || { ownership_release; return 1; }
+}
+
+ownership_recheck() {
+  ownership_check_paths || return 1
+  [ -n "$ownership_lock_path" ] && [ "$ownership_lock_path" = "$ownership_root/lock" ] || {
+    ownership_error 'deployment requires its held per-home lock'; return 1;
+  }
+  ownership_safe_directory "$ownership_lock_path" || return 1
+  ownership_current_identity=$(ls -di -- "$ownership_lock_path") || return 1
+  read -r ownership_current_identity _ownership_rest <<EOF
+$ownership_current_identity
+EOF
+  [ "$ownership_current_identity" = "$ownership_lock_identity" ] || {
+    ownership_error 'held lock was replaced'; return 1;
+  }
+}
+
+ownership_release() {
+  if [ -n "$ownership_lock_path" ] && [ ! -L "$ownership_lock_path" ] && [ -d "$ownership_lock_path" ]; then
+    ownership_current_identity=$(ls -di -- "$ownership_lock_path") || return 1
+    read -r ownership_current_identity _ownership_rest <<EOF
+$ownership_current_identity
+EOF
+    if [ "$ownership_current_identity" = "$ownership_lock_identity" ]; then
+      rmdir -- "$ownership_lock_path" || return 1
+    fi
+  fi
+  exec 9<&-
+  ownership_lock_path=
+  ownership_lock_identity=
+}
+# END embedded ownership guard
 
 script_dir=
 case "$0" in
@@ -284,7 +455,13 @@ emit_service_plan() {
     linux)
       printf '%s\n' \
         '  systemctl --user daemon-reload' \
-        '  systemctl --user enable --now tmux-workspace.service'
+        '  systemctl --user enable tmux-workspace.service (unless already enabled)' \
+        '  systemctl --user start tmux-workspace.service (unless already active)'
+      if [ "$2" = hypr ]; then
+        printf '%s\n' \
+          '  systemctl --user enable cliphist.service (unless already enabled)' \
+          '  systemctl --user start cliphist.service (only in an active Wayland graphical session)'
+      fi
       ;;
     macos)
       service_domain=gui/$(id -u)
@@ -502,6 +679,14 @@ run_service_command() {
     record_test_command "$@"
     failure_token=${DOTFILES_BOOTSTRAP_TEST_SERVICE_FAIL:-}
     if [ -n "$failure_token" ]; then
+      failure_unit=${DOTFILES_BOOTSTRAP_TEST_SERVICE_FAIL_UNIT:-}
+      if [ -n "$failure_unit" ]; then
+        failure_unit_selected=false
+        for service_argument do
+          [ "$service_argument" != "$failure_unit" ] || failure_unit_selected=true
+        done
+        [ "$failure_unit_selected" = true ] || return 0
+      fi
       for service_argument do
         [ "$service_argument" != "$failure_token" ] || return 1
       done
@@ -1091,7 +1276,7 @@ stop_owned_probe() {
         "$active_probe_group_id" "$active_probe_anchor_pid"; then
         record_probe_test_audit "group-term|$active_probe_group_id" \
           || probe_cleanup_status=1
-        kill -TERM -- "-$active_probe_group_id" >/dev/null 2>&1 \
+        kill -TERM "-$active_probe_group_id" >/dev/null 2>&1 \
           || probe_cleanup_status=1
       fi
       if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ] \
@@ -1125,7 +1310,7 @@ stop_owned_probe() {
           "$active_probe_anchor_pid" "$active_probe_anchor_parent"; then
           record_probe_test_audit "group-kill|$active_probe_group_id" \
             || probe_cleanup_status=1
-          kill -KILL -- "-$active_probe_group_id" >/dev/null 2>&1 \
+          kill -KILL "-$active_probe_group_id" >/dev/null 2>&1 \
             || probe_cleanup_status=1
         else
           printf '%s\n' \
@@ -1141,7 +1326,7 @@ stop_owned_probe() {
             "$active_probe_anchor_pid" "$active_probe_anchor_parent"; then
             record_probe_test_audit "group-kill|$active_probe_group_id" \
               || probe_cleanup_status=1
-            kill -KILL -- "-$active_probe_group_id" >/dev/null 2>&1 \
+            kill -KILL "-$active_probe_group_id" >/dev/null 2>&1 \
               || probe_cleanup_status=1
           fi
         elif probe_anchor_identity_is_valid \
@@ -1260,6 +1445,8 @@ start_owned_probe() {
     probe_start_stdin=$active_probe_fifo
     probe_start_stdout=$active_probe_tmp/stdout
     probe_start_stderr=$active_probe_tmp/stderr
+  elif [ "$probe_start_mode" = capture ]; then
+    probe_start_stdout=$active_probe_tmp/stdout
   fi
 
   if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
@@ -1353,6 +1540,19 @@ bounded_command_succeeds() {
   sleep 1
   bounded_probe_cleanup_status=0
   stop_owned_probe || bounded_probe_cleanup_status=$?
+  [ "$bounded_probe_cleanup_status" -eq 0 ] \
+    && [ "$last_probe_status_available" = true ] \
+    && [ "$last_probe_status" -eq 0 ]
+}
+
+bounded_command_output() {
+  bounded_probe_output=
+  start_owned_probe capture "$@" || return 1
+  sleep 1
+  bounded_probe_cleanup_status=0
+  bounded_probe_output=$(cat "$active_probe_tmp/stdout") \
+    || bounded_probe_cleanup_status=1
+  stop_owned_probe || bounded_probe_cleanup_status=1
   [ "$bounded_probe_cleanup_status" -eq 0 ] \
     && [ "$last_probe_status_available" = true ] \
     && [ "$last_probe_status" -eq 0 ]
@@ -1992,37 +2192,46 @@ stage_lua_language_server() {
   done
 }
 
-stage_taplo() {
-  taplo_manifest_root=$1
-  taplo_stage_root=$2
-  taplo_asset_data=$(direct_asset_record \
+load_managed_taplo_record() {
+  managed_taplo_manifest_root=$1
+  managed_taplo_asset_data=$(direct_asset_record \
     taplo linux "$managed_architecture" \
-    "$taplo_manifest_root/packages-direct.tsv")
-  old_ifs=$IFS
-  tab_character=$(printf '\t')
-  IFS=$tab_character
+    "$managed_taplo_manifest_root/packages-direct.tsv") || exit $?
+  managed_taplo_old_ifs=$IFS
+  managed_taplo_tab=$(printf '	')
+  IFS=$managed_taplo_tab
   set -f
-  # shellcheck disable=SC2086 # Intentional split on the verified manifest tab delimiter.
-  set -- $taplo_asset_data
+  # shellcheck disable=SC2086
+  set -- $managed_taplo_asset_data
   set +f
-  IFS=$old_ifs
+  IFS=$managed_taplo_old_ifs
   [ "$#" -eq 4 ] || die 'malformed direct asset entry: taplo'
-  taplo_asset_version=$1
-  taplo_asset_format=$2
-  taplo_asset_url=$3
-  taplo_asset_sha256=$4
-  [ "$taplo_asset_version" = 0.10.0 ] \
+  managed_taplo_asset_version=$1
+  managed_taplo_asset_format=$2
+  managed_taplo_asset_url=$3
+  managed_taplo_asset_sha256=$4
+  [ "$managed_taplo_asset_version" = 0.10.0 ] \
     || die 'unexpected managed Taplo version'
-  [ "$taplo_asset_format" = gzip ] \
+  [ "$managed_taplo_asset_format" = gzip ] \
     || die 'unexpected managed Taplo archive format'
-  case "$taplo_asset_url" in
+  case $managed_taplo_asset_url in
     https://*) ;;
     *) die 'direct asset URL must use HTTPS: taplo' ;;
   esac
+  case $managed_taplo_asset_sha256 in
+    ''|*[!0-9a-f]*) die 'invalid SHA-256 for managed Taplo' ;;
+  esac
+  [ "${#managed_taplo_asset_sha256}" -eq 64 ] \
+    || die 'invalid SHA-256 length for managed Taplo'
+}
 
+stage_taplo() {
+  taplo_manifest_root=$1
+  taplo_stage_root=$2
+  load_managed_taplo_record "$taplo_manifest_root"
   taplo_asset_path=$taplo_stage_root/taplo.asset
   taplo_ready_root=$taplo_stage_root/taplo.ready
-  download_verified "$taplo_asset_url" "$taplo_asset_sha256" \
+  download_verified "$managed_taplo_asset_url" "$managed_taplo_asset_sha256" \
     "$taplo_asset_path"
   gzip -t "$taplo_asset_path" \
     || die 'verified Taplo asset is not valid gzip'
@@ -2036,8 +2245,8 @@ stage_taplo() {
     || die 'verified Taplo asset did not produce one regular executable'
   chmod 0755 "$taplo_ready_root/taplo" \
     || die 'could not make the staged Taplo executable'
-  staged_taplo_version=$("$taplo_ready_root/taplo" --version 2>/dev/null)
-  [ "$staged_taplo_version" = 'taplo 0.10.0' ] \
+  read_managed_taplo_version "$taplo_ready_root/taplo" \
+    && [ "$managed_taplo_version" = 0.10.0 ] \
     || die 'staged Taplo version does not match taplo 0.10.0'
   bounded_command_succeeds \
     "$taplo_ready_root/taplo" lsp stdio --help \
@@ -2091,6 +2300,40 @@ for (const [path, record] of Object.entries(lock.packages)) {
   done
 }
 
+scoped_managed_path_identity() {
+  scoped_identity_path=$1
+  scoped_identity_kind=$2
+  scoped_identity_stat=$(stat -c '%d:%i:%f:%w' "$scoped_identity_path") || return 1
+  case $scoped_identity_kind in
+    directory)
+      [ "$(find "$scoped_identity_path" -mindepth 1 -maxdepth 1 -printf '%f\n')" = taplo ] \
+        && [ -f "$scoped_identity_path/taplo" ] \
+        && [ ! -L "$scoped_identity_path/taplo" ] || return 1
+      scoped_identity_file=$(stat -c '%d:%i:%f:%w' "$scoped_identity_path/taplo") || return 1
+      scoped_identity_hash=$(file_sha256 "$scoped_identity_path/taplo") || return 1
+      [ -n "$scoped_identity_hash" ] || return 1
+      printf '%s|%s|%s\n' "$scoped_identity_stat" "$scoped_identity_file" "$scoped_identity_hash"
+      ;;
+    link)
+      scoped_identity_source=$(readlink -- "$scoped_identity_path") || return 1
+      printf '%s|%s\n' "$scoped_identity_stat" "$scoped_identity_source"
+      ;;
+    parent) printf '%s\n' "$scoped_identity_stat" ;;
+    *) return 1 ;;
+  esac
+}
+
+scoped_recorded_path_identity() {
+  scoped_lookup_path=$1
+  while IFS="$(printf '\t')" read -r scoped_record_path scoped_record_identity; do
+    if [ "$scoped_record_path" = "$scoped_lookup_path" ]; then
+      printf '%s\n' "$scoped_record_identity"
+      return 0
+    fi
+  done <"$managed_created_identities_file"
+  return 1
+}
+
 record_managed_created_path() {
   created_path=$1
   [ -n "$managed_created_paths_file" ] \
@@ -2101,6 +2344,13 @@ record_managed_created_path() {
     /*) ;;
     *) die "managed-created path must be absolute: $created_path" ;;
   esac
+  if [ "$managed_tool" = taplo ]; then
+    [ -n "$managed_unjournaled_identity" ] \
+      || die 'managed Taplo publication identity is unavailable'
+    printf '%s\t%s\n' "$created_path" "$managed_unjournaled_identity" \
+      >>"$managed_created_identities_file" \
+      || die 'could not record managed Taplo publication identity'
+  fi
   printf '%s\n' "$created_path" >>"$managed_created_paths_file" \
     || die 'could not record a managed-created path'
 }
@@ -2173,6 +2423,7 @@ begin_managed_publication_critical() {
   managed_publication_critical=true
   managed_unjournaled_path=
   managed_unjournaled_kind=
+  managed_unjournaled_identity=
 }
 
 track_managed_unjournaled_path() {
@@ -2190,11 +2441,21 @@ track_managed_unjournaled_path() {
     || die "unexpected managed publication path: $managed_unjournaled_path"
   [ "$managed_created_path_kind" = "$managed_unjournaled_kind" ] \
     || die "managed publication path kind mismatch: $managed_unjournaled_path"
+  if [ "$managed_tool" = taplo ]; then
+    managed_unjournaled_identity=
+    [ "$#" -lt 3 ] || managed_unjournaled_identity=$3
+    if [ -z "$managed_unjournaled_identity" ]; then
+      managed_unjournaled_identity=$(scoped_managed_path_identity \
+        "$managed_unjournaled_path" "$managed_unjournaled_kind") \
+        || die 'could not identify managed Taplo publication'
+    fi
+  fi
 }
 
 clear_managed_unjournaled_path() {
   managed_unjournaled_path=
   managed_unjournaled_kind=
+  managed_unjournaled_identity=
 }
 
 finish_managed_publication_critical() {
@@ -2242,6 +2503,14 @@ remove_managed_unjournaled_path() {
     "$cleanup_unjournaled_path" "$cleanup_unjournaled_kind"; then
     printf 'bootstrap: refusing unjournaled managed %s cleanup for changed path: %s\n' \
       "$cleanup_unjournaled_kind" "$cleanup_unjournaled_path" >&2
+    return 1
+  fi
+  if [ "$managed_tool" = taplo ] \
+    && { [ -z "$managed_unjournaled_identity" ] \
+      || [ "$(scoped_managed_path_identity "$cleanup_unjournaled_path" "$cleanup_unjournaled_kind")" \
+        != "$managed_unjournaled_identity" ]; }; then
+    printf 'bootstrap: refusing managed Taplo cleanup for replaced or changed path: %s\n' \
+      "$cleanup_unjournaled_path" >&2
     return 1
   fi
   case "$cleanup_unjournaled_kind" in
@@ -2301,6 +2570,18 @@ remove_managed_created_paths() {
       managed_cleanup_status=1
       continue
     fi
+    if [ "$managed_tool" = taplo ]; then
+      cleanup_managed_identity=$(scoped_recorded_path_identity "$cleanup_managed_path") \
+        || cleanup_managed_identity=
+      if [ -z "$cleanup_managed_identity" ] \
+        || [ "$(scoped_managed_path_identity "$cleanup_managed_path" "$cleanup_managed_kind")" \
+          != "$cleanup_managed_identity" ]; then
+        printf 'bootstrap: refusing managed Taplo cleanup for replaced or changed path: %s\n' \
+          "$cleanup_managed_path" >&2
+        managed_cleanup_status=1
+        continue
+      fi
+    fi
     case "$cleanup_managed_kind" in
       parent)
         rmdir "$cleanup_managed_path" >/dev/null 2>&1 \
@@ -2352,12 +2633,25 @@ publish_managed_directory() {
   publication_token=$3
   require_managed_target_free "$publish_target"
   begin_managed_publication_critical
+  if [ "$managed_tool" = taplo ]; then
+    scoped_publish_identity=$(scoped_managed_path_identity "$publish_source" directory) \
+      || fail_managed_publication_critical 'could not identify staged Taplo directory'
+  fi
   if ! mv --no-clobber --no-target-directory \
     "$publish_source" "$publish_target"; then
     fail_managed_publication_critical \
       "could not publish managed language-tool directory: $publish_target"
   fi
-  track_managed_unjournaled_path "$publish_target" directory
+  if [ "$managed_tool" = taplo ]; then
+    if path_exists "$publish_source" \
+      || [ "$(scoped_managed_path_identity "$publish_target" directory)" != "$scoped_publish_identity" ]; then
+      fail_managed_publication_critical \
+        "managed Taplo directory ownership did not transfer: $publish_target"
+    fi
+    track_managed_unjournaled_path "$publish_target" directory "$scoped_publish_identity"
+  else
+    track_managed_unjournaled_path "$publish_target" directory
+  fi
   if [ -e "$publish_source" ] || [ -L "$publish_source" ]; then
     fail_managed_publication_critical \
       "managed language-tool directory was not published: $publish_target"
@@ -2416,11 +2710,26 @@ publish_managed_link() {
   esac
   require_managed_target_free "$link_target"
   begin_managed_publication_critical
-  if ! ln -s "$link_source" "$link_target"; then
-    fail_managed_publication_critical \
-      "could not publish managed language-tool link: $link_target"
+  if [ "$managed_tool" = taplo ]; then
+    scoped_staged_link=$managed_taplo_link_root/taplo.link
+    ln -sT "$link_source" "$scoped_staged_link" \
+      || fail_managed_publication_critical 'could not stage managed Taplo link'
+    scoped_publish_identity=$(scoped_managed_path_identity "$scoped_staged_link" link) \
+      || fail_managed_publication_critical 'could not identify staged Taplo link'
+    if ! mv --no-clobber --no-target-directory "$scoped_staged_link" "$link_target" \
+      || path_exists "$scoped_staged_link" \
+      || [ "$(scoped_managed_path_identity "$link_target" link)" != "$scoped_publish_identity" ]; then
+      fail_managed_publication_critical \
+        "managed Taplo link ownership did not transfer: $link_target"
+    fi
+    track_managed_unjournaled_path "$link_target" link "$scoped_publish_identity"
+  else
+    if ! ln -s "$link_source" "$link_target"; then
+      fail_managed_publication_critical \
+        "could not publish managed language-tool link: $link_target"
+    fi
+    track_managed_unjournaled_path "$link_target" link
   fi
-  track_managed_unjournaled_path "$link_target" link
   mutate_managed_link_for_test before-journal "$link_target"
   if [ ! -L "$link_target" ]; then
     fail_managed_publication_critical \
@@ -3168,6 +3477,257 @@ require_managed_parent_directory() {
   fi
 }
 
+read_managed_taplo_version() {
+  bounded_command_output "$1" --version || return 1
+  managed_taplo_version=$(printf '%s\n' "$bounded_probe_output" | awk '
+    NR == 1 && /^taplo [0-9]+\.[0-9]+\.[0-9]+$/ { version = $2 }
+    END {
+      if (NR != 1 || version == "") exit 1
+      print version
+    }
+  ')
+}
+
+managed_taplo_external_is_satisfactory() {
+  managed_taplo_external_command=$1
+  read_managed_taplo_version "$managed_taplo_external_command" || return 1
+  version_at_least "$managed_taplo_version" 0.10.0 || return 1
+  bounded_command_succeeds \
+    "$managed_taplo_external_command" lsp stdio --help
+}
+
+managed_taplo_layout_is_exact() {
+  [ -d "$managed_taplo_target" ] \
+    && [ ! -L "$managed_taplo_target" ] \
+    && [ -f "$managed_taplo_target/taplo" ] \
+    && [ ! -L "$managed_taplo_target/taplo" ] \
+    && [ -x "$managed_taplo_target/taplo" ] \
+    && [ -L "$managed_taplo_link" ] \
+    || return 1
+  managed_taplo_entries=$(find "$managed_taplo_target" \
+    -mindepth 1 -maxdepth 1 -printf '%f\n') || return 1
+  [ "$managed_taplo_entries" = taplo ] || return 1
+  managed_taplo_link_source=$(readlink -- "$managed_taplo_link") || return 1
+  [ "$managed_taplo_link_source" = "$managed_taplo_target/taplo" ] || return 1
+  managed_taplo_resolved=$(command -v taplo 2>/dev/null || true)
+  [ "$managed_taplo_resolved" = "$managed_taplo_link" ] || return 1
+  read_managed_taplo_version "$managed_taplo_link" || return 1
+  [ "$managed_taplo_version" = 0.10.0 ] || return 1
+  bounded_command_succeeds "$managed_taplo_link" lsp stdio --help
+}
+
+prepare_managed_taplo_scope() {
+  managed_taplo_manifest_root=$1
+  validate_home_directory
+  managed_architecture=$(normalized_architecture) || exit $?
+  managed_taplo_target=$HOME/.local/opt/taplo-0.10.0-$managed_architecture
+  managed_taplo_link=$HOME/.local/bin/taplo
+  load_managed_taplo_record "$managed_taplo_manifest_root"
+
+  managed_taplo_command=$(command -v taplo 2>/dev/null || true)
+  managed_taplo_target_exists=false
+  managed_taplo_link_exists=false
+  path_exists "$managed_taplo_target" && managed_taplo_target_exists=true
+  path_exists "$managed_taplo_link" && managed_taplo_link_exists=true
+
+  if [ "$managed_taplo_target_exists" = false ] \
+    && [ "$managed_taplo_link_exists" = false ]; then
+    if [ -n "$managed_taplo_command" ]; then
+      managed_taplo_external_is_satisfactory "$managed_taplo_command" \
+        || die "existing Taplo command is unsatisfactory: $managed_taplo_command"
+      managed_taplo_state=satisfied-external
+    else
+      case :${PATH:-}: in
+        *:"$HOME/.local/bin":*) ;;
+        *) die 'managed Taplo activation directory is not present in PATH' ;;
+      esac
+      require_managed_parent_directory "$HOME/.local"
+      require_managed_parent_directory "$HOME/.local/bin"
+      require_managed_parent_directory "$HOME/.local/opt"
+      managed_taplo_state=missing
+    fi
+  elif managed_taplo_layout_is_exact; then
+    require_managed_parent_directory "$HOME/.local"
+    require_managed_parent_directory "$HOME/.local/bin"
+    require_managed_parent_directory "$HOME/.local/opt"
+    managed_taplo_state=satisfied-managed
+  else
+    die 'conflicting managed Taplo state'
+  fi
+}
+
+emit_managed_taplo_plan() {
+  case $managed_taplo_state in
+    satisfied-external) managed_taplo_action='skip external' ;;
+    satisfied-managed) managed_taplo_action='skip managed' ;;
+    missing) managed_taplo_action=install ;;
+    *) die "unsupported managed Taplo state: $managed_taplo_state" ;;
+  esac
+  printf '%s\n' \
+    "Mode: $mode" \
+    'Platform: linux' \
+    "Architecture: $managed_architecture" \
+    'Managed tool: taplo' \
+    "Version: $managed_taplo_asset_version" \
+    "Source: $managed_taplo_asset_url" \
+    "Target: $managed_taplo_target" \
+    "Link: $managed_taplo_link" \
+    "State: $managed_taplo_state" \
+    "Action: $managed_taplo_action"
+}
+
+remove_managed_taplo_publish_storage() {
+  scoped_staging_cleanup_status=0
+  for scoped_staging_kind in link target; do
+    case $scoped_staging_kind in
+      link)
+        scoped_staging_path=$managed_taplo_link_tmp
+        scoped_staging_identity=$managed_taplo_link_tmp_identity
+        scoped_staging_parent=bin
+        ;;
+      target)
+        scoped_staging_path=$managed_taplo_publish_tmp
+        scoped_staging_identity=$managed_taplo_publish_tmp_identity
+        scoped_staging_parent=opt
+        ;;
+    esac
+    [ -n "$scoped_staging_path" ] || continue
+    scoped_staging_parent=$HOME/.local/$scoped_staging_parent
+    case $scoped_staging_path in
+      "$scoped_staging_parent"/dotfiles-bootstrap.*) ;;
+      *) scoped_staging_cleanup_status=1; continue ;;
+    esac
+    if [ ! -d "$scoped_staging_path" ] || [ -L "$scoped_staging_path" ] \
+      || [ "$(stat -c '%d:%i:%f:%w' "$scoped_staging_path")" != "$scoped_staging_identity" ]; then
+      printf 'bootstrap: refusing cleanup of replaced Taplo staging storage: %s\n' \
+        "$scoped_staging_path" >&2
+      scoped_staging_cleanup_status=1
+      continue
+    fi
+    if ! rm -rf -- "$scoped_staging_path"; then
+      scoped_staging_cleanup_status=1
+      continue
+    fi
+    case $scoped_staging_kind in
+      link) managed_taplo_link_tmp=; managed_taplo_link_tmp_identity= ;;
+      target) managed_taplo_publish_tmp=; managed_taplo_publish_tmp_identity= ;;
+    esac
+  done
+  return "$scoped_staging_cleanup_status"
+}
+
+prepare_managed_taplo_publication_storage() {
+  managed_taplo_publish_root=$1
+  scoped_stage_device=$(stat -c '%d' "$managed_taplo_publish_root") \
+    || die 'could not identify Taplo staging filesystem'
+  scoped_target_device=$(stat -c '%d' "$HOME/.local/opt") \
+    || die 'could not identify Taplo destination filesystem'
+  [ "$scoped_stage_device" != "$scoped_target_device" ] || return 0
+
+  # GNU mv copies on EXDEV. Copy inside an owned private directory first so
+  # only the final same-filesystem rename exposes the verified executable.
+  begin_cleanup_registration_critical
+  managed_taplo_publish_tmp=$(TMPDIR=$HOME/.local/opt temporary_directory) || {
+    finish_cleanup_registration_critical
+    die 'could not create Taplo publication staging storage'
+  }
+  managed_taplo_publish_tmp_identity=$(stat -c '%d:%i:%f:%w' "$managed_taplo_publish_tmp") \
+    || die 'could not identify Taplo publication staging storage'
+  finish_cleanup_registration_critical
+  cp -pR "$managed_taplo_publish_root/taplo.ready" "$managed_taplo_publish_tmp/taplo.ready" \
+    || die 'could not copy verified Taplo to the destination filesystem'
+  scoped_copied_hash=$(file_sha256 "$managed_taplo_publish_tmp/taplo.ready/taplo") \
+    || die 'could not checksum copied Taplo'
+  [ -n "$scoped_copied_hash" ] \
+    && [ "$scoped_copied_hash" = "$(file_sha256 "$managed_taplo_publish_root/taplo.ready/taplo")" ] \
+    || die 'copied Taplo checksum does not match verified staging'
+  managed_taplo_publish_root=$managed_taplo_publish_tmp
+}
+
+prepare_managed_taplo_link_storage() {
+  managed_taplo_link_root=$managed_taplo_publish_root
+  scoped_link_source_device=$(stat -c '%d' "$managed_taplo_link_root") \
+    || die 'could not identify Taplo link staging filesystem'
+  scoped_link_target_device=$(stat -c '%d' "$HOME/.local/bin") \
+    || die 'could not identify Taplo activation filesystem'
+  [ "$scoped_link_source_device" != "$scoped_link_target_device" ] || return 0
+  begin_cleanup_registration_critical
+  managed_taplo_link_tmp=$(TMPDIR=$HOME/.local/bin temporary_directory) || {
+    finish_cleanup_registration_critical
+    die 'could not create Taplo link staging storage'
+  }
+  managed_taplo_link_tmp_identity=$(stat -c '%d:%i:%f:%w' "$managed_taplo_link_tmp") \
+    || die 'could not identify Taplo link staging storage'
+  finish_cleanup_registration_critical
+  managed_taplo_link_root=$managed_taplo_link_tmp
+}
+
+publish_managed_taplo_scope() {
+  managed_publish_root=$1
+  managed_publish_active=true
+  create_managed_parent_directory "$HOME/.local"
+  create_managed_parent_directory "$HOME/.local/bin"
+  create_managed_parent_directory "$HOME/.local/opt"
+  prepare_managed_taplo_publication_storage "$managed_publish_root"
+  prepare_managed_taplo_link_storage
+  publish_managed_directory \
+    "$managed_taplo_publish_root/taplo.ready" "$managed_taplo_target" taplo-directory
+  publish_managed_link "$managed_taplo_target/taplo" "$managed_taplo_link"
+  maybe_fail_managed_publication taplo-link
+}
+
+apply_managed_taplo_scope() {
+  prepare_managed_taplo_scope "$1"
+  emit_managed_taplo_plan
+  case $managed_taplo_state in
+    satisfied-external|satisfied-managed) return 0 ;;
+    missing) ;;
+    *) die "unsupported managed Taplo state: $managed_taplo_state" ;;
+  esac
+
+  begin_cleanup_registration_critical
+  start_package_tracking
+  managed_created_identities_file=$package_actions_tmp/managed-created.identities
+  : >"$managed_created_identities_file" \
+    || die 'could not initialize managed Taplo identity journal'
+  finish_cleanup_registration_critical
+  begin_cleanup_registration_critical
+  managed_stage_root=$(temporary_directory) || {
+    finish_cleanup_registration_critical
+    die 'could not create managed Taplo staging storage'
+  }
+  active_package_tmp=$managed_stage_root
+  finish_cleanup_registration_critical
+  stage_taplo "$1" "$managed_stage_root"
+  publish_managed_taplo_scope "$managed_stage_root"
+  prepare_managed_taplo_scope "$1"
+  [ "$managed_taplo_state" = satisfied-managed ] \
+    || die 'published managed Taplo failed final validation'
+  record_package_action direct taplo
+  remove_managed_taplo_publish_storage \
+    || die 'could not remove managed Taplo publication staging storage'
+  managed_publish_active=false
+  remove_temporary_directory "$managed_stage_root"
+  active_package_tmp=
+}
+
+run_managed_tool_mode() {
+  managed_tool_platform=$1
+  managed_tool_manifest_root=$2
+  [ "$managed_tool_platform" = linux ] \
+    || die 'managed tool taplo is supported only on Linux'
+  # This helper is platform-neutral despite its legacy Debian name.
+  require_debian_probe_runtime || exit 1
+  case $mode in
+    dry-run)
+      prepare_managed_taplo_scope "$managed_tool_manifest_root"
+      emit_managed_taplo_plan
+      ;;
+    apply) apply_managed_taplo_scope "$managed_tool_manifest_root" ;;
+    *) die "unsupported managed Taplo mode: $mode" ;;
+  esac
+}
+
 prepare_debian_language_servers() {
   managed_manifest_root=$1
   managed_node_required=false
@@ -3621,12 +4181,50 @@ boolean_value() {
   esac
 }
 
+emit_selected_services() {
+  case "$1:$2" in
+    linux:hypr) printf '%s\n' tmux-workspace.service cliphist.service ;;
+    linux:*) printf '%s\n' tmux-workspace.service ;;
+    macos:*) printf '%s\n' dev.ruohao.tmux-workspace ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_service_identifier() {
+  case "$1:$2" in
+    linux:tmux-workspace.service|linux:cliphist.service|macos:dev.ruohao.tmux-workspace) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_service_inventory() {
+  inventory_platform=$1
+  inventory_file=$2
+  [ -f "$inventory_file" ] && [ ! -L "$inventory_file" ] && [ -s "$inventory_file" ] || return 1
+  inventory_seen=' '
+  while IFS= read -r inventory_service || [ -n "$inventory_service" ]; do
+    validate_service_identifier "$inventory_platform" "$inventory_service" || return 1
+    case "$inventory_seen" in *" $inventory_service "*) return 1 ;; esac
+    inventory_seen="$inventory_seen$inventory_service "
+  done <"$inventory_file"
+}
+
 service_unit_path() {
-  service_platform=$1
-  case "$service_platform" in
-    linux) printf '%s\n' "$HOME/.config/systemd/user/tmux-workspace.service" ;;
-    macos) printf '%s\n' "$HOME/Library/LaunchAgents/dev.ruohao.tmux-workspace.plist" ;;
-    *) die "unsupported service platform: $service_platform" ;;
+  case "$1:${2:-tmux-workspace.service}" in
+    linux:tmux-workspace.service) printf '%s\n' "$HOME/.config/systemd/user/tmux-workspace.service" ;;
+    linux:cliphist.service)
+      if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
+        # Test mode never silently falls back to a host unit.
+        case ${DOTFILES_BOOTSTRAP_TEST_CLIPHIST_UNIT_PATH:-} in
+          /*) printf '%s\n' "$DOTFILES_BOOTSTRAP_TEST_CLIPHIST_UNIT_PATH" ;;
+          *) return 1 ;;
+        esac
+      else
+        printf '%s\n' /usr/lib/systemd/user/cliphist.service
+      fi
+      ;;
+    macos:*) printf '%s\n' "$HOME/Library/LaunchAgents/dev.ruohao.tmux-workspace.plist" ;;
+    *) return 1 ;;
   esac
 }
 
@@ -3652,59 +4250,58 @@ require_service_manager() {
 
 record_initial_service_state() {
   service_platform=$1
-  service_target=$(service_unit_path "$service_platform")
-  if path_exists "$service_target"; then
-    service_was_installed=true
-  else
-    service_was_installed=false
-  fi
-  service_was_enabled=false
-  service_was_active=false
-
-  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
-    service_was_installed=$(boolean_value \
-      DOTFILES_BOOTSTRAP_TEST_SERVICE_INSTALLED \
-      "${DOTFILES_BOOTSTRAP_TEST_SERVICE_INSTALLED:-$service_was_installed}") \
-      || die 'invalid test service installed state'
-    case "$service_platform" in
-      linux)
-        service_was_enabled=$(boolean_value \
-          DOTFILES_BOOTSTRAP_TEST_SERVICE_ENABLED \
-          "${DOTFILES_BOOTSTRAP_TEST_SERVICE_ENABLED:-false}") \
-          || die 'invalid test service enabled state'
-        service_was_active=$(boolean_value \
-          DOTFILES_BOOTSTRAP_TEST_SERVICE_ACTIVE \
-          "${DOTFILES_BOOTSTRAP_TEST_SERVICE_ACTIVE:-false}") \
-          || die 'invalid test service active state'
-        ;;
-      macos)
-        service_was_active=$(boolean_value \
-          DOTFILES_BOOTSTRAP_TEST_SERVICE_LOADED \
-          "${DOTFILES_BOOTSTRAP_TEST_SERVICE_LOADED:-false}") \
-          || die 'invalid test service loaded state'
-        ;;
-    esac
-  else
-    case "$service_platform" in
-      linux)
-        systemctl --user is-enabled --quiet tmux-workspace.service \
-          >/dev/null 2>&1 && service_was_enabled=true
-        systemctl --user is-active --quiet tmux-workspace.service \
-          >/dev/null 2>&1 && service_was_active=true
-        ;;
-      macos)
-        launchctl print "$(service_domain)/dev.ruohao.tmux-workspace" \
-          >/dev/null 2>&1 && service_was_active=true
-        ;;
-    esac
-  fi
-
+  service_profile=$2
   printf '%s\n' "$service_platform" >"$transaction_run/service-platform"
-  printf '%s\n' "$service_was_installed" >"$transaction_run/service-was-installed"
-  printf '%s\n' "$service_was_enabled" >"$transaction_run/service-was-enabled"
-  printf '%s\n' "$service_was_active" >"$transaction_run/service-was-active"
-  printf '%s\n' false >"$transaction_run/service-new-loaded"
+  printf '%s\n' 2 >"$transaction_run/service-journal-version"
+  printf '%s\n' false >"$transaction_run/service-manager-reloaded"
+  emit_selected_services "$service_platform" "$service_profile" >"$transaction_run/services.list" \
+    || die 'could not select login services'
+  validate_service_inventory "$service_platform" "$transaction_run/services.list" \
+    || die 'invalid login service inventory'
   : >"$transaction_run/service-actions.log"
+  while IFS= read -r selected_service; do
+    service_state=$transaction_run/services/$selected_service
+    mkdir -p "$service_state" || die 'could not create service journal'
+    service_was_installed=false
+    service_target=$(service_unit_path "$service_platform" "$selected_service") || service_target=
+    [ -n "$service_target" ] && path_exists "$service_target" && service_was_installed=true
+    service_was_enabled=false
+    service_was_active=false
+    if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
+      case $selected_service in
+        cliphist.service)
+          service_was_installed=${DOTFILES_BOOTSTRAP_TEST_CLIPHIST_INSTALLED:-$service_was_installed}
+          service_was_enabled=${DOTFILES_BOOTSTRAP_TEST_CLIPHIST_ENABLED:-false}
+          service_was_active=${DOTFILES_BOOTSTRAP_TEST_CLIPHIST_ACTIVE:-false}
+          ;;
+        tmux-workspace.service)
+          service_was_installed=${DOTFILES_BOOTSTRAP_TEST_SERVICE_INSTALLED:-$service_was_installed}
+          service_was_enabled=${DOTFILES_BOOTSTRAP_TEST_SERVICE_ENABLED:-false}
+          service_was_active=${DOTFILES_BOOTSTRAP_TEST_SERVICE_ACTIVE:-false}
+          ;;
+        dev.ruohao.tmux-workspace)
+          service_was_installed=${DOTFILES_BOOTSTRAP_TEST_SERVICE_INSTALLED:-$service_was_installed}
+          service_was_active=${DOTFILES_BOOTSTRAP_TEST_SERVICE_LOADED:-false}
+          ;;
+      esac
+    else
+      case $service_platform in
+        linux)
+          systemctl --user is-enabled --quiet "$selected_service" >/dev/null 2>&1 && service_was_enabled=true
+          systemctl --user is-active --quiet "$selected_service" >/dev/null 2>&1 && service_was_active=true
+          ;;
+        macos)
+          launchctl print "$(service_domain)/$selected_service" >/dev/null 2>&1 && service_was_active=true
+          ;;
+      esac
+    fi
+    boolean_value was-installed "$service_was_installed" >"$service_state/was-installed" || die 'invalid installed service state'
+    boolean_value was-enabled "$service_was_enabled" >"$service_state/was-enabled" || die 'invalid enabled service state'
+    boolean_value was-active "$service_was_active" >"$service_state/was-active" || die 'invalid active service state'
+    for service_flag in enabled-by-transaction started-by-transaction new-loaded; do
+      printf '%s\n' false >"$service_state/$service_flag"
+    done
+  done <"$transaction_run/services.list"
 }
 
 begin_transaction() {
@@ -3747,7 +4344,7 @@ begin_transaction() {
       && printf '%s\n' "$selected_manager" >"$transaction_run/package-manager" \
       && printf '%s\n' "$selected_window_manager" >"$transaction_run/window-manager"
   } || die 'could not initialize transaction metadata'
-  record_initial_service_state "$selected_platform"
+  record_initial_service_state "$selected_platform" "$selected_window_manager"
   printf '%s\n' \
     'Package changes are retained during rollback.' \
     "Package manager: $selected_manager" \
@@ -3872,38 +4469,88 @@ install_command_links() {
     'tmux workspace helper'
 }
 
+preflight_selected_service_assets() {
+  preflight_transaction_service || die 'invalid service transaction journal'
+  while IFS= read -r selected_service; do
+    service_target=$(service_unit_path "$service_platform" "$selected_service") \
+      || die 'could not resolve the selected service unit'
+    [ -f "$service_target" ] && [ ! -L "$service_target" ] \
+      || die 'selected service unit is missing or invalid'
+    case $selected_service in
+      tmux-workspace.service|dev.ruohao.tmux-workspace)
+        [ -f "$HOME/.config/tmux/scripts/workspace" ] \
+          && [ ! -L "$HOME/.config/tmux/scripts/workspace" ] \
+          && [ -x "$HOME/.config/tmux/scripts/workspace" ] \
+          || die 'deployed tmux workspace helper is not executable'
+        ;;
+      cliphist.service)
+        for service_asset in .config/clipboard-history/store .config/cliphist/config .config/systemd/user/cliphist.service.d/override.conf; do
+          [ -f "$HOME/$service_asset" ] && [ ! -L "$HOME/$service_asset" ] \
+            || die 'deployed clipboard capture asset is missing or invalid'
+        done
+        [ -x "$HOME/.config/clipboard-history/store" ] || die 'deployed clipboard capture helper is not executable'
+        ;;
+    esac
+  done <"$transaction_run/services.list"
+}
+
+clipboard_session_active() {
+  [ -n "${WAYLAND_DISPLAY:-}" ] || return 1
+  if [ "${DOTFILES_BOOTSTRAP_TESTING:-0}" = 1 ]; then
+    [ "${DOTFILES_BOOTSTRAP_TEST_GRAPHICAL_ACTIVE:-false}" = true ]
+  else
+    systemctl --user is-active --quiet graphical-session.target >/dev/null 2>&1
+  fi
+}
+
 activate_login_service() {
   service_platform=$1
-  [ -x "$HOME/.config/tmux/scripts/workspace" ] \
-    || die 'deployed tmux workspace helper is not executable'
-  service_target=$(service_unit_path "$service_platform")
-  [ -f "$service_target" ] && [ ! -L "$service_target" ] \
-    || die 'deployed tmux workspace service file is invalid'
-
-  case "$service_platform" in
-    linux)
-      run_service_command systemctl --user daemon-reload \
-        || die 'could not reload the systemd user manager'
-      run_service_command systemctl --user enable --now tmux-workspace.service \
-        || die 'could not enable and start tmux-workspace.service'
-      ;;
-    macos)
-      service_target_domain=$(service_domain)
-      service_was_active=$(cat "$transaction_run/service-was-active")
-      if [ "$service_was_active" = true ]; then
-        run_service_command launchctl bootout \
-          "$service_target_domain/dev.ruohao.tmux-workspace" \
-          || die 'could not unload the previous tmux workspace LaunchAgent'
-      fi
-      run_service_command launchctl bootstrap "$service_target_domain" "$service_target" \
-        || die 'could not bootstrap the tmux workspace LaunchAgent'
-      printf '%s\n' true >"$transaction_run/service-new-loaded"
-      run_service_command launchctl kickstart -k \
-        "$service_target_domain/dev.ruohao.tmux-workspace" \
-        || die 'could not start the tmux workspace LaunchAgent'
-      ;;
-    *) die "unsupported service platform: $service_platform" ;;
-  esac
+  preflight_selected_service_assets
+  if [ "$service_platform" = linux ]; then
+    printf '%s\n' true >"$transaction_run/service-manager-reloaded"
+    run_service_command systemctl --user daemon-reload || die 'could not reload the systemd user manager'
+  fi
+  while IFS= read -r selected_service; do
+    service_state=$transaction_run/services/$selected_service
+    case $service_platform in
+      linux)
+        if [ "$(cat "$service_state/was-enabled")" = false ]; then
+          # Journal intent before a command: a failed manager call may have partially succeeded.
+          printf '%s\n' true >"$service_state/enabled-by-transaction"
+          run_service_command systemctl --user enable "$selected_service" || die 'could not enable the selected user service'
+        fi
+        service_should_start=true
+        if [ "$selected_service" = cliphist.service ] && ! clipboard_session_active; then
+          service_should_start=false
+          printf '%s\n' 'Clipboard capture is enabled; startup is deferred until a Wayland graphical session.'
+        fi
+        if [ "$service_should_start" = true ] && [ "$(cat "$service_state/was-active")" = false ]; then
+          printf '%s\n' true >"$service_state/started-by-transaction"
+          run_service_command systemctl --user start "$selected_service" || die 'could not start the selected user service'
+        fi
+        ;;
+      macos)
+        service_target_domain=$(service_domain)
+        service_target=$(service_unit_path macos "$selected_service")
+        if [ "$(cat "$service_state/was-active")" = true ]; then
+          printf '%s\n' true >"$service_state/started-by-transaction"
+          if ! run_service_command launchctl bootout "$service_target_domain/$selected_service"; then
+            # A failed unload may leave the previous job intact. Do not reload it.
+            if run_service_command launchctl print "$service_target_domain/$selected_service" >/dev/null 2>&1; then
+              printf '%s\n' false >"$service_state/started-by-transaction"
+            fi
+            die 'could not unload the previous tmux workspace LaunchAgent'
+          fi
+        fi
+        # Record load intent because bootstrap may fail after registering the job.
+        printf '%s\n' true >"$service_state/new-loaded"
+        run_service_command launchctl bootstrap "$service_target_domain" "$service_target" \
+          || die 'could not bootstrap the tmux workspace LaunchAgent'
+        run_service_command launchctl kickstart -k "$service_target_domain/$selected_service" \
+          || die 'could not start the tmux workspace LaunchAgent'
+        ;;
+    esac
+  done <"$transaction_run/services.list"
 }
 
 install_transaction_preference() {
@@ -4170,7 +4817,7 @@ transaction_has_service_metadata() {
   [ -f "$transaction_run/service-platform" ]
 }
 
-preflight_transaction_service() {
+preflight_legacy_transaction_service() {
   transaction_has_service_metadata || return 0
   rollback_service_platform=$(cat "$transaction_run/service-platform" 2>/dev/null || true)
   case $rollback_service_platform in
@@ -4200,7 +4847,7 @@ preflight_transaction_service() {
   done
 }
 
-stop_deployed_service() {
+stop_legacy_deployed_service() {
   transaction_has_service_metadata || return 0
   rollback_service_platform=$(cat "$transaction_run/service-platform")
   case $rollback_service_platform in
@@ -4217,7 +4864,7 @@ stop_deployed_service() {
   esac
 }
 
-restore_previous_service_state() {
+restore_legacy_service_state() {
   transaction_has_service_metadata || return 0
   rollback_service_platform=$(cat "$transaction_run/service-platform")
   service_was_enabled=$(cat "$transaction_run/service-was-enabled")
@@ -4251,7 +4898,94 @@ restore_previous_service_state() {
   esac
 }
 
+
+preflight_transaction_service() {
+  if [ ! -e "$transaction_run/service-journal-version" ]; then
+    preflight_legacy_transaction_service
+    return $?
+  fi
+  [ "$(cat "$transaction_run/service-journal-version")" = 2 ] || return 1
+  case $(cat "$transaction_run/service-manager-reloaded" 2>/dev/null) in true|false) ;; *) return 1 ;; esac
+  rollback_service_platform=$(cat "$transaction_run/service-platform") || return 1
+  validate_service_inventory "$rollback_service_platform" "$transaction_run/services.list" || return 1
+  require_service_manager "$rollback_service_platform"
+  [ -d "$transaction_run/services" ] && [ ! -L "$transaction_run/services" ] || return 1
+  while IFS= read -r selected_service; do
+    service_state=$transaction_run/services/$selected_service
+    [ -d "$service_state" ] && [ ! -L "$service_state" ] || return 1
+    for service_flag in was-installed was-enabled was-active enabled-by-transaction started-by-transaction new-loaded; do
+      [ -f "$service_state/$service_flag" ] && [ ! -L "$service_state/$service_flag" ] || return 1
+      case $(cat "$service_state/$service_flag") in true|false) ;; *) return 1 ;; esac
+    done
+  done <"$transaction_run/services.list"
+}
+
+stop_deployed_service() {
+  if [ ! -e "$transaction_run/service-journal-version" ]; then
+    stop_legacy_deployed_service
+    return $?
+  fi
+  rollback_service_platform=$(cat "$transaction_run/service-platform")
+  reverse_journal "$transaction_run/services.list" | while IFS= read -r selected_service; do
+    service_state=$transaction_run/services/$selected_service
+    case $rollback_service_platform in
+      linux)
+        if [ "$(cat "$service_state/started-by-transaction")" = true ]; then
+          run_service_command systemctl --user stop "$selected_service" || exit 1
+          printf '%s\n' false >"$service_state/started-by-transaction"
+        fi
+        if [ "$(cat "$service_state/enabled-by-transaction")" = true ]; then
+          run_service_command systemctl --user disable "$selected_service" || exit 1
+          printf '%s\n' false >"$service_state/enabled-by-transaction"
+        fi
+        ;;
+      macos)
+        if [ "$(cat "$service_state/new-loaded")" = true ]; then
+          rollback_service_domain=$(service_domain)
+          if ! run_service_command launchctl bootout "$rollback_service_domain/$selected_service"; then
+            # A failed load (or partially successful unload) can leave no job to remove.
+            # Verify the manager is reachable before treating a missing job as clean.
+            run_service_command launchctl print "$rollback_service_domain" >/dev/null 2>&1 || exit 1
+            if run_service_command launchctl print "$rollback_service_domain/$selected_service" >/dev/null 2>&1; then
+              exit 1
+            fi
+          fi
+          printf '%s\n' false >"$service_state/new-loaded"
+        fi
+        ;;
+    esac
+  done
+}
+
+restore_previous_service_state() {
+  if [ ! -e "$transaction_run/service-journal-version" ]; then
+    restore_legacy_service_state
+    return $?
+  fi
+  rollback_service_platform=$(cat "$transaction_run/service-platform")
+  case $rollback_service_platform in
+    linux)
+      if [ "$(cat "$transaction_run/service-manager-reloaded")" = true ]; then
+        run_service_command systemctl --user daemon-reload || return 1
+        printf '%s\n' false >"$transaction_run/service-manager-reloaded"
+      fi
+      ;;
+    macos)
+      service_state=$transaction_run/services/dev.ruohao.tmux-workspace
+      if [ "$(cat "$service_state/started-by-transaction")" = true ]; then
+        restored_service_target=$(service_unit_path macos)
+        [ -f "$restored_service_target" ] && [ ! -L "$restored_service_target" ] || return 1
+        restored_service_domain=$(service_domain)
+        run_service_command launchctl bootstrap "$restored_service_domain" "$restored_service_target" || return 1
+        run_service_command launchctl kickstart -k "$restored_service_domain/dev.ruohao.tmux-workspace" || return 1
+        printf '%s\n' false >"$service_state/started-by-transaction"
+      fi
+      ;;
+  esac
+}
+
 rollback_transaction() {
+  ownership_recheck || return 1
   transaction_run=$1
   rollback_status=$(cat "$transaction_run/status" 2>/dev/null || true)
   if [ "$rollback_status" = rolled-back ]; then
@@ -4343,6 +5077,8 @@ handle_process_exit() {
   if [ -n "$active_probe_waiter_pid" ] || [ -n "$active_probe_tmp" ]; then
     stop_owned_probe || true
   fi
+  remove_managed_taplo_publish_storage || printf '%s\n' \
+    'bootstrap: managed Taplo staging cleanup was incomplete; inspect the reported path' >&2
   if [ "$process_status" -ne 0 ] && [ "$managed_publish_active" = true ]; then
     managed_cleanup_incomplete=false
     if ! remove_managed_unjournaled_path; then
@@ -4381,6 +5117,7 @@ handle_process_exit() {
   if [ -n "$package_actions_tmp" ] && [ -d "$package_actions_tmp" ]; then
     remove_temporary_directory "$package_actions_tmp"
   fi
+  ownership_release || printf '%s\n' 'bootstrap: ownership lock cleanup was incomplete' >&2
   exit "$process_status"
 }
 
@@ -4417,12 +5154,26 @@ managed_node_target=
 managed_lua_target=
 managed_taplo_target=
 managed_npm_target=
+managed_taplo_state=
+managed_taplo_link=
+managed_taplo_asset_version=
+managed_taplo_asset_format=
+managed_taplo_asset_url=
+managed_taplo_asset_sha256=
+managed_taplo_publish_root=
+managed_taplo_publish_tmp=
+managed_taplo_publish_tmp_identity=
+managed_taplo_link_root=
+managed_taplo_link_tmp=
+managed_taplo_link_tmp_identity=
 managed_lock_sha256=
 managed_publish_active=false
 managed_created_paths_file=
+managed_created_identities_file=
 managed_publication_critical=false
 managed_unjournaled_path=
 managed_unjournaled_kind=
+managed_unjournaled_identity=
 cleanup_registration_critical=false
 pending_transaction_signal_name=
 pending_transaction_signal_code=
@@ -4456,11 +5207,22 @@ trap 'handle_transaction_signal HUP 129' HUP
 trap 'handle_transaction_signal INT 130' INT
 trap 'handle_transaction_signal TERM 143' TERM
 
+# Coordinate before scoped dispatch, prerequisites, package tracking or Git fetch.
+if [ "$mode" = apply ] || [ "$mode" = rollback ]; then
+  ownership_acquire || exit 1
+fi
+
 platform=$(detect_platform)
 case "$platform" in
   macos|linux) ;;
   *) die "invalid platform selection: $platform" ;;
 esac
+if [ -n "$managed_tool" ]; then
+  [ -n "$script_dir" ] || die 'managed tool mode requires local bootstrap manifests'
+  run_managed_tool_mode "$platform" "$script_dir/manifests"
+  exit 0
+fi
+
 manager=$(detect_manager "$platform")
 case "$platform:$manager" in
   macos:homebrew|linux:apt|linux:pacman) ;;
@@ -4519,7 +5281,7 @@ emit_selected_paths "$platform" "$window_manager" "$script_dir/manifests" \
 printf '%s\n' 'Packages:'
 emit_package_plan "$manager" "$window_manager" "$script_dir/manifests"
 emit_platform_preference_plan "$platform" "$window_manager"
-emit_service_plan "$platform"
+emit_service_plan "$platform" "$window_manager"
 emit_post_apply_manual_steps "$platform" "$window_manager"
 
 if [ "$mode" = dry-run ]; then

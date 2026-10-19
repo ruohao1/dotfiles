@@ -7,7 +7,7 @@ die() {
 }
 
 usage() {
-  printf '%s\n' 'usage: t' >&2
+  printf '%s\n' 'usage: t [--editor | --with-editor]' >&2
 }
 
 normalize_directory() {
@@ -16,11 +16,11 @@ normalize_directory() {
 }
 
 attach_session() {
-  exec tmux attach-session -c "$2" -t "=$1"
+  exec "$project_helper" open "=$1" "$2" "$project_view"
 }
 
 attach_session_id() {
-  exec tmux attach-session -c "$2" -t "$1"
+  exec "$project_helper" open "$1" "$2" "$project_view"
 }
 
 session_root() {
@@ -49,6 +49,11 @@ attach_current_directory_session() {
     exact_normalized_root_with_sentinel=$(normalize_directory "$exact_root") || continue
     exact_normalized_root=${exact_normalized_root_with_sentinel%.}
     [ "$exact_normalized_root" = "$exact_directory" ] || continue
+
+    # The editor shares this directory, but t attaches the shell half of the pair.
+    # Its deterministic name survives restoration even when tmux options do not.
+    exact_name_with_sentinel=$(session_name "$exact_candidate_id") || continue
+    [ "${exact_name_with_sentinel%.}" != "$paired_editor_name" ] || continue
 
     exact_match_count=$((exact_match_count + 1))
     exact_match_id=$exact_candidate_id
@@ -123,7 +128,12 @@ if [ -n "${TMUX-}" ]; then
   die "already inside tmux"
 fi
 
-if [ "$#" -ne 0 ]; then
+project_view=shell
+if [ "$#" -eq 1 ] && [ "$1" = --editor ]; then
+  project_view=nvim
+elif [ "$#" -eq 1 ] && [ "$1" = --with-editor ]; then
+  project_view=pair
+elif [ "$#" -ne 0 ]; then
   usage
   exit 2
 fi
@@ -143,6 +153,11 @@ if ! current_directory_with_sentinel=$(normalize_directory .); then
   die "could not normalize current directory"
 fi
 current_directory=${current_directory_with_sentinel%.}
+project_helper=$HOME/.config/tmux/scripts/project-session
+[ -x "$project_helper" ] \
+  || die "project helper is missing or not executable: $project_helper"
+paired_editor_name=$("$project_helper" editor-name "$current_directory") \
+  || die "could not identify the project's editor session"
 attach_current_directory_session "$current_directory"
 
 if ! command -v git >/dev/null 2>&1; then
@@ -150,9 +165,13 @@ if ! command -v git >/dev/null 2>&1; then
   exit 127
 fi
 
-if ! git_root=$(git rev-parse --show-toplevel 2>/dev/null); then
+if ! git_root_with_sentinel=$(git rev-parse --show-toplevel 2>/dev/null && printf '.'); then
+  [ "$project_view" = shell ] || die 'no project session or Git worktree found'
   exec tmux
 fi
+# Remove the sentinel and exactly Git's output newline, preserving path newlines.
+git_root=${git_root_with_sentinel%.}
+git_root=${git_root%?}
 
 if ! project_root_with_sentinel=$(normalize_directory "$git_root"); then
   die "could not normalize Git root '$git_root'"

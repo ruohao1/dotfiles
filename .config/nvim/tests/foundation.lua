@@ -44,10 +44,33 @@ for _, key in ipairs({
   "<leader>fb",
   "<leader>fr",
   "<leader>fh",
-  "-",
+  "<leader>ha",
+  "<leader>hh",
+  "<leader>hd",
+  "<leader>hc",
+  "<leader><Tab>",
 }) do
   local mapping = vim.fn.maparg(key, "n", false, true)
   assert(type(mapping) == "table" and next(mapping) ~= nil, "missing navigation mapping " .. key)
+end
+
+for _, command in ipairs({ "LinePinAdd", "LinePins", "LinePinDelete", "LinePinsClear" }) do
+  assert(vim.fn.exists(":" .. command) == 2, "missing line-pin command " .. command)
+end
+
+for _, mode in ipairs({ "n", "x" }) do
+  local mapping = vim.fn.maparg("<leader>p", mode, false, true)
+  assert(
+    type(mapping) == "table" and mapping.desc == "Paste history",
+    "missing clipboard mapping in " .. mode
+  )
+end
+for _, command in ipairs({
+  "ClipboardHistoryClear",
+  "ClipboardHistoryPause",
+  "ClipboardHistoryResume",
+}) do
+  assert(vim.fn.exists(":" .. command) == 2, "missing clipboard command " .. command)
 end
 
 assert(vim.fn.maparg("<leader>fk", "n") == "", "keymap picker must remain absent")

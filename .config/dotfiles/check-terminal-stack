@@ -50,6 +50,10 @@ warn() {
   warnings=$((warnings + 1))
 }
 
+tmux_url_version_is_eligible() {
+  version_at_least "$1" "3.7"
+}
+
 version_at_least() {
   awk -v actual="$1" -v required="$2" 'BEGIN {
     split(actual, a, ".")
@@ -487,6 +491,9 @@ tmux_pristine_binding_delta_is_exact() {
   TMUX_EXPECTED_SWAP_RIGHT_COMMAND=$tmux_swap_right_command \
   TMUX_EXPECTED_MOVE_COMMAND=$tmux_move_command \
   TMUX_EXPECTED_PERSISTENCE_SAVE_COMMAND=$tmux_persistence_save_command \
+  TMUX_EXPECTED_URL_ENABLED=$tmux_url_enabled \
+  TMUX_EXPECTED_URL_DOWN_COMMAND=$tmux_url_down_command \
+  TMUX_EXPECTED_URL_UP_COMMAND=$tmux_url_up_command \
     awk '
       function approve(table, key, command,    identity) {
         identity = table SUBSEP key
@@ -553,7 +560,7 @@ tmux_pristine_binding_delta_is_exact() {
         approve("root", "M-j", "select-pane -D")
         approve("root", "M-k", "select-pane -U")
         approve("root", "M-l", "select-pane -R")
-        approve("root", "M-q", "kill-pane")
+        approve("root", "M-q", "confirm-before -p \"Kill pane #P? (y/n)\" kill-pane")
         approve("root", "M-f", "resize-pane -Z")
 
         approve("resize", "h", "resize-pane -L 1 \\; switch-client -T resize")
@@ -570,6 +577,13 @@ tmux_pristine_binding_delta_is_exact() {
         approve("copy-mode-vi", "M-j", "select-pane -D")
         approve("copy-mode-vi", "M-k", "select-pane -U")
         approve("copy-mode-vi", "M-l", "select-pane -R")
+
+        expected_approval_count = 46
+        if (ENVIRON["TMUX_EXPECTED_URL_ENABLED"] == "true") {
+          approve("root", "C-MouseDown1Pane", ENVIRON["TMUX_EXPECTED_URL_DOWN_COMMAND"])
+          approve("root", "C-MouseUp1Pane", ENVIRON["TMUX_EXPECTED_URL_UP_COMMAND"])
+          expected_approval_count = 48
+        }
 
         allow_removal("prefix", "C-Space")
         allow_removal("prefix", "C-b")
@@ -629,6 +643,9 @@ tmux_pristine_binding_delta_is_exact() {
       {
         source_line = $0
         current_line[source_line] = 1
+        if (parse_binding(source_line)) {
+          current_command[parsed_table SUBSEP parsed_key] = parsed_command
+        }
         if (source_line in pristine_line) next
 
         if (!parse_binding(source_line)) {
@@ -652,9 +669,23 @@ tmux_pristine_binding_delta_is_exact() {
         }
       }
       END {
-        if (duplicate_approval || approval_count != 46) {
-          print "internal tmux owned-binding map error: expected 46 unique identities, found " approval_count
+        if (duplicate_approval || approval_count != expected_approval_count) {
+          print "internal tmux owned-binding map error: expected " expected_approval_count " unique identities, found " approval_count
           invalid = 1
+        }
+        if (ENVIRON["TMUX_EXPECTED_URL_ENABLED"] == "true") {
+          down_identity = "root" SUBSEP "C-MouseDown1Pane"
+          up_identity = "root" SUBSEP "C-MouseUp1Pane"
+          if (!(down_identity in current_command) \
+            || current_command[down_identity] != approved_command[down_identity]) {
+            print "missing or noncanonical tmux Ctrl-down identity"
+            invalid = 1
+          }
+          if (!(up_identity in current_command) \
+            || current_command[up_identity] != approved_command[up_identity]) {
+            print "missing or noncanonical tmux Ctrl-up identity"
+            invalid = 1
+          }
         }
         if (duplicate_removal || removal_count != 47) {
           print "internal tmux removal map error: expected 47 unique identities, found " removal_count
@@ -687,6 +718,11 @@ tmux_source_commands_are_allowed() {
 
   TMUX_EXPECTED_PERSISTENCE_SOURCE=${tmux_persistence_source:-} \
   TMUX_EXPECTED_PERSISTENCE_HELPER_SOURCE=${tmux_persistence_helper_source:-} \
+  TMUX_EXPECTED_URL_SOURCE_GUARD=$tmux_url_source_guard \
+  TMUX_EXPECTED_URL_SOURCE_DOWN=$tmux_url_source_down \
+  TMUX_EXPECTED_URL_SOURCE_UP=$tmux_url_source_up \
+  TMUX_EXPECTED_URL_SOURCE_CONTINUATION=$tmux_url_source_continuation \
+  TMUX_EXPECTED_URL_SOURCE_ENDIF=$tmux_url_source_endif \
   TMUX_EXPECTED_PERSISTENCE_PROMPT=${tmux_persistence_prompt:-} \
     awk -v policy="$source_policy" '
     function clear_tokens(depth,    token_index) {
@@ -698,6 +734,10 @@ tmux_source_commands_are_allowed() {
       parsed_token_count[depth] = 0
       parsed_lex_error[depth] = 0
       parsed_error_line[depth] = 1
+      parsed_final_brace_level[depth] = 0
+      parsed_final_quote[depth] = ""
+      parsed_final_comment[depth] = 0
+      parsed_final_continuation[depth] = 0
       word_value[depth] = ""
       word_has_token[depth] = 0
     }
@@ -716,12 +756,13 @@ tmux_source_commands_are_allowed() {
       parsed_token_kind[depth, token_index] = kind
       parsed_token_line[depth, token_index] = line_number
     }
-    function tokenize_tmux_source(input, depth, base_line,    brace_level, character, character_index, comment, input_length, line_number, next_character, quote) {
+    function tokenize_tmux_source(input, depth, base_line,    brace_level, character, character_index, comment, continued_line, input_length, line_number, next_character, quote) {
       clear_tokens(depth)
       input_length = length(input)
       line_number = base_line
       brace_level = 0
       comment = 0
+      continued_line = 0
       quote = ""
 
       for (character_index = 1; character_index <= input_length; character_index++) {
@@ -732,10 +773,12 @@ tmux_source_commands_are_allowed() {
           if (character == "\\" && next_character == "\n") {
             character_index++
             line_number++
+            continued_line = 1
           } else if (character == "\n") {
             emit_boundary(depth, "newline", line_number)
             comment = 0
             line_number++
+            continued_line = 0
           }
           continue
         }
@@ -747,6 +790,7 @@ tmux_source_commands_are_allowed() {
             parsed_lex_error[depth] = 1
             parsed_error_line[depth] = line_number
             line_number++
+            continued_line = 0
           } else {
             word_value[depth] = word_value[depth] character
           }
@@ -760,6 +804,7 @@ tmux_source_commands_are_allowed() {
             if (next_character == "\n") {
               character_index++
               line_number++
+              continued_line = 1
             } else if (next_character == "") {
               word_value[depth] = word_value[depth] "\\"
             } else {
@@ -771,6 +816,7 @@ tmux_source_commands_are_allowed() {
             parsed_lex_error[depth] = 1
             parsed_error_line[depth] = line_number
             line_number++
+            continued_line = 0
           } else {
             word_value[depth] = word_value[depth] character
           }
@@ -781,6 +827,7 @@ tmux_source_commands_are_allowed() {
           if (next_character == "\n") {
             character_index++
             line_number++
+            continued_line = 1
           } else if (next_character == "") {
             word_value[depth] = word_value[depth] "\\"
             word_has_token[depth] = 1
@@ -798,6 +845,7 @@ tmux_source_commands_are_allowed() {
         } else if (character == "\n") {
           emit_boundary(depth, "newline", line_number)
           line_number++
+          continued_line = 0
         } else if (character ~ /[[:space:]]/) {
           flush_word(depth, line_number)
         } else if (character == ";") {
@@ -824,6 +872,10 @@ tmux_source_commands_are_allowed() {
         parsed_error_line[depth] = line_number
       }
       flush_word(depth, line_number)
+      parsed_final_brace_level[depth] = brace_level
+      parsed_final_quote[depth] = quote
+      parsed_final_comment[depth] = comment
+      parsed_final_continuation[depth] = continued_line
       return parsed_token_count[depth]
     }
     function effective_policy_name(current_policy, scope, brace_level) {
@@ -1018,6 +1070,11 @@ tmux_source_commands_are_allowed() {
       persistence_source = ENVIRON["TMUX_EXPECTED_PERSISTENCE_SOURCE"]
       persistence_helper_source = ENVIRON["TMUX_EXPECTED_PERSISTENCE_HELPER_SOURCE"]
       persistence_prompt = ENVIRON["TMUX_EXPECTED_PERSISTENCE_PROMPT"]
+      expected_url_line[1] = ENVIRON["TMUX_EXPECTED_URL_SOURCE_GUARD"]
+      expected_url_line[2] = ENVIRON["TMUX_EXPECTED_URL_SOURCE_DOWN"]
+      expected_url_line[3] = ENVIRON["TMUX_EXPECTED_URL_SOURCE_UP"]
+      expected_url_line[4] = ENVIRON["TMUX_EXPECTED_URL_SOURCE_CONTINUATION"]
+      expected_url_line[5] = ENVIRON["TMUX_EXPECTED_URL_SOURCE_ENDIF"]
       if (persistence_source == "" \
         || persistence_helper_source == "" \
         || persistence_prompt == "") {
@@ -1053,10 +1110,53 @@ tmux_source_commands_are_allowed() {
       expected_source_count["$HOME/.config/tmux/conf/status.conf"] = 1
     }
     {
+      if (policy == "keys") {
+        if (url_line_index > 0) {
+          if ($0 == expected_url_line[url_line_index + 1]) {
+            url_line_index++
+            if (url_line_index == 5) {
+              url_line_index = 0
+              complete_url_block_count++
+            }
+            next
+          }
+          print "noncanonical tmux URL source block: line=" NR " expected-line=" (url_line_index + 1)
+          url_source_invalid = 1
+          url_line_index = 0
+        }
+        if ($0 == expected_url_line[1]) {
+          url_guard_count++
+          tokenize_tmux_source(source_text, 11, 1)
+          if (parsed_final_brace_level[11] != 0 \
+            || parsed_final_quote[11] != "" \
+            || parsed_final_comment[11] \
+            || parsed_final_continuation[11]) {
+            print "tmux URL source block is not top-level: line=" NR
+            url_source_invalid = 1
+          }
+          url_line_index = 1
+          next
+        }
+        if ($0 ~ /^[[:space:]]*%/) {
+          print "unapproved tmux URL source directive: line=" NR
+          url_source_invalid = 1
+        }
+        if ($0 ~ /^[[:space:]]*bind-key[[:space:]]/ \
+          && $0 ~ /C-Mouse(Down|Up)1Pane/) {
+          print "tmux URL binding outside exact source guard: line=" NR
+          url_source_invalid = 1
+        }
+      }
       source_text = source_text $0 "\n"
     }
     END {
       invalid = audit_command_text(source_text, policy, "top", 0, 1)
+      if (policy == "keys" \
+        && (url_guard_count != 1 || complete_url_block_count != 1 || url_line_index != 0)) {
+        print "tmux URL source block count mismatch: expected=1 complete=1 actual-guards=" (url_guard_count + 0) " actual-complete=" (complete_url_block_count + 0)
+        url_source_invalid = 1
+      }
+      if (url_source_invalid) invalid = 1
       if (persistence_contract_invalid) invalid = 1
       if (audit_persistence_manifest()) invalid = 1
       if (audit_condition_manifest()) invalid = 1
@@ -1064,6 +1164,78 @@ tmux_source_commands_are_allowed() {
       exit invalid
     }
   ' "$source_file"
+}
+
+tmux_url_source_fixture() {
+  url_fixture_kind=$1
+  url_fixture_file=$2
+
+  TMUX_EXPECTED_URL_SOURCE_GUARD=$tmux_url_source_guard \
+  TMUX_EXPECTED_URL_SOURCE_DOWN=$tmux_url_source_down \
+  TMUX_EXPECTED_URL_SOURCE_UP=$tmux_url_source_up \
+  TMUX_EXPECTED_URL_SOURCE_CONTINUATION=$tmux_url_source_continuation \
+  TMUX_EXPECTED_URL_SOURCE_ENDIF=$tmux_url_source_endif \
+    awk -v kind="$url_fixture_kind" '
+      BEGIN {
+        guard = ENVIRON["TMUX_EXPECTED_URL_SOURCE_GUARD"]
+        down = ENVIRON["TMUX_EXPECTED_URL_SOURCE_DOWN"]
+        up = ENVIRON["TMUX_EXPECTED_URL_SOURCE_UP"]
+        continuation = ENVIRON["TMUX_EXPECTED_URL_SOURCE_CONTINUATION"]
+        endif = ENVIRON["TMUX_EXPECTED_URL_SOURCE_ENDIF"]
+      }
+      $0 == guard {
+        guards++
+        if (kind == "brace-wrapped-block") print "bind-key -n F11 {"
+        if (kind == "quoted-brace-prefix") print "bind-key -n F11 display-message \"{\""
+        if (kind == "escaped-brace-prefix") print "bind-key -n F11 display-message \\{"
+        if (kind == "continued-line-block") print "bind-key -n F11 display-message \\"
+        if (kind == "changed-version-guard") print "%if 1"
+        else print
+        if (kind == "nested-guard") print guard
+        next
+      }
+      $0 == endif {
+        endifs++
+        if (kind == "third-guarded-binding") {
+          print "bind-key -n C-MouseDragEnd1Pane send-keys -M"
+        }
+        if (kind != "missing-endif") print
+        if (kind == "duplicate-block") {
+          print guard
+          print down
+          print up
+          print continuation
+          print endif
+        }
+        if (kind == "URL-binding-outside-guard") print down
+        if (kind == "brace-wrapped-block") print "}"
+        next
+      }
+      { print }
+      END {
+        if (kind == "extra-endif") print endif
+        if (guards != 1 || endifs != 1) exit 1
+      }
+    ' "$tmux_keys" > "$url_fixture_file"
+}
+
+tmux_ctrl_url_matches_pristine() {
+  ctrl_pristine_file=$1
+  ctrl_candidate_file=$2
+  for ctrl_key in C-MouseDown1Pane C-MouseUp1Pane; do
+    ctrl_pristine_count=$(tmux_binding_count "$ctrl_pristine_file" root "$ctrl_key")
+    ctrl_candidate_count=$(tmux_binding_count "$ctrl_candidate_file" root "$ctrl_key")
+    [ "$ctrl_pristine_count" -eq "$ctrl_candidate_count" ] || return 1
+    [ "$ctrl_pristine_count" -le 1 ] || return 1
+    if [ "$ctrl_pristine_count" -eq 1 ]; then
+      tmux_binding_command "$ctrl_pristine_file" root "$ctrl_key" \
+        > "$check_tmp/tmux-pristine-$ctrl_key.txt" || return 1
+      tmux_binding_command "$ctrl_candidate_file" root "$ctrl_key" \
+        > "$check_tmp/tmux-candidate-$ctrl_key.txt" || return 1
+      cmp -s "$check_tmp/tmux-pristine-$ctrl_key.txt" \
+        "$check_tmp/tmux-candidate-$ctrl_key.txt" || return 1
+    fi
+  done
 }
 
 tmux_entry_source_graph_is_allowed() {
@@ -1698,6 +1870,7 @@ tmux_copy_pipe_and_run_shell_payloads_are_safe() {
   TMUX_EXPECTED_SWAP_RIGHT_COMMAND=$tmux_swap_right_command \
   TMUX_EXPECTED_MOVE_COMMAND=$tmux_move_command \
   TMUX_EXPECTED_PERSISTENCE_SAVE_COMMAND=$tmux_persistence_save_command \
+  TMUX_EXPECTED_URL_UP_COMMAND=$tmux_url_up_command \
     awk '
     function take_token(    token) {
       token = remaining
@@ -1942,6 +2115,7 @@ tmux_copy_pipe_and_run_shell_payloads_are_safe() {
       canonical_swap_command["L"] = ENVIRON["TMUX_EXPECTED_SWAP_RIGHT_COMMAND"]
       canonical_move_command = ENVIRON["TMUX_EXPECTED_MOVE_COMMAND"]
       canonical_persistence_save_command = ENVIRON["TMUX_EXPECTED_PERSISTENCE_SAVE_COMMAND"]
+      canonical_url_up_command = ENVIRON["TMUX_EXPECTED_URL_UP_COMMAND"]
     }
     /^[[:space:]]*$/ { next }
     {
@@ -1972,6 +2146,9 @@ tmux_copy_pipe_and_run_shell_payloads_are_safe() {
       if (parsed_table == "prefix" \
         && parsed_key == "s" \
         && remaining == canonical_persistence_save_command) next
+      if (parsed_table == "root" \
+        && parsed_key == "C-MouseUp1Pane" \
+        && remaining == canonical_url_up_command) next
       if (audit_tmux_command_list(remaining, 0)) invalid = 1
     }
     END { exit invalid }
@@ -2627,9 +2804,12 @@ resolve_nvim_data_query_tool() {
     return 1
   fi
 
+  data_query_expected_runner=$(realpath "$nvim_root/scripts/data-query-runner.py" \
+    2>> "$data_query_probe_output") || return 1
+
   # shellcheck disable=SC2016  # Preserve the jq $runner binding literally.
   if ! "$data_query_resolver_jq" -e \
-    --arg runner "$nvim_root/scripts/data-query-runner.py" '
+    --arg runner "$data_query_expected_runner" '
       def safe_absolute:
         type == "string"
         and length > 1
@@ -2676,7 +2856,7 @@ resolve_nvim_data_query_tool() {
     && [ "$data_query_tool_python" = "$parquet_tool_python" ] \
     && [ "$data_query_tool_viewer" = "$parquet_tool_viewer" ] \
     && [ "$data_query_tool_pyarrow" = "$parquet_tool_pyarrow" ] \
-    && [ "$data_query_tool_runner" = "$nvim_root/scripts/data-query-runner.py" ] \
+    && [ "$data_query_tool_runner" = "$data_query_expected_runner" ] \
     && [ -x "$data_query_tool_python" ] \
     && [ -x "$data_query_tool_viewer" ] \
     && [ -r "$data_query_tool_pyarrow" ] \
@@ -3213,7 +3393,7 @@ run_nvim_notebook_roundtrip() {
       XDG_STATE_HOME="$XDG_STATE_HOME" \
       XDG_CACHE_HOME="$XDG_CACHE_HOME" \
       XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-      JUPYTER_RUNTIME_DIR="$check_tmp/jupyter-runtime" \
+      JUPYTER_RUNTIME_DIR="$JUPYTER_RUNTIME_DIR" \
       NVIM_LOG_FILE="$nvim_roundtrip_log" \
       PYTHONDONTWRITEBYTECODE=1 \
       TERM_PROGRAM=ghostty \
@@ -6657,6 +6837,268 @@ GIT_ATTR_NOSYSTEM=1
 export GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM \
   GIT_CONFIG_NOSYSTEM GIT_ATTR_NOSYSTEM
 
+check_clipboard_history() {
+  for clipboard_command in python3 id find; do
+    require_command "$clipboard_command" || return 1
+  done
+  if ! python3 - "$config_root" "$0" "$checker_workspace_source" <<'CLIPBOARD_SOURCE_CHECK'
+import importlib.util
+from pathlib import Path
+import sys
+try:
+    config, checker, workspace = map(Path, sys.argv[1:])
+    source = checker.resolve(strict=True).parents[2]
+    if str(workspace).startswith('/nix/store/') and str(workspace).endswith('-dotfiles-runtime/.config/tmux/scripts/workspace'):
+        source = workspace.parents[3]
+    validator = source/'.config/dotfiles/lib/config-source.py'
+    spec = importlib.util.spec_from_file_location('config_source', validator)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for relative in ['nvim/lua/clipboard/history.lua', 'nvim/tests/clipboard_history.lua']:
+        assert module.valid_source(config/relative, source/'.config'/relative)
+except (AssertionError, ImportError, OSError, RuntimeError, ValueError):
+    sys.exit(1)
+CLIPBOARD_SOURCE_CHECK
+  then
+    fail 'clipboard history editor sources are missing or untrusted'
+    return 1
+  fi
+
+  if [ "$clipboard_capture_required" = true ]; then
+  clipboard_fixture=$check_tmp/clipboard-history
+  if [ -e "$clipboard_fixture" ] || [ -L "$clipboard_fixture" ] \
+    || ! (umask 077 && mkdir "$clipboard_fixture"); then
+    fail 'clipboard history requires a fresh checker-owned fixture'
+    return 1
+  fi
+  clipboard_binary=$(command -v cliphist 2>/dev/null || true)
+  clipboard_output=$check_tmp/clipboard-history.txt
+  if python3 - "$config_root" "$clipboard_fixture" "$clipboard_binary" "$check_tmp" <<'CLIPBOARD_CHECK' >"$clipboard_output" 2>&1
+from pathlib import Path
+import os, re, shutil, stat, subprocess, sys
+
+config, root, binary, parent = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
+stage = 'private fixture identity'
+identity = None
+
+def private_directory(path, allow_sticky=False):
+    info = path.lstat()
+    assert stat.S_ISDIR(info.st_mode), 'directory type'
+    assert info.st_uid == os.getuid(), 'directory owner'
+    accepted_modes = (0o700, 0o1700) if allow_sticky else (0o700,)
+    assert stat.S_IMODE(info.st_mode) in accepted_modes, 'directory mode'
+    return info.st_dev, info.st_ino
+
+def normalized(path):
+    return [line.split('#',1)[0].strip() for line in path.read_text().splitlines()
+            if line.split('#',1)[0].strip()]
+
+def ordinary_file(path, executable=False):
+    assert path.is_file() and not path.is_symlink(), 'missing or unsafe source file'
+    if executable: assert os.access(path, os.X_OK), 'source helper is not executable'
+
+try:
+    # Other terminal checks may add the sticky bit without granting group/other access.
+    private_directory(parent, allow_sticky=True)
+    assert root.parent == parent and root.name == 'clipboard-history'
+    identity = private_directory(root)
+    stage = 'static capture policy'
+    capture_paths = ['.config/clipboard-history/store', '.config/cliphist/config',
+                     '.config/systemd/user/cliphist.service.d/override.conf']
+    for relative in capture_paths:
+        ordinary_file(config/relative.removeprefix('.config/'), relative.endswith('/store'))
+    policy = ['max-items 500','max-dedupe-search 500','min-store-length 1','preview-width 100']
+    assert normalized(config/'cliphist/config') == policy, 'unexpected retention policy'
+    override = ['[Service]','ExecStart=',
+                'ExecStart=/usr/bin/wl-paste --type text --watch %h/.config/clipboard-history/store',
+                'ExecStartPre=%h/.config/clipboard-history/store --prepare','UMask=0077']
+    assert normalized(config/'systemd/user/cliphist.service.d/override.conf') == override, 'unexpected text watcher policy'
+    manifests = config/'dotfiles/manifests'
+    for path in manifests.glob('*.paths'):
+        entries = normalized(path)
+        for relative in capture_paths:
+            assert entries.count(relative) == (1 if path.name == 'config-linux-hypr.paths' else 0), 'clipboard paths are not Hyprland-only'
+    for path in manifests.glob('packages*.list'):
+        assert normalized(path).count('cliphist') == (1 if path.name == 'packages-pacman-hypr.list' else 0), 'Cliphist package is not Hyprland-only'
+    print('PASS  clipboard history capture policy and Hyprland-only manifests are exact')
+
+    for name in ['home','config','cache','state','data','runtime','bin']:
+        (root/name).mkdir(mode=0o700)
+    (root/'config/cliphist').mkdir(mode=0o700)
+    policy_file = root/'config/cliphist/config'
+    policy_file.write_text('\n'.join(policy)+'\n')
+    history_dir = root/'cache/cliphist'; history_dir.mkdir(mode=0o700)
+    db = history_dir/'db'
+    env = dict(os.environ, HOME=str(root/'home'), XDG_CONFIG_HOME=str(root/'config'),
+        XDG_CACHE_HOME=str(root/'cache'), XDG_STATE_HOME=str(root/'state'), XDG_DATA_HOME=str(root/'data'),
+        XDG_RUNTIME_DIR=str(root/'runtime'), CLIPHIST_CONFIG_PATH=str(policy_file), CLIPHIST_DB_PATH=str(db),
+        DBUS_SESSION_BUS_ADDRESS='unix:path='+str(root/'no-session-bus'))
+    env.pop('WAYLAND_DISPLAY',None)
+    env.pop('DISPLAY',None)
+    if binary:
+        stage = 'Cliphist version'
+        assert Path(binary).is_absolute() and os.access(binary,os.X_OK)
+        def clip(action, payload=None):
+            assert private_directory(root) == identity
+            private_directory(history_dir)
+            if db.exists() or db.is_symlink():
+                info=db.lstat()
+                assert stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1
+                assert stat.S_IMODE(info.st_mode) == 0o600
+            result = subprocess.run([binary,'-config-path',str(policy_file),'-db-path',str(db),action],
+                input=payload,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10,umask=0o077)
+            assert result.returncode == 0, 'private Cliphist command failed'
+            return result.stderr.splitlines()[0] if action == 'version' else result.stdout
+        version = clip('version').decode().strip()
+        match = re.fullmatch(r'version\t(\d+)\.(\d+)\.(\d+)',version)
+        assert match and tuple(map(int,match.groups())) >= (0,7,0), 'Cliphist stable version is too old'
+        print('PASS  Cliphist stable version is at least 0.7.0')
+        stage = 'exact private text storage and decoding'
+        marker = b'cliphist-isolated-DO-NOT-LEAK-'
+        samples = [b'x', b' \tleading and trailing\t ', marker+'é中🙂\nlast\n'.encode()]
+        for value in samples:
+            clip('store',value)
+            first = clip('list').splitlines()[0]
+            assert clip('decode',first) == value, 'private decode changed text bytes'
+        stage = 'capture helper and size bounds'
+        if sys.platform.startswith('linux'):
+            (root/'bin/cliphist').symlink_to(binary)
+            capture_env=dict(env,PATH=str(root/'bin')+os.pathsep+os.environ.get('PATH',''))
+            helper=str(config/'clipboard-history/store')
+            def capture(value):
+                result=subprocess.run([helper],input=value,env=capture_env,stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,timeout=10,umask=0o077)
+                assert result.returncode==0 and not result.stdout and not result.stderr
+                assert not list(history_dir.glob('.store.*')), 'capture temporary payload remains'
+            before=clip('list')
+            capture(b'');capture(b'x'*1048577)
+            assert clip('list')==before, 'empty or oversized capture was stored'
+            maximum=marker+b'x'*(1048576-len(marker))
+            capture(maximum)
+            assert clip('decode',clip('list').splitlines()[0])==maximum, '1 MiB capture changed bytes'
+        stage = 'retention, dedupe, delete, and wipe'
+        clip('wipe')
+        for index in range(501): clip('store',marker+str(index).encode())
+        rows=clip('list').splitlines()
+        assert len(rows)==500, 'private retention is not 500'
+        assert clip('decode',rows[-1])==marker+b'1', 'retention did not evict oldest item'
+        duplicate=marker+b'1'
+        clip('store',duplicate)
+        rows=clip('list').splitlines()
+        assert len(rows)==500 and clip('decode',rows[0])==duplicate, 'dedupe search did not cover retained history'
+        clip('delete',rows[0])
+        assert len(clip('list').splitlines())==499, 'delete did not remove one entry'
+        clip('wipe')
+        assert not clip('list').strip(), 'wipe did not empty private history'
+        print('PASS  Cliphist isolated text history retention, decode, delete, and wipe assertions pass')
+    else:
+        print('SKIP  Cliphist private runtime checks: executable is not installed on this host')
+
+    stage = 'private systemd unit verification'
+    if sys.platform.startswith('linux') and shutil.which('systemd-analyze') and Path('/usr/bin/wl-paste').is_file():
+        mirror=root/'units';mirror.mkdir(mode=0o700)
+        installed=Path('/usr/lib/systemd/user/cliphist.service')
+        base=mirror/'cliphist.service'
+        if installed.is_file() and not installed.is_symlink():
+            base.write_bytes(installed.read_bytes())
+            source_label='installed base unit copied into private mirror'
+        else:
+            base.write_text('[Unit]\nDescription=Synthetic Cliphist package unit\nPartOf=graphical-session.target\nRequisite=graphical-session.target\nAfter=graphical-session.target\n[Service]\nExecStart=/usr/bin/wl-paste --watch cliphist store\nRestart=on-failure\n[Install]\nWantedBy=graphical-session.target\n')
+            source_label='synthetic package-style base unit'
+        entries=normalized(base)
+        for relationship in ['WantedBy','PartOf','Requisite']:
+            assert entries.count(relationship+'=graphical-session.target')==1, 'unexpected graphical-session relationship'
+        (mirror/'cliphist.service.d').mkdir(mode=0o700)
+        # Substitute only the home specifier for offline verification; no live HOME asset is reachable.
+        fixture_helper=root/'home/.config/clipboard-history/store'
+        fixture_helper.parent.mkdir(mode=0o700,parents=True)
+        shutil.copy2(config/'clipboard-history/store',fixture_helper)
+        override_text=(config/'systemd/user/cliphist.service.d/override.conf').read_text()
+        (mirror/'cliphist.service.d/override.conf').write_text(override_text.replace('%h',str(root/'home')))
+        verify_env=dict(env,SYSTEMD_UNIT_PATH=str(mirror)+':/usr/lib/systemd/user',SYSTEMD_OFFLINE='1')
+        verified=subprocess.run(['systemd-analyze','--user','verify','--man=no',str(base)],env=verify_env,
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10)
+        assert verified.returncode==0, 'private unit verification failed'
+        print('PASS  clipboard watcher override verifies against '+source_label)
+    else:
+        print('SKIP  clipboard systemd unit verification is unavailable on this host')
+except Exception as error:
+    detail = str(error) if str(error) in {'directory type', 'directory owner', 'directory mode'} else ''
+    print('FAIL  clipboard history check failed during '+stage+(' ('+detail+')' if detail else ''), file=sys.stderr)
+    sys.exit(1)
+finally:
+    if identity is not None and root.exists() and private_directory(root)==identity:
+        shutil.rmtree(root)
+CLIPBOARD_CHECK
+  then
+    cat "$clipboard_output"
+  else
+    # Diagnostics are deliberately content-free, including on subprocess failures.
+    cat "$clipboard_output" >&2
+    fail 'clipboard history static or private runtime assertions failed'
+  fi
+
+  else
+    printf '%s\n' 'SKIP  native Hyprland clipboard capture is not configured'
+  fi
+
+  clipboard_nvim_root=$check_tmp/clipboard-nvim
+  clipboard_nvim_output=$check_tmp/clipboard-nvim.txt
+  if ! command -v nvim >/dev/null 2>&1; then
+    fail 'Neovim is required for injected clipboard history checks'
+  elif (umask 077 && mkdir -p "$clipboard_nvim_root/home" "$clipboard_nvim_root/config" \
+      "$clipboard_nvim_root/data" "$clipboard_nvim_root/state" "$clipboard_nvim_root/cache" \
+      "$clipboard_nvim_root/runtime" "$clipboard_nvim_root/tmp") \
+    && env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+      HOME="$clipboard_nvim_root/home" TMPDIR="$clipboard_nvim_root/tmp" \
+      XDG_CONFIG_HOME="$clipboard_nvim_root/config" XDG_DATA_HOME="$clipboard_nvim_root/data" \
+      XDG_STATE_HOME="$clipboard_nvim_root/state" XDG_CACHE_HOME="$clipboard_nvim_root/cache" \
+      XDG_RUNTIME_DIR="$clipboard_nvim_root/runtime" NVIM_LOG_FILE="$clipboard_nvim_root/nvim.log" \
+      DOTFILES_NVIM_ROOT="$nvim_root" \
+      nvim --clean --headless -u NONE -i NONE \
+      -c 'lua vim.opt.runtimepath:prepend(vim.env.DOTFILES_NVIM_ROOT)' \
+      -l "$nvim_root/tests/clipboard_history.lua" >"$clipboard_nvim_output" 2>&1 \
+    && grep -Fqx 'Neovim clipboard history assertions: ok' "$clipboard_nvim_output" \
+    && [ ! -s "$clipboard_nvim_root/nvim.log" ]; then
+    pass 'Neovim clipboard history injected processes and native-buffer assertions pass'
+  else
+    fail 'Neovim clipboard history assertions failed; private logs retained until checker cleanup'
+  fi
+
+  if python3 - "$check_tmp" <<'CLIPBOARD_LOG_CHECK'
+from pathlib import Path
+import sys
+root=Path(sys.argv[1])
+markers=[b'clipboard-secret-DO-NOT-LEAK',b'cliphist-isolated-DO-NOT-LEAK-']
+for path in root.rglob('*'):
+    if path.is_file() and not path.is_symlink():
+        try: content=path.read_bytes()
+        except OSError: sys.exit(1)
+        if any(marker in content for marker in markers): sys.exit(1)
+CLIPBOARD_LOG_CHECK
+  then
+    pass 'clipboard history synthetic content is absent from checker-owned logs'
+  else
+    fail 'clipboard history synthetic content was retained in checker-owned files'
+  fi
+
+  case ${DOTFILES_CHECK_CLIPBOARD_HISTORY_LIVE+x}:${DOTFILES_CHECK_CLIPBOARD_HISTORY_LIVE:-} in
+    :) printf '%s\n' 'SKIP  live clipboard history capture validation was not requested' ;;
+    x:1)
+      if [ "$clipboard_capture_required" = true ] && [ -n "${WAYLAND_DISPLAY:-}" ] \
+        && command -v systemctl >/dev/null 2>&1 \
+        && systemctl --user is-enabled --quiet cliphist.service \
+        && systemctl --user is-active --quiet cliphist.service; then
+        pass 'live clipboard capture service is enabled and active'
+        printf '%s\n' 'SKIP  end-to-end Wayland capture requires a manual copy/paste check'
+      else
+        fail 'live clipboard capture service is unavailable, disabled, or inactive'
+      fi
+      ;;
+    *) fail 'DOTFILES_CHECK_CLIPBOARD_HISTORY_LIVE must be unset or exactly 1' ;;
+  esac
+}
+
 case "$(uname -s)" in
   Darwin)
     platform="macos"
@@ -6696,12 +7138,47 @@ tmux_persistence_helper_source='$HOME/.config/tmux/scripts/workspace'
 tmux_persistence_prompt='Save tmux workspace now? (y/n)'
 tmux_persistence_helper="$tmux_root/scripts/workspace"
 tmux_fresh_start_test="$tmux_root/tests/fresh-start.sh"
+# shellcheck disable=SC2016  # The five physical source lines are byte-exact.
+tmux_url_source_guard='%if "#{m/r:^(3[.]([7-9]|[1-9][0-9]+)|([4-9]|[1-9][0-9]+)[.][0-9]+)[[:alnum:]._-]*$,#{version}}"'
+tmux_url_source_down='bind-key -n C-MouseDown1Pane send-keys -M'
+# shellcheck disable=SC1003  # The final backslash is a literal physical-line continuation.
+tmux_url_source_up='bind-key -n C-MouseUp1Pane send-keys -M \; run-shell -b -t = \'
+tmux_url_source_continuation="  '~/.config/tmux/scripts/open-url --pane #{mouse_pane} --x #{mouse_x} --y #{mouse_y} --hyperlink #{?mouse_hyperlink,1,0} || :'"
+tmux_url_source_endif='%endif'
 # shellcheck disable=SC2034  # Consumed by the effective-key contract in the next slice.
 tmux_persistence_save_command="confirm-before -p \"$tmux_persistence_prompt\" \"run-shell '$tmux_persistence_helper save'\""
 nvim_root="$config_root/nvim"
 nvim_data_root="$data_home/nvim"
 git_summary="$config_root/dotfiles/git-summary"
 terminal_stack_checker="$config_root/dotfiles/check-terminal-stack"
+# Transferred configuration validation uses the workspace's selected-generation
+# proof. Runtime state and native Codex hooks retain their separate policies.
+checker_workspace_source=$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))' \
+  "$tmux_persistence_helper" 2>/dev/null || true)
+case $checker_workspace_source in
+  /nix/store/*-dotfiles-runtime/.config/tmux/scripts/workspace)
+    if "$tmux_persistence_helper" doctor >/dev/null 2>&1; then
+      pass "selected tmux configuration sources and service are valid"
+    else
+      fail "selected tmux configuration sources or service are invalid"
+    fi
+    ;;
+esac
+# Partial or dangling native installs still require capture validation.
+clipboard_capture_required=false
+if [ "$platform" = linux ]; then
+  for clipboard_native_asset in \
+    hypr/hyprland.lua hypr/hyprland.conf \
+    clipboard-history/store cliphist/config \
+    systemd/user/cliphist.service.d/override.conf systemd/user/cliphist.service \
+    systemd/user/default.target.wants/cliphist.service \
+    systemd/user/graphical-session.target.wants/cliphist.service
+  do
+    if [ -e "$config_root/$clipboard_native_asset" ] || [ -L "$config_root/$clipboard_native_asset" ]; then
+      clipboard_capture_required=true
+    fi
+  done
+fi
 macos_ghostty_entry="$HOME/Library/Application Support/com.mitchellh.ghostty/config.ghostty"
 
 check_tmp=$(mktemp -d "${TMPDIR:-/tmp}/terminal-stack-check.XXXXXX") || exit 1
@@ -6717,11 +7194,14 @@ fi
 XDG_STATE_HOME="$check_tmp/state"
 XDG_CACHE_HOME="$check_tmp/cache"
 XDG_RUNTIME_DIR="$check_tmp/runtime"
+# Pinned Molten also writes connection files below the Jupyter data directory.
+JUPYTER_DATA_DIR="$check_tmp/jupyter-data"
+JUPYTER_RUNTIME_DIR="$JUPYTER_DATA_DIR/runtime"
 if ! (umask 077 && mkdir -p \
-  "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR"); then
+  "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR" "$JUPYTER_RUNTIME_DIR"); then
   fail "could not create checker-owned XDG state, cache, and runtime directories"
 fi
-export XDG_STATE_HOME XDG_CACHE_HOME XDG_RUNTIME_DIR
+export XDG_STATE_HOME XDG_CACHE_HOME XDG_RUNTIME_DIR JUPYTER_DATA_DIR JUPYTER_RUNTIME_DIR
 
 real_git=$(command -v git 2>/dev/null || true)
 case "$real_git" in
@@ -6731,6 +7211,12 @@ esac
 
 case "${DOTFILES_CHECK_MODE:-}" in
   "")
+    ;;
+  clipboard-history-self-test)
+    check_clipboard_history
+    printf '\nSummary: %s failure(s), %s warning(s)\n' "$failures" "$warnings"
+    [ "$failures" -eq 0 ]
+    exit $?
     ;;
   nvim-parquet-resolver-self-test)
     parquet_probe_output="$check_tmp/parquet-tool.txt"
@@ -6775,7 +7261,7 @@ printf 'Data root: %s\n\n' "$data_home"
 static_shellcheck_ready=true
 static_stylua_ready=true
 git_security_commands_ready=true
-for required_command in uname awk sed grep cmp mktemp mkfifo wc ps infocmp git env ghostty herdr tmux nvim bash-language-server vscode-json-language-server yaml-language-server lua-language-server pyright-langserver taplo fzf jq shellcheck stylua cksum stat date curl tar tree-sitter uv identify convert; do
+for required_command in id find uname awk sed grep cmp mktemp mkfifo wc ps infocmp git env ghostty herdr tmux nvim python3 bash-language-server vscode-json-language-server yaml-language-server lua-language-server pyright-langserver taplo fzf jq shellcheck stylua cksum stat date curl tar tree-sitter uv identify convert; do
   if ! require_command "$required_command"; then
     case "$required_command" in
       shellcheck) static_shellcheck_ready=false ;;
@@ -6838,21 +7324,26 @@ data_query_linux_tools_ready=false
 data_query_timeout=""
 if [ "$platform" = "linux" ]; then
   data_query_linux_tools_ready=true
-  for data_query_linux_command in bwrap timeout; do
-    if ! require_command "$data_query_linux_command"; then
-      data_query_linux_tools_ready=false
+  if ! require_command bwrap; then
+    data_query_linux_tools_ready=false
+  fi
+  data_query_timeout_version="$check_tmp/data-query-timeout-version.txt"
+  # Ubuntu may expose GNU timeout as gnutimeout alongside a uutils timeout.
+  for data_query_timeout_candidate in \
+    "$(command -p -v timeout 2>/dev/null || true)" \
+    "$(command -p -v gnutimeout 2>/dev/null || true)"; do
+    case "$data_query_timeout_candidate" in
+      /*) [ -x "$data_query_timeout_candidate" ] || continue ;;
+      *) continue ;;
+    esac
+    if "$data_query_timeout_candidate" --version > "$data_query_timeout_version" 2>&1 \
+      && sed -n '1p' "$data_query_timeout_version" \
+        | grep -Fq 'timeout (GNU coreutils)'; then
+      data_query_timeout=$data_query_timeout_candidate
+      break
     fi
   done
-  data_query_timeout=$(command -p -v timeout 2>/dev/null || true)
-  case "$data_query_timeout" in
-    /*) [ -x "$data_query_timeout" ] || data_query_linux_tools_ready=false ;;
-    *) data_query_linux_tools_ready=false ;;
-  esac
-  data_query_timeout_version="$check_tmp/data-query-timeout-version.txt"
-  if [ -n "$data_query_timeout" ] \
-    && "$data_query_timeout" --version > "$data_query_timeout_version" 2>&1 \
-    && sed -n '1p' "$data_query_timeout_version" \
-      | grep -Fq 'timeout (GNU coreutils)'; then
+  if [ -n "$data_query_timeout" ]; then
     pass "GNU timeout is available for bounded Linux data-query probes"
   else
     [ ! -s "$data_query_timeout_version" ] \
@@ -7009,6 +7500,14 @@ else
   fail "Git summary helper is not executable"
 fi
 
+if [ "$clipboard_capture_required" = true ]; then
+  for clipboard_native_asset in \
+    clipboard-history/store cliphist/config systemd/user/cliphist.service.d/override.conf
+  do
+    require_file "$config_root/$clipboard_native_asset" || static_lint_files_ready=false
+  done
+fi
+
 for static_lint_file in \
   "$terminal_stack_checker" \
   "$nvim_root/.stylua.toml" \
@@ -7029,7 +7528,13 @@ for static_lint_file in \
   "$nvim_root/lua/config/treesitter.lua" \
   "$nvim_root/lua/editing/buffers.lua" \
   "$nvim_root/lua/integrations/tmux_status.lua" \
+  "$nvim_root/lua/navigation/oil.lua" \
+  "$nvim_root/lua/clipboard/history.lua" \
   "$nvim_root/lua/navigation/pickers.lua" \
+  "$nvim_root/lua/navigation/location_pin_context.lua" \
+  "$nvim_root/lua/navigation/location_pin_store.lua" \
+  "$nvim_root/lua/navigation/location_pin_picker.lua" \
+  "$nvim_root/lua/navigation/location_pins.lua" \
   "$nvim_root/lua/navigation/root.lua" \
   "$nvim_root/lua/notebook/environment.lua" \
   "$nvim_root/lua/notebook/health.lua" \
@@ -7067,7 +7572,10 @@ for static_lint_file in \
   "$nvim_root/tests/foundation.lua" \
   "$nvim_root/tests/key_helper.lua" \
   "$nvim_root/tests/lsp.lua" \
+  "$nvim_root/tests/clipboard_history.lua" \
   "$nvim_root/tests/navigation.lua" \
+  "$nvim_root/tests/location_pin_picker.lua" \
+  "$nvim_root/tests/location_pins.lua" \
   "$nvim_root/tests/notebook_environment.lua" \
   "$nvim_root/tests/notebook_health.lua" \
   "$nvim_root/tests/notebook_plugins.lua" \
@@ -7080,6 +7588,7 @@ for static_lint_file in \
   "$nvim_root/tests/parquet_tool.lua" \
   "$nvim_root/tests/parquet_viewer.lua" \
   "$nvim_root/tests/fixtures/notebook/stored-output.ipynb" \
+  "$nvim_root/tests/oil_workspace.lua" \
   "$nvim_root/tests/oil_trash.lua" \
   "$nvim_root/tests/plugin_source.lua" \
   "$nvim_root/tests/platform.lua" \
@@ -7128,7 +7637,11 @@ fi
 if [ "$static_lint_files_ready" = true ]; then
   shell_syntax_ok=true
   : > "$check_tmp/shell-syntax.txt"
-  for static_shell_file in "$git_summary" "$terminal_stack_checker"; do
+  for static_shell_file in "$git_summary" "$terminal_stack_checker" "$config_root/clipboard-history/store"; do
+    if [ "$static_shell_file" = "$config_root/clipboard-history/store" ] \
+      && [ "$clipboard_capture_required" = false ]; then
+      continue
+    fi
     if ! sh -n "$static_shell_file" >> "$check_tmp/shell-syntax.txt" 2>&1; then
       shell_syntax_ok=false
     fi
@@ -7188,6 +7701,15 @@ fi
 if command -v nvim >/dev/null 2>&1 \
   && [ "$static_lint_files_ready" = true ]; then
   run_nvim_focused_test \
+    oil-workspace "$nvim_root/tests/oil_workspace.lua" \
+    'Responsive Oil workspace assertions: ok' || true
+  run_nvim_focused_test \
+    location-pin-picker "$nvim_root/tests/location_pin_picker.lua" \
+    'Line-pin picker assertions: ok (10201 preview cases)' || true
+  run_nvim_focused_test \
+    location-pins "$nvim_root/tests/location_pins.lua" \
+    'Line-pin editor assertions: ok' || true
+  run_nvim_focused_test \
     notebook-python "$nvim_root/tests/notebook_python.lua" \
     'notebook Python assertions: ok' || true
   run_nvim_focused_test \
@@ -7225,10 +7747,37 @@ if command -v nvim >/dev/null 2>&1 \
     'data query health assertions: ok' || true
 fi
 
+for pin_file in "$tmux_root/scripts/location-pins" "$tmux_root/scripts/location-pins.jq" "$nvim_root/LINE-PINS.md"; do
+  require_file "$pin_file" || static_lint_files_ready=false
+done
+for pin_test in location-pins workspace-state workspace-restore project-session; do
+  if env -u TMUX -u TMUX_PANE SHELL=/bin/sh \
+    sh "$tmux_root/tests/$pin_test.sh" >"$check_tmp/$pin_test.txt" 2>&1; then
+    pass "tmux $pin_test private-state regressions pass"
+  else
+    sed 's/^/      /' "$check_tmp/$pin_test.txt" >&2
+    fail "tmux $pin_test private-state regressions failed"
+  fi
+done
+
+if env -u TMUX -u TMUX_PANE SHELL=/bin/sh \
+  python3 "$tmux_root/tests/project-pairs.py" >"$check_tmp/project-pairs.txt" 2>&1; then
+  pass "tmux project shell/editor pair regressions pass"
+else
+  sed 's/^/      /' "$check_tmp/project-pairs.txt" >&2
+  fail "tmux project shell/editor pair regressions failed"
+fi
+
 if [ "$static_shellcheck_ready" = true ] \
   && [ "$static_lint_files_ready" = true ]; then
-  if shellcheck -s sh "$git_summary" "$terminal_stack_checker" \
+  if { [ "$clipboard_capture_required" = false ] \
+      || shellcheck -s sh "$config_root/clipboard-history/store"; } \
     > "$check_tmp/shellcheck.txt" 2>&1 \
+    && shellcheck -s sh "$git_summary" "$terminal_stack_checker" \
+    "$tmux_root/scripts/location-pins" "$tmux_root/scripts/workspace" \
+    "$tmux_root/tests/location-pins.sh" "$tmux_root/tests/workspace-state.sh" \
+    "$tmux_root/tests/workspace-restore.sh" "$tmux_root/tests/project-session.sh" "$HOME/.local/bin/t" \
+    >> "$check_tmp/shellcheck.txt" 2>&1 \
     && [ ! -s "$check_tmp/shellcheck.txt" ]; then
     pass "POSIX ShellCheck is exact and silent"
   else
@@ -7725,6 +8274,7 @@ if [ "$task1_git_fixtures_ready" = true ] \
   && begin_git_index_guard "$check_tmp/git-clean" "fast Git watchdog cleanup"; then
   : > "$task1_fake_git_log"
   : > "$task1_fake_sleep_pid_file"
+  fast_watchdog_start=$(date +%s)
   PATH="$task1_fake_sleep_bin:$task1_fake_bin:$PATH" \
     TASK1_FAKE_GIT_LOG="$task1_fake_git_log" \
     TASK1_FAKE_GIT_PATH="$check_tmp/git-clean" \
@@ -7736,6 +8286,7 @@ if [ "$task1_git_fixtures_ready" = true ] \
       "fast Git watchdog cleanup" \
       --path "$check_tmp/git-clean" --profile compact
   fast_watchdog_status=$?
+  fast_watchdog_elapsed=$(($(date +%s) - fast_watchdog_start))
   end_git_index_guard || true
   require_task1_fake_git_call "$check_tmp/git-clean" \
     "fast Git watchdog cleanup" || true
@@ -7747,6 +8298,13 @@ if [ "$task1_git_fixtures_ready" = true ] \
   else
     sed 's/^/      /' "$check_tmp/git-fast-watchdog.err" >&2
     fail "fast Git watchdog fixture exits successfully"
+  fi
+
+  # The fixture sleeps one second; allow for integer clock rounding.
+  if [ "$fast_watchdog_elapsed" -le 2 ]; then
+    pass "fast Git success cancels its watchdog without waiting for the deadline"
+  else
+    fail "fast Git success waited $fast_watchdog_elapsed seconds for watchdog cleanup"
   fi
 
   if read_exact_positive_pid_file "$task1_fake_sleep_pid_file"; then
@@ -8617,8 +9175,12 @@ else
 fi
 
 tmux_version=""
+tmux_url_enabled=false
 if command -v tmux >/dev/null 2>&1; then
   tmux_version=$(tmux -V | sed -nE 's/^tmux ([0-9]+\.[0-9]+).*/\1/p')
+  if [ -n "$tmux_version" ] && tmux_url_version_is_eligible "$tmux_version"; then
+    tmux_url_enabled=true
+  fi
   if [ -n "$tmux_version" ] && version_at_least "$tmux_version" "3.2"; then
     pass "tmux version $tmux_version"
   else
@@ -9167,6 +9729,91 @@ if [ -r "$tmux_entry" ] \
   else
     fail "tmux modules contain a condition or command outside their exact per-file manifests"
   fi
+
+  if tmux_source_commands_are_allowed keys "$tmux_keys"; then
+    pass "tmux keys source accepts the exact five-line Ctrl-click guard"
+  else
+    fail "tmux keys source rejects the exact five-line Ctrl-click guard"
+  fi
+
+  tmux_url_literal_guard=$(awk '
+    /^%if / { guard = $0; count++ }
+    END { if (count != 1) exit 1; print guard }
+  ' "$tmux_keys") || tmux_url_literal_guard=''
+  if [ "$tmux_url_literal_guard" = "$tmux_url_source_guard" ]; then
+    pass "tmux URL version matrix reads the exact source guard"
+  else
+    fail "tmux URL version matrix could not read the exact source guard"
+  fi
+  tmux_url_guard_shape_valid=false
+  case "$tmux_url_literal_guard" in
+    '%if "#{m/r:'*',#{version}}"')
+      tmux_url_guard_regex=${tmux_url_literal_guard#'%if "#{m/r:'}
+      tmux_url_guard_regex=${tmux_url_guard_regex%',#{version}}"'}
+      if [ -n "$tmux_url_guard_regex" ]; then
+        tmux_url_guard_shape_valid=true
+      fi
+      ;;
+  esac
+  if [ "$tmux_url_guard_shape_valid" = true ]; then
+    pass "tmux URL version matrix extracts the literal source regex"
+  else
+    fail "tmux URL version matrix could not extract the literal source regex"
+  fi
+  for url_test_version in 3.6 3.7 3.7c 3.10 4.0 10.2; do
+    url_expected_eligibility=true
+    [ "$url_test_version" = "3.6" ] && url_expected_eligibility=false
+    url_actual_eligibility=false
+    if [ "$tmux_url_guard_shape_valid" = true ] \
+      && printf '%s\n' "$url_test_version" \
+        | LC_ALL=C grep -Eq "$tmux_url_guard_regex"; then
+      url_actual_eligibility=true
+    fi
+    if [ "$url_actual_eligibility" = "$url_expected_eligibility" ]; then
+      pass "tmux literal URL source guard version $url_test_version evaluates $url_expected_eligibility"
+    else
+      fail "tmux literal URL source guard version $url_test_version evaluated $url_actual_eligibility"
+    fi
+  done
+
+  for url_source_case in \
+    changed-version-guard missing-endif extra-endif nested-guard \
+    duplicate-block third-guarded-binding URL-binding-outside-guard \
+    brace-wrapped-block continued-line-block
+  do
+    case "$url_source_case" in
+      changed-version-guard|extra-endif) url_source_diagnostic='unapproved tmux URL source directive' ;;
+      missing-endif|nested-guard|third-guarded-binding) url_source_diagnostic='noncanonical tmux URL source block' ;;
+      duplicate-block) url_source_diagnostic='tmux URL source block count mismatch' ;;
+      URL-binding-outside-guard) url_source_diagnostic='tmux URL binding outside exact source guard' ;;
+      brace-wrapped-block|continued-line-block) url_source_diagnostic='tmux URL source block is not top-level' ;;
+    esac
+    url_source_fixture="$check_tmp/tmux-url-source-$url_source_case.conf"
+    url_source_audit="$check_tmp/tmux-url-source-$url_source_case-audit.txt"
+    if tmux_url_source_fixture "$url_source_case" "$url_source_fixture" \
+      && ! cmp -s "$tmux_keys" "$url_source_fixture" \
+      && ! tmux_source_commands_are_allowed keys "$url_source_fixture" \
+        > "$url_source_audit" \
+      && grep -Fq "$url_source_diagnostic" "$url_source_audit"; then
+      pass "tmux URL source fixture rejects $url_source_case in the source audit"
+    else
+      sed 's/^/      /' "$url_source_audit" >&2
+      fail "tmux URL source fixture did not reject $url_source_case in the source audit"
+    fi
+  done
+
+  for url_source_case in quoted-brace-prefix escaped-brace-prefix; do
+    url_source_fixture="$check_tmp/tmux-url-source-$url_source_case.conf"
+    url_source_audit="$check_tmp/tmux-url-source-$url_source_case-audit.txt"
+    if tmux_url_source_fixture "$url_source_case" "$url_source_fixture" \
+      && tmux_source_commands_are_allowed keys "$url_source_fixture" \
+        > "$url_source_audit"; then
+      pass "tmux URL source fixture keeps $url_source_case at top level"
+    else
+      sed 's/^/      /' "$url_source_audit" >&2
+      fail "tmux URL source fixture misclassified $url_source_case"
+    fi
+  done
 
   if tmux_source_commands_are_allowed options "$tmux_options"; then
     pass "tmux options exact condition manifest accepts its canonical quoted condition"
@@ -10182,6 +10829,8 @@ TASK6_APPLICATION_CASES
 
   tmux_reload_command="source-file $tmux_root/tmux.conf \\; display-message \"Reloaded tmux foundation\""
   serialized_backslash_key="M-\\\\"
+  tmux_url_down_command='send-keys -M'
+  tmux_url_up_command='send-keys -M \; run-shell -b -t = "\~/.config/tmux/scripts/open-url --pane #{mouse_pane} --x #{mouse_x} --y #{mouse_y} --hyperlink #{?mouse_hyperlink,1,0} || :"'
   tmux_swap_left_command='if-shell -F "#{window_zoomed_flag}" "resize-pane -Z ; if-shell -F \"#{pane_at_left}\" \"resize-pane -Z ; display-message \\\"No pane left\\\"\" \"run-shell -C \\\"swap-pane -Z -s '\''#{pane_id}'\'' -t '\''{left-of}'\'' ; select-pane -t '\''#{pane_id}'\'' ; resize-pane -Z -t '\''#{pane_id}'\''\\\"\"" "if-shell -F \"#{pane_at_left}\" \"display-message \\\"No pane left\\\"\" \"run-shell -C \\\"swap-pane -Z -s '\''#{pane_id}'\'' -t '\''{left-of}'\'' ; select-pane -t '\''#{pane_id}'\''\\\"\""'
   tmux_swap_down_command='if-shell -F "#{window_zoomed_flag}" "resize-pane -Z ; if-shell -F \"#{pane_at_bottom}\" \"resize-pane -Z ; display-message \\\"No pane down\\\"\" \"run-shell -C \\\"swap-pane -Z -s '\''#{pane_id}'\'' -t '\''{down-of}'\'' ; select-pane -t '\''#{pane_id}'\'' ; resize-pane -Z -t '\''#{pane_id}'\''\\\"\"" "if-shell -F \"#{pane_at_bottom}\" \"display-message \\\"No pane down\\\"\" \"run-shell -C \\\"swap-pane -Z -s '\''#{pane_id}'\'' -t '\''{down-of}'\'' ; select-pane -t '\''#{pane_id}'\''\\\"\""'
   tmux_swap_up_command='if-shell -F "#{window_zoomed_flag}" "resize-pane -Z ; if-shell -F \"#{pane_at_top}\" \"resize-pane -Z ; display-message \\\"No pane up\\\"\" \"run-shell -C \\\"swap-pane -Z -s '\''#{pane_id}'\'' -t '\''{up-of}'\'' ; select-pane -t '\''#{pane_id}'\'' ; resize-pane -Z -t '\''#{pane_id}'\''\\\"\"" "if-shell -F \"#{pane_at_top}\" \"display-message \\\"No pane up\\\"\" \"run-shell -C \\\"swap-pane -Z -s '\''#{pane_id}'\'' -t '\''{up-of}'\'' ; select-pane -t '\''#{pane_id}'\''\\\"\""'
@@ -10190,6 +10839,20 @@ TASK6_APPLICATION_CASES
   tmux_move_without_horizontal_command='run-shell -C "choose-tree -Zw \"run-shell -C \\\"move-pane -s '\''##{a:37}#{s/%//:pane_id}'\'' -t '\''%%'\''\\\"\""'
   tmux_move_unsafe_frozen_source_command='run-shell -C "choose-tree -Zw \"move-pane -h -s '\''#{pane_id}'\'' -t '\''%%'\''\""'
   tmux_swap_unzoomed_only_left_command='if-shell -F "#{pane_at_left}" "display-message \"No pane left\"" "run-shell -C \"swap-pane -Z -s '\''#{pane_id}'\'' -t '\''{left-of}'\'' ; select-pane -t '\''#{pane_id}'\''\""'
+  if [ "$tmux_url_enabled" = true ]; then
+    require_tmux_binding "$check_tmp/tmux-root-keys.txt" root C-MouseDown1Pane \
+      "$tmux_url_down_command" \
+      "tmux eligible Ctrl-down forwards the mouse event exactly" || true
+    require_tmux_binding "$check_tmp/tmux-root-keys.txt" root C-MouseUp1Pane \
+      "$tmux_url_up_command" \
+      "tmux eligible Ctrl-up forwards and opens through the exact URL route" || true
+  elif tmux_ctrl_url_matches_pristine \
+      "$check_tmp/tmux-pristine-all-keys.txt" "$check_tmp/tmux-root-keys.txt"; then
+    pass "tmux ineligible Ctrl-down and Ctrl-up retain their pristine bindings"
+  else
+    fail "tmux ineligible Ctrl-down or Ctrl-up changed from pristine"
+  fi
+
   require_tmux_binding "$check_tmp/tmux-prefix-keys.txt" prefix M-Space 'send-prefix' "tmux prefix sends Meta-Space through" || true
   require_tmux_binding "$check_tmp/tmux-prefix-keys.txt" prefix '?' 'list-keys' "tmux prefix+? opens help" || true
   require_tmux_binding "$check_tmp/tmux-prefix-keys.txt" prefix R "$tmux_reload_command" "tmux prefix+Shift-r reloads exactly the foundation" || true
@@ -10239,7 +10902,9 @@ TASK6_APPLICATION_CASES
   require_tmux_binding "$check_tmp/tmux-root-keys.txt" root M-j 'select-pane -D' "tmux Meta-j always focuses the lower tmux pane" || true
   require_tmux_binding "$check_tmp/tmux-root-keys.txt" root M-k 'select-pane -U' "tmux Meta-k always focuses the upper tmux pane" || true
   require_tmux_binding "$check_tmp/tmux-root-keys.txt" root M-l 'select-pane -R' "tmux Meta-l always focuses the right tmux pane" || true
-  require_tmux_binding "$check_tmp/tmux-root-keys.txt" root M-q 'kill-pane' "tmux Meta-q closes the pane immediately" || true
+  require_tmux_binding "$check_tmp/tmux-root-keys.txt" root M-q \
+    'confirm-before -p "Kill pane #P? (y/n)" kill-pane' \
+    "tmux Meta-q confirms before closing the pane" || true
   require_tmux_binding "$check_tmp/tmux-root-keys.txt" root M-f 'resize-pane -Z' "tmux Meta-f toggles pane zoom" || true
 
   for key in M-H M-J M-K M-L; do
@@ -10346,16 +11011,58 @@ TASK6_APPLICATION_CASES
     > "$check_tmp/tmux-effective-inherited-binding.txt"
   if [ "$(tmux_binding_count "$check_tmp/tmux-pristine-all-keys.txt" prefix ':')" -eq 1 ] \
     && cmp -s "$check_tmp/tmux-pristine-inherited-binding.txt" "$check_tmp/tmux-effective-inherited-binding.txt" \
-    && tmux_pristine_binding_delta_is_exact \
-      "$check_tmp/tmux-pristine-all-keys.txt" \
-      "$check_tmp/tmux-pristine-all-keys.txt" \
-      "$tmux_reload_command" \
-      "$serialized_backslash_key" \
-      > "$check_tmp/tmux-pristine-self-delta.txt"; then
+    && (
+      # shellcheck disable=SC2030  # Pristine mode is confined to this subshell.
+      tmux_url_enabled=false
+      tmux_pristine_binding_delta_is_exact \
+        "$check_tmp/tmux-pristine-all-keys.txt" \
+        "$check_tmp/tmux-pristine-all-keys.txt" \
+        "$tmux_reload_command" \
+        "$serialized_backslash_key"
+    ) > "$check_tmp/tmux-pristine-self-delta.txt"; then
     pass "tmux symmetric pristine delta accepts harmless inherited built-ins"
   else
     sed 's/^/      /' "$check_tmp/tmux-pristine-self-delta.txt" >&2
     fail "tmux symmetric pristine delta rejects a harmless inherited built-in"
+  fi
+
+  # shellcheck disable=SC2031  # The pristine-self subshell cannot change this value.
+  if [ "$tmux_url_enabled" = true ]; then
+    for url_identity_case in unexpected-Ctrl-drag-end missing-down missing-up; do
+      url_identity_fixture="$check_tmp/tmux-url-identity-$url_identity_case.txt"
+      url_identity_audit="$check_tmp/tmux-url-identity-$url_identity_case-audit.txt"
+      case "$url_identity_case" in
+        unexpected-Ctrl-drag-end)
+          cp "$check_tmp/tmux-all-keys.txt" "$url_identity_fixture"
+          printf '%s\n' 'bind-key -T root C-MouseDragEnd1Pane send-keys -M' \
+            >> "$url_identity_fixture"
+          url_identity_diagnostic='unowned tmux binding delta: table=root key=C-MouseDragEnd1Pane'
+          ;;
+        missing-down|missing-up)
+          url_missing_key=C-MouseDown1Pane
+          [ "$url_identity_case" = "missing-up" ] && url_missing_key=C-MouseUp1Pane
+          awk -v key="$url_missing_key" \
+            '$1 == "bind-key" && $3 == "root" && $4 == key { next } { print }' \
+            "$check_tmp/tmux-all-keys.txt" > "$url_identity_fixture"
+          if [ "$url_identity_case" = "missing-down" ]; then
+            url_identity_diagnostic='missing or noncanonical tmux Ctrl-down identity'
+          else
+            url_identity_diagnostic='missing or noncanonical tmux Ctrl-up identity'
+          fi
+          ;;
+      esac
+      if ! cmp -s "$check_tmp/tmux-all-keys.txt" "$url_identity_fixture" \
+        && ! tmux_pristine_binding_delta_is_exact \
+          "$check_tmp/tmux-pristine-all-keys.txt" "$url_identity_fixture" \
+          "$tmux_reload_command" "$serialized_backslash_key" \
+          > "$url_identity_audit" \
+        && grep -Fq "$url_identity_diagnostic" "$url_identity_audit"; then
+        pass "tmux Ctrl identity fixture rejects $url_identity_case in the delta audit"
+      else
+        sed 's/^/      /' "$url_identity_audit" >&2
+        fail "tmux Ctrl identity fixture did not reject $url_identity_case in the delta audit"
+      fi
+    done
   fi
 
   if tmux_pristine_binding_delta_is_exact \
@@ -10375,6 +11082,52 @@ TASK6_APPLICATION_CASES
   else
     fail "an effective tmux copy-pipe or run-shell route contains an unapproved explicit payload"
   fi
+
+  tmux_url_payload_fixture="$check_tmp/tmux-url-payload-canonical.txt"
+  printf '%s\n' "bind-key -T root C-MouseUp1Pane $tmux_url_up_command" \
+    > "$tmux_url_payload_fixture"
+  if tmux_binding_matches_exactly "$tmux_url_payload_fixture" root C-MouseUp1Pane \
+      "$tmux_url_up_command" \
+    && tmux_copy_pipe_and_run_shell_payloads_are_safe "$tmux_url_payload_fixture"; then
+    pass "tmux payload audit accepts only the exact root Ctrl-up URL route"
+  else
+    fail "tmux payload audit rejects the exact root Ctrl-up URL route"
+  fi
+
+  for url_payload_case in \
+    exact-up-on-root-F11 changed-helper-path raw-mouse-hyperlink \
+    mouse-word extra-shell-command
+  do
+    url_payload_file="$check_tmp/tmux-url-payload-$url_payload_case.txt"
+    case "$url_payload_case" in
+      exact-up-on-root-F11)
+        task6_replace_all C-MouseUp1Pane F11 \
+          < "$tmux_url_payload_fixture" > "$url_payload_file"
+        ;;
+      changed-helper-path)
+        task6_replace_all 'tmux/scripts/open-url' 'tmux/scripts/not-open-url' \
+          < "$tmux_url_payload_fixture" > "$url_payload_file"
+        ;;
+      raw-mouse-hyperlink)
+        task6_replace_all '#{?mouse_hyperlink,1,0}' '#{mouse_hyperlink}' \
+          < "$tmux_url_payload_fixture" > "$url_payload_file"
+        ;;
+      mouse-word)
+        task6_replace_all '#{?mouse_hyperlink,1,0}' '#{mouse_word}' \
+          < "$tmux_url_payload_fixture" > "$url_payload_file"
+        ;;
+      extra-shell-command)
+        task6_replace_all ' || :"' ' || :; true"' \
+          < "$tmux_url_payload_fixture" > "$url_payload_file"
+        ;;
+    esac
+    if ! cmp -s "$tmux_url_payload_fixture" "$url_payload_file" \
+      && ! tmux_copy_pipe_and_run_shell_payloads_are_safe "$url_payload_file"; then
+      pass "tmux URL payload fixture rejects $url_payload_case in the payload audit"
+    else
+      fail "tmux URL payload fixture did not reject $url_payload_case in the payload audit"
+    fi
+  done
 
   tmux_persistence_payload_fixture="$check_tmp/tmux-persistence-payload-canonical.txt"
   tmux_describe_binding "$check_tmp/tmux-all-keys.txt" prefix s \
@@ -10884,6 +11637,30 @@ TASK6_APPLICATION_CASES
     fail "tmux exact-command audit accepted or could not create the kill-window mutation"
   fi
 
+  tmux_m_q_confirmed_command='confirm-before -p "Kill pane #P? (y/n)" kill-pane'
+  if tmux -S "$check_socket" bind-key -T root M-q kill-pane \
+    && tmux -S "$check_socket" list-keys -T root \
+      > "$check_tmp/tmux-m-q-immediate-mutation.txt" 2>&1 \
+    && tmux_binding_matches_exactly \
+      "$check_tmp/tmux-m-q-immediate-mutation.txt" root M-q 'kill-pane' \
+    && ! tmux_binding_matches_exactly \
+      "$check_tmp/tmux-m-q-immediate-mutation.txt" root M-q "$tmux_m_q_confirmed_command"; then
+    pass "tmux exact-command audit rejects immediate M-q pane killing"
+  else
+    fail "tmux exact-command audit accepted or could not create immediate M-q pane killing"
+  fi
+
+  if tmux -S "$check_socket" bind-key -T root M-q \
+      confirm-before -p 'Kill pane #P? (y/n)' kill-pane \
+    && tmux -S "$check_socket" list-keys -T root \
+      > "$check_tmp/tmux-m-q-confirmed-restoration.txt" 2>&1 \
+    && tmux_binding_matches_exactly \
+      "$check_tmp/tmux-m-q-confirmed-restoration.txt" root M-q "$tmux_m_q_confirmed_command"; then
+    pass "tmux private M-q mutation restores the confirmed command"
+  else
+    fail "tmux private M-q mutation did not restore the confirmed command"
+  fi
+
   if tmux -S "$check_socket" bind-key -T root M-f run-shell 'resize-pane -Z' \
     && tmux -S "$check_socket" list-keys -T root > "$check_tmp/tmux-zoom-mutation.txt" 2>&1 \
     && tmux_binding_matches_exactly "$check_tmp/tmux-zoom-mutation.txt" root M-f 'run-shell "resize-pane -Z"' \
@@ -11284,6 +12061,40 @@ TASK6_APPLICATION_CASES
     fail "tmux non-vi copy-mode mutation did not restore to the complete copy-pipe/run-shell-safe baseline"
   fi
 
+  # shellcheck disable=SC2031  # The pristine-self subshell cannot change this value.
+  if [ "$tmux_url_enabled" = true ]; then
+    tmux_url_reload_mutated=false
+    # shellcheck disable=SC2088  # The literal tilde is a private tmux binding fixture.
+    if tmux -S "$check_socket" bind-key -T root C-MouseUp1Pane \
+        send-keys -M '\;' run-shell -b -t = \
+        '~/.config/tmux/scripts/not-open-url || :' \
+      && tmux -S "$check_socket" list-keys > "$check_tmp/tmux-url-reload-mutated-all-keys.txt" 2>&1 \
+      && ! cmp -s "$check_tmp/tmux-before-reload-all-keys.txt" \
+        "$check_tmp/tmux-url-reload-mutated-all-keys.txt" \
+      && ! tmux_binding_matches_exactly \
+        "$check_tmp/tmux-url-reload-mutated-all-keys.txt" root C-MouseUp1Pane \
+        "$tmux_url_up_command"; then
+      tmux_url_reload_mutated=true
+      pass "tmux URL reload fixture changes the route before reload"
+    else
+      fail "tmux URL reload fixture could not change the route before reload"
+    fi
+    if [ "$tmux_url_reload_mutated" = true ] \
+      && tmux -S "$check_socket" source-file "$tmux_root/tmux.conf" \
+        > "$check_tmp/tmux-url-reload-restore.txt" 2>&1 \
+      && tmux -S "$check_socket" list-keys > "$check_tmp/tmux-url-reload-restored-all-keys.txt" 2>&1 \
+      && cmp -s "$check_tmp/tmux-before-reload-all-keys.txt" \
+        "$check_tmp/tmux-url-reload-restored-all-keys.txt" \
+      && tmux_binding_matches_exactly \
+        "$check_tmp/tmux-url-reload-restored-all-keys.txt" root C-MouseUp1Pane \
+        "$tmux_url_up_command"; then
+      pass "tmux URL reload restores the exact approved full key snapshot"
+    else
+      sed 's/^/      /' "$check_tmp/tmux-url-reload-restore.txt" >&2
+      fail "tmux URL reload did not restore the exact approved full key snapshot"
+    fi
+  fi
+
   printf '%s\n' 'bind-key -n M-f run-shell "resize-pane -Z"' > "$check_tmp/tmux-reload-regression.conf"
   if tmux -S "$check_socket" source-file "$check_tmp/tmux-reload-regression.conf" > "$check_tmp/tmux-reload-regression-source.txt" 2>&1 \
     && tmux -S "$check_socket" list-keys -T root > "$check_tmp/tmux-reload-regression-root.txt" 2>&1 \
@@ -11323,6 +12134,22 @@ TASK6_APPLICATION_CASES
     pass "captured the complete tmux state after the idempotence reload"
   else
     fail "could not capture the complete tmux state after the idempotence reload"
+  fi
+
+  # shellcheck disable=SC2031  # The pristine-self subshell cannot change this value.
+  if [ "$tmux_url_enabled" = true ]; then
+    require_tmux_binding "$check_tmp/tmux-after-reload-root-keys.txt" root C-MouseDown1Pane \
+      "$tmux_url_down_command" \
+      "tmux reload keeps exact eligible Ctrl-down forwarding" || true
+    require_tmux_binding "$check_tmp/tmux-after-reload-root-keys.txt" root C-MouseUp1Pane \
+      "$tmux_url_up_command" \
+      "tmux reload keeps the exact eligible Ctrl-up URL route" || true
+  elif tmux_ctrl_url_matches_pristine \
+      "$check_tmp/tmux-pristine-all-keys.txt" \
+      "$check_tmp/tmux-after-reload-root-keys.txt"; then
+    pass "tmux reload keeps ineligible Ctrl identities pristine"
+  else
+    fail "tmux reload changed an ineligible Ctrl identity from pristine"
   fi
 
   for snapshot_component in marker platform prefix prefix2 copy-command features feature-slot server-options session-options window-options prefix-keys root-keys resize-keys copy-keys all-keys; do
@@ -11527,7 +12354,13 @@ for nvim_file in \
   "$nvim_root/lua/parquet/tool.lua" \
   "$nvim_root/lua/parquet/viewer.lua" \
   "$nvim_root/lua/navigation/root.lua" \
+  "$nvim_root/lua/navigation/oil.lua" \
+  "$nvim_root/lua/clipboard/history.lua" \
   "$nvim_root/lua/navigation/pickers.lua" \
+  "$nvim_root/lua/navigation/location_pin_context.lua" \
+  "$nvim_root/lua/navigation/location_pin_store.lua" \
+  "$nvim_root/lua/navigation/location_pin_picker.lua" \
+  "$nvim_root/lua/navigation/location_pins.lua" \
   "$nvim_root/lua/plugins/editing.lua" \
   "$nvim_root/lua/plugins/key-helper.lua" \
   "$nvim_root/lua/plugins/navigation.lua" \
@@ -11555,7 +12388,10 @@ for nvim_file in \
   "$nvim_root/tests/foundation.lua" \
   "$nvim_root/tests/key_helper.lua" \
   "$nvim_root/tests/lsp.lua" \
+  "$nvim_root/tests/clipboard_history.lua" \
   "$nvim_root/tests/navigation.lua" \
+  "$nvim_root/tests/location_pin_picker.lua" \
+  "$nvim_root/tests/location_pins.lua" \
   "$nvim_root/tests/notebook_environment.lua" \
   "$nvim_root/tests/notebook_health.lua" \
   "$nvim_root/tests/notebook_plugins.lua" \
@@ -11568,6 +12404,7 @@ for nvim_file in \
   "$nvim_root/tests/parquet_tool.lua" \
   "$nvim_root/tests/parquet_viewer.lua" \
   "$nvim_root/tests/fixtures/notebook/stored-output.ipynb" \
+  "$nvim_root/tests/oil_workspace.lua" \
   "$nvim_root/tests/oil_trash.lua" \
   "$nvim_root/tests/plugin_source.lua" \
   "$nvim_root/tests/pyright.lua" \
@@ -11942,16 +12779,16 @@ if [ "$nvim_config_ready" = true ] && [ "$plugins_trusted" = true ] && command -
     -c 'lua for _, name in ipairs({ "platform", "foundation", "key_helper" }) do dofile(vim.fs.joinpath(vim.env.DOTFILES_NVIM_ROOT, "tests", name .. ".lua")) end' \
     -c "luafile $nvim_root/tests/completion.lua" \
     -c "luafile $nvim_root/tests/editing.lua" \
-    -c "luafile $nvim_root/tests/navigation.lua" \
+    -c 'lua for _, name in ipairs({ "navigation", "oil_workspace", "location_pin_picker" }) do dofile(vim.fs.joinpath(vim.env.DOTFILES_NVIM_ROOT, "tests", name .. ".lua")) end' \
     -c "luafile $nvim_root/tests/statusline.lua" \
     -c "luafile $nvim_root/tests/startup.lua" \
     -c 'lua for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "pyright", "taplo", "yamlls" }) do assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned during configured foundation assertions") end' \
-    -c qa > "$check_tmp/nvim-tests.txt" 2>&1 \
+    -c 'qa!' > "$check_tmp/nvim-tests.txt" 2>&1 \
     && ! nvim_log_has_error "$check_tmp/nvim-tests.txt" \
     && data_query_processes_absent \
       "$XDG_CACHE_HOME/nvim/dotfiles-data-query" \
       "$check_tmp/nvim-passive-processes.txt"; then
-    pass "Neovim platform, native Bash, JSON, Lua, Python, TOML, and YAML LSP startup and completion, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, MiniPairs, MiniStarter, MiniSurround, WhichKey, smart-splits, statusline, and startup assertions pass"
+    pass "Neovim platform, native Bash, JSON, Lua, Python, TOML, and YAML LSP startup and completion, clipboard history mappings and commands, navigation, TokyoNight, Treesitter, parser, FzfLua, Oil, MiniIcons, MiniPairs, MiniStarter, MiniSurround, WhichKey, smart-splits, statusline, and startup assertions pass"
   else
     sed 's/^/      /' "$check_tmp/nvim-tests.txt" >&2
     fail "Neovim headless foundation assertions failed"
@@ -11981,6 +12818,37 @@ if [ "$nvim_config_ready" = true ] && [ "$plugins_trusted" = true ] && command -
       || sed 's/^/      /' "$nvim_startup_output" >&2
     fail "configured MiniStarter startup matrix failed"
   fi
+
+  oil_workspace_root="$check_tmp/oil-workspace"
+  oil_workspace_output="$check_tmp/oil-workspace.txt"
+  if [ ! -e "$oil_workspace_root" ] \
+    && [ ! -L "$oil_workspace_root" ] \
+    && mkdir -p "$oil_workspace_root/home" "$oil_workspace_root/config" \
+      "$oil_workspace_root/data" "$oil_workspace_root/state" \
+      "$oil_workspace_root/cache" "$oil_workspace_root/runtime" \
+      "$oil_workspace_root/tmp" "$oil_workspace_root/fixture" \
+    && chmod 700 "$oil_workspace_root/runtime" \
+    && env -u TMUX -u TMUX_PANE -u NVIM_APPNAME \
+      HOME="$oil_workspace_root/home" TMPDIR="$oil_workspace_root/tmp" \
+      XDG_CONFIG_HOME="$oil_workspace_root/config" XDG_DATA_HOME="$oil_workspace_root/data" \
+      XDG_STATE_HOME="$oil_workspace_root/state" XDG_CACHE_HOME="$oil_workspace_root/cache" \
+      XDG_RUNTIME_DIR="$oil_workspace_root/runtime" NVIM_LOG_FILE="$oil_workspace_root/nvim.log" \
+      DOTFILES_OIL_WORKSPACE_LIVE=1 \
+      DOTFILES_OIL_WORKSPACE_TEST_ROOT="$oil_workspace_root/fixture" \
+      DOTFILES_NVIM_ROOT="$nvim_root" DOTFILES_MINI_ICONS_ROOT="$mini_icons_dir" \
+      DOTFILES_OIL_ROOT="$oil_dir" \
+      nvim --clean --headless -u NONE -i NONE \
+      -c 'lua for _, path in ipairs({ vim.env.DOTFILES_NVIM_ROOT, vim.env.DOTFILES_MINI_ICONS_ROOT, vim.env.DOTFILES_OIL_ROOT }) do vim.opt.runtimepath:prepend(path) end' \
+      -l "$nvim_root/tests/oil_workspace.lua" > "$oil_workspace_output" 2>&1 \
+    && ! nvim_log_has_error "$oil_workspace_output" \
+    && [ ! -s "$oil_workspace_root/nvim.log" ] \
+    && grep -Fqx 'Responsive Oil workspace assertions: ok' "$oil_workspace_output"; then
+    pass "responsive Oil workspace preserves native browsing and preview"
+  else
+    [ ! -f "$oil_workspace_output" ] || sed 's/^/      /' "$oil_workspace_output" >&2
+    fail "responsive Oil workspace assertions failed"
+  fi
+
 
   for DOTFILES_OIL_TEST_MODE in failure success; do
     oil_test_output="$check_tmp/oil-trash-$DOTFILES_OIL_TEST_MODE.txt"
@@ -12061,7 +12929,7 @@ if [ "$nvim_config_ready" = true ] \
     && (umask 077 && mkdir -p \
       "$notebook_integration_root" \
       "$check_tmp/nvim-notebook-home" \
-      "$check_tmp/jupyter-runtime") \
+      "$JUPYTER_RUNTIME_DIR") \
     && printf '%s\n' '# Ordinary Markdown' > "$notebook_ordinary" \
     && cp "$notebook_fixture_source" "$notebook_nonlive" \
     && cp "$notebook_fixture_source" "$notebook_live" \
@@ -12076,7 +12944,7 @@ if [ "$nvim_config_ready" = true ] \
       XDG_STATE_HOME="$XDG_STATE_HOME" \
       XDG_CACHE_HOME="$XDG_CACHE_HOME" \
       XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-      JUPYTER_RUNTIME_DIR="$check_tmp/jupyter-runtime" \
+      JUPYTER_RUNTIME_DIR="$JUPYTER_RUNTIME_DIR" \
       NVIM_LOG_FILE="$notebook_scope_log" \
       PYTHONDONTWRITEBYTECODE=1 \
       TERM_PROGRAM=ghostty \
@@ -14536,6 +15404,8 @@ if [ "${1:-}" = "--interactive" ]; then
     run_interactive_matrix
   fi
 fi
+
+check_clipboard_history
 
 printf '\nSummary: %s failure(s), %s warning(s)\n' "$failures" "$warnings"
 

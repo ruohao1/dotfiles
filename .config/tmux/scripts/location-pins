@@ -1,0 +1,188 @@
+#!/bin/sh
+# Pins are independent session-local options: unrelated concurrent updates commute.
+set -eu
+umask 077
+LC_ALL=C
+export LC_ALL
+program='location-pins'
+die() { printf '%s: %s\n' "$program" "$1" >&2; exit 1; }
+usage() {
+  printf '%s\n' \
+    'usage: location-pins validate < state.json' \
+    '       location-pins list|add|delete|clear|import --socket PATH --session ID --server-pid PID' \
+    'add: {path,line,col}; delete: {id}; import: {version:1,pins:[...]}, on stdin'
+}
+[ "$#" -gt 0 ] || { usage >&2; exit 2; }
+action=$1
+shift
+case $action in
+  -h|--help) usage; exit 0 ;;
+  validate|list|add|delete|clear|import) ;;
+  *) usage >&2; exit 2 ;;
+esac
+socket=
+session=
+server_pid=
+while [ "$#" -gt 0 ]; do
+  [ "$#" -ge 2 ] || die 'a context argument is missing its value'
+  case $1 in
+    --socket) [ -z "$socket" ] || die 'duplicate socket'; socket=$2 ;;
+    --session) [ -z "$session" ] || die 'duplicate session'; session=$2 ;;
+    --server-pid) [ -z "$server_pid" ] || die 'duplicate server PID'; server_pid=$2 ;;
+    *) die 'unknown argument' ;;
+  esac
+  shift 2
+done
+if [ "$action" = validate ]; then
+  [ -z "$socket$session$server_pid" ] || die 'validate does not accept a tmux context'
+else
+  case $socket in /*) ;; *) die 'an explicit absolute tmux socket is required' ;; esac
+  case $session in \$*) session_number=${session#\$} ;; *) die 'an exact tmux session ID is required' ;; esac
+  case $session_number in ''|*[!0-9]*) die 'an exact tmux session ID is required' ;; esac
+  case $server_pid in ''|*[!0-9]*) die 'the tmux server PID is required' ;; esac
+fi
+for dependency in jq iconv; do
+  command -v "$dependency" >/dev/null 2>&1 || die "$dependency is required"
+done
+if command -v sha256sum >/dev/null 2>&1; then
+  hash_tool=sha256sum
+elif command -v shasum >/dev/null 2>&1; then
+  hash_tool=shasum
+else
+  die 'sha256sum or shasum is required'
+fi
+script_dir=$(CDPATH='' cd -P "$(dirname "$0")" && pwd -P)
+root=$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-location-pins.XXXXXX") || die 'cannot create private scratch directory'
+cleanup() {
+  case $root in "${TMPDIR:-/tmp}"/dotfiles-location-pins.*) rm -rf "$root" ;; esac
+}
+trap cleanup 0
+trap 'exit 130' INT
+trap 'exit 143' HUP TERM
+tmux_run() { command tmux -u -S "$socket" "$@"; }
+check_context() {
+  identity=$(tmux_run display-message -p -t "$session:" '#{pid} #{session_id}') \
+    || die 'tmux session is unavailable'
+  [ "$identity" = "$server_pid $session" ] || die 'tmux context changed; reopen the line-pin action'
+}
+digest() {
+  if [ "$hash_tool" = sha256sum ]; then
+    hash_output=$(sha256sum) || die 'cannot hash pin'
+  else
+    hash_output=$(shasum -a 256) || die 'cannot hash pin'
+  fi
+  printf '%s\n' "${hash_output%% *}"
+}
+record_id() {
+  # -j omits the trailing newline; this defines the canonical identity bytes.
+  printf '%s' "$1" | jq -cj '[.path,(.line | floor + 0),(.col | floor + 0)]' | digest
+}
+validate_state() {
+  # jq replaces invalid UTF-8, so reject it before JSON parsing can alter paths.
+  iconv -f UTF-8 -t UTF-8 "$1" >"$root/utf8" 2>/dev/null || die 'pin data is not valid UTF-8'
+  jq -L "$script_dir" -ces '
+    include "location-pins";
+    if length == 1 and (.[0] | line_pin_state)
+    then .[0] | .version = 1 | .pins |= (map(canonical_line_pin) | sort_by(.path,.line,.col,.id))
+    else error("invalid line-pin state") end
+  ' "$root/utf8" >"$2" || die 'invalid line-pin state'
+  jq -c '.pins[]' "$2" >"$root/verify-records"
+  while IFS= read -r verify_record; do
+    expected_id=$(record_id "$verify_record")
+    actual_id=$(printf '%s' "$verify_record" | jq -r '.id')
+    [ "$actual_id" = "$expected_id" ] || die 'pin identity does not match its location'
+  done <"$root/verify-records"
+}
+list_state() {
+  check_context
+  tmux_run show-options -q -t "$session" >"$root/options" || die 'cannot read session options'
+  : >"$root/records"
+  while IFS= read -r option_line; do
+    case $option_line in
+      @dotfiles_line_pin_*)
+        option_name=${option_line%% *}
+        option_id=${option_name#@dotfiles_line_pin_}
+        case $option_id in ''|*[!0-9a-f]*) die 'malformed line-pin option name' ;; esac
+        [ "${#option_id}" = 64 ] || die 'malformed line-pin option name'
+        # Without -A only local values are read, even if a global option exists.
+        local_option=$(tmux_run show-options -q -t "$session" "$option_name") || die 'cannot read pin'
+        [ -n "$local_option" ] || continue
+        record=$(tmux_run show-options -qv -t "$session" "$option_name") || die 'cannot read pin'
+        if [ -z "$record" ]; then
+          remaining_option=$(tmux_run show-options -q -t "$session" "$option_name") || die 'cannot recheck pin'
+          [ -n "$remaining_option" ] || continue
+          die 'invalid empty pin option'
+        fi
+        printf '%s\n' "$record" >"$root/record"
+        iconv -f UTF-8 -t UTF-8 "$root/record" >"$root/record-utf8" 2>/dev/null || die 'pin data is not valid UTF-8'
+        jq -L "$script_dir" -ces --arg id "$option_id" '
+          include "location-pins";
+          if length == 1 and (.[0] | line_pin_record and .id == $id)
+          then .[0] else error("invalid pin option") end
+        ' "$root/record-utf8" >>"$root/records" || die 'invalid pin option'
+        ;;
+    esac
+  done <"$root/options"
+  jq -cs '{version:1,pins:.}' "$root/records" >"$root/unvalidated"
+  validate_state "$root/unvalidated" "$root/state"
+  check_context
+}
+set_pin() {
+  write_id=$(printf '%s' "$1" | jq -r '.id')
+  check_context
+  tmux_run set-option -t "$session" "@dotfiles_line_pin_$write_id" "$1" || die 'cannot save pin'
+  check_context
+}
+case $action in
+  validate)
+    cat >"$root/input"
+    validate_state "$root/input" "$root/state"
+    cat "$root/state"
+    ;;
+  list)
+    list_state
+    cat "$root/state"
+    ;;
+  add)
+    cat >"$root/input"
+    iconv -f UTF-8 -t UTF-8 "$root/input" >"$root/utf8" 2>/dev/null || die 'pin data is not valid UTF-8'
+    location=$(jq -L "$script_dir" -ces '
+      include "location-pins";
+      if length == 1 and (.[0] | line_pin_location)
+      then .[0] | canonical_line_pin else error("invalid pin location") end
+    ' "$root/utf8") || die 'invalid pin location'
+    pin_id=$(record_id "$location")
+    new_record=$(printf '%s' "$location" | jq -c --arg id "$pin_id" '. + {id:$id}')
+    list_state
+    set_pin "$new_record"
+    printf '%s\n' "$new_record"
+    ;;
+  delete)
+    cat >"$root/input"
+    delete_id=$(jq -ers '
+      if length == 1 and (.[0] | type == "object" and keys == ["id"]
+        and (.id | type == "string" and test("^[0-9a-f]{64}$")))
+      then .[0].id else error("invalid pin ID") end
+    ' "$root/input") || die 'invalid pin ID'
+    list_state
+    check_context
+    tmux_run set-option -qu -t "$session" "@dotfiles_line_pin_$delete_id" || die 'cannot delete pin'
+    check_context
+    ;;
+  clear)
+    list_state
+    jq -r '.pins[].id' "$root/state" >"$root/clear-ids"
+    while IFS= read -r clear_id; do
+      check_context
+      tmux_run set-option -qu -t "$session" "@dotfiles_line_pin_$clear_id" || die 'cannot clear pin'
+    done <"$root/clear-ids"
+    check_context
+    ;;
+  import)
+    cat >"$root/input"
+    validate_state "$root/input" "$root/import"
+    list_state
+    jq -c '.pins[]' "$root/import" >"$root/import-records"
+    while IFS= read -r import_record; do set_pin "$import_record"; done <"$root/import-records"
+    ;;
+esac

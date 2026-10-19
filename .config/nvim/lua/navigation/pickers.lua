@@ -121,6 +121,18 @@ local function new(dependencies)
         },
       })
     end,
+    line_pins = function(source)
+      if not check_fzf() then
+        return
+      end
+      return require("navigation.location_pin_picker").open(dependencies.fzf(), source)
+    end,
+    clipboard_history = function()
+      if not check_fzf() then
+        return
+      end
+      return dependencies.history().open()
+    end,
     help = function()
       if not check_fzf() then
         return
@@ -183,6 +195,9 @@ local runtime = new({
   fzf = function()
     return require("fzf-lua")
   end,
+  history = function()
+    return require("clipboard.history")
+  end,
   root = function()
     return require("navigation.root").resolve()
   end,
@@ -193,6 +208,8 @@ M.grep = runtime.grep
 M.buffers = runtime.buffers
 M.recent = runtime.recent
 M.projects = runtime.projects
+M.line_pins = runtime.line_pins
+M.clipboard_history = runtime.clipboard_history
 M.help = runtime.help
 M.lsp_locations = runtime.lsp_locations
 M.document_symbols = runtime.document_symbols

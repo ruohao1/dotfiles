@@ -1,0 +1,524 @@
+#!/bin/sh
+set -eu
+
+MAX_URL_BYTES=16384
+MAX_COORDINATE=100000000
+MAX_CAPTURE_BYTES=262144
+failure_pane=
+tmux_path=
+capture_file=
+
+usage() {
+  printf '%s\n' 'usage: open-url --pane %N --x N --y N --hyperlink 0|1' \
+    '       open-url --test-resolve-plain X Y' \
+    '       open-url --test-resolve-osc8 X' \
+    '       open-url --test-open linux|macos' >&2
+  exit 64
+}
+
+is_bounded_uint() {
+  [ "$#" -eq 1 ] || return 1
+  case $1 in ''|*[!0-9]*) return 1;; esac
+  LC_ALL=C awk -v value="$1" -v maximum="$MAX_COORDINATE" \
+    'BEGIN { exit !(length(value) <= length(maximum) && value + 0 <= maximum) }'
+}
+
+report_failure() {
+  if [ -n "$failure_pane" ] && [ -n "$tmux_path" ]; then
+    "$tmux_path" display-message -t "$failure_pane" 'Could not open URL' >/dev/null 2>&1 || :
+  else
+    printf '%s\n' 'Could not open URL' >&2
+  fi
+}
+
+# Convert bytes before assigning a candidate to the shell: the only output is
+# bounded printable ASCII, so command substitution cannot trim or transform it.
+validate_url_stream() {
+  LC_ALL=C od -An -v -tu1 | LC_ALL=C awk -v max="$MAX_URL_BYTES" '
+    function valid(value, lower, rest, authority, i, ch, offset) {
+      if (length(value) == 0 || length(value) > max) return 0
+      lower = tolower(value)
+      if (substr(lower, 1, 7) == "http://") offset = 8
+      else if (substr(lower, 1, 8) == "https://") offset = 9
+      else return 0
+      rest = substr(value, offset); authority = rest
+      for (i = 1; i <= length(rest); i++) {
+        ch = substr(rest, i, 1)
+        if (ch == "/" || ch == "?" || ch == "#") { authority = substr(rest, 1, i - 1); break }
+      }
+      return length(authority) != 0
+    }
+    {
+      for (field = 1; field <= NF; field++) {
+        byte = $field; bytes++
+        if (byte < 33 || byte > 126) invalid = 1
+        if (bytes <= max) value = value sprintf("%c", byte)
+      }
+    }
+    END { if (invalid || bytes > max || !valid(value)) exit 1; print value }'
+}
+
+validate_url_value() {
+  printf '%s' "$1" | validate_url_stream
+}
+
+# Validate whole UTF-8 sequences before any pane text enters a shell variable.
+validate_visible_utf8() {
+  LC_ALL=C od -An -v -tu1 "$1" >"$2" 2>/dev/null || return 1
+  LC_ALL=C awk '
+    { for (i = 1; i <= NF; i++) {
+        b = $i
+        if (need) {
+          if (b < low || b > high) bad = 1
+          need--; low = 128; high = 191
+        } else if (b >= 32 && b <= 126) continue
+        else if (b == 194) { need = 1; low = 160; high = 191 }
+        else if (b >= 195 && b <= 223) { need = 1; low = 128; high = 191 }
+        else if (b == 224) { need = 2; low = 160; high = 191 }
+        else if ((b >= 225 && b <= 236) || (b >= 238 && b <= 239)) { need = 2; low = 128; high = 191 }
+        else if (b == 237) { need = 2; low = 128; high = 159 }
+        else if (b == 240) { need = 3; low = 144; high = 191 }
+        else if (b >= 241 && b <= 243) { need = 3; low = 128; high = 191 }
+        else if (b == 244) { need = 3; low = 128; high = 143 }
+        else bad = 1
+        if (bad) exit 1
+      }
+    }
+    END { if (bad || need) exit 1 }' "$2"
+}
+
+select_utf8_locale() {
+  for locale_candidate in C.UTF-8 C.utf8 en_US.UTF-8 en_US.utf8; do
+    locale_charmap=$(LC_ALL="$locale_candidate" locale charmap 2>/dev/null) || continue
+    case $locale_charmap in UTF-8|utf8) ;; *) continue ;; esac
+    wide_probe=$(printf ' A\347\225\214Z' | LC_ALL="$locale_candidate" fold -w 2 2>/dev/null) || continue
+    combining_probe=$(printf ' e\314\201Z' | LC_ALL="$locale_candidate" fold -w 2 2>/dev/null) || continue
+    [ "$wide_probe" = "$(printf ' A\n\347\225\214\nZ')" ] || continue
+    [ "$combining_probe" = "$(printf ' e\314\201\nZ')" ] || continue
+    url_utf8_locale=$locale_candidate
+    return 0
+  done
+  return 1
+}
+
+# Return the zero-based byte containing the displayed cell.
+display_column_to_byte() {
+  map_x=$1; map_text=$2
+  is_bounded_uint "$map_x" || return 1
+  printf '%s' "$map_text" >"$resolver_dir/map.text" || return 1
+  validate_visible_utf8 "$resolver_dir/map.text" "$resolver_dir/map.bytes" || return 1
+  select_utf8_locale || return 1
+  printf ' %s' "$map_text" | LC_ALL="$url_utf8_locale" fold -w "$((map_x + 1))" >"$resolver_dir/map.fold" 2>/dev/null || return 1
+  map_prefix=$(sed -n '1p' "$resolver_dir/map.fold") || return 1
+  map_bytes=$(printf '%s' "$map_prefix" | LC_ALL=C wc -c 2>/dev/null) || return 2
+  map_total=$(LC_ALL=C wc -c <"$resolver_dir/map.text" 2>/dev/null) || return 2
+  map_bytes=$(printf '%s\n' "$map_bytes" | LC_ALL=C awk '{print $1}')
+  map_total=$(printf '%s\n' "$map_total" | LC_ALL=C awk '{print $1}')
+  case $map_bytes:$map_total in *[!0-9:]*|'':*|*:'') return 1 ;; esac
+  map_offset=$((map_bytes - 1))
+  [ "$map_offset" -ge 0 ] && [ "$map_offset" -lt "$map_total" ] || return 1
+  printf '%s\n' "$map_offset"
+}
+
+resolve_plain() (
+  plain_x=$1; plain_y=$2
+  resolver_dir=$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-open-url-resolve.XXXXXX" 2>/dev/null) || exit 1
+  trap 'rm -rf "$resolver_dir"' EXIT HUP INT TERM
+  cat >"$resolver_dir/input" || exit 1
+  LC_ALL=C awk -v click_y="$plain_y" -v row_file="$resolver_dir/row" -v logical_file="$resolver_dir/logical" -v state_file="$resolver_dir/state" -v bound="$MAX_CAPTURE_BYTES" '
+    {
+      if ($0 !~ /^(-[1-9][0-9]*|0|[1-9][0-9]*) [DHOPWX-]+ / ||
+          ($2 != "-" && ($2 == "" || $2 !~ /^D?H?O?P?W?X?$/))) malformed = 1
+      raw = $0; number = $1; flag = $2
+      sub(/^[^ ]+ [^ ]+ /, "", raw)
+      if (rows > 0 && number != previous_number + 1) malformed = 1
+      rows++; flags[rows] = flag; text[rows] = raw
+      previous_number = number
+      if (number == click_y) target = rows
+    }
+    END {
+      if (malformed || !target) exit 1
+      first = target; while (first > 1 && index(flags[first - 1], "W")) first--
+      last = target; while (last < rows && index(flags[last], "W")) last++
+      logical = ""; preceding = 0
+      for (i = first; i <= last; i++) {
+        if (i == target) preceding = length(logical)
+        logical = logical text[i]
+        if (length(logical) > bound) exit 1
+      }
+      printf "%s", text[target] > row_file
+      printf "%s", logical > logical_file
+      print preceding, (last == rows && index(flags[last], "W") != 0) > state_file
+    }' "$resolver_dir/input" || exit 1
+  validate_visible_utf8 "$resolver_dir/logical" "$resolver_dir/logical.bytes" || exit 1
+  row=$(cat "$resolver_dir/row") || exit 1
+  row_offset=$(display_column_to_byte "$plain_x" "$row") || exit $?
+  read -r preceding trailing_wrap <"$resolver_dir/state" || exit 1
+  logical_offset=$((preceding + row_offset))
+  LC_ALL=C awk -v click_offset="$logical_offset" -v trailing_wrap="$trailing_wrap" -v max="$MAX_URL_BYTES" '
+    function occurrences(value, needle, i, count) {
+      for (i = 1; i <= length(value); i++) if (substr(value, i, 1) == needle) count++
+      return count
+    }
+    function trim_candidate(value, last) {
+      while (length(value)) {
+        last = substr(value, length(value), 1)
+        if (index(".,;!", last) || (last == ")" && occurrences(value, ")") > occurrences(value, "(")) || (last == "]" && occurrences(value, "]") > occurrences(value, "[")) || (last == "}" && occurrences(value, "}") > occurrences(value, "{")) || (last == ">" && occurrences(value, ">") > occurrences(value, "<"))) {
+          value = substr(value, 1, length(value) - 1); continue
+        }
+        break
+      }
+      return value
+    }
+    function valid_url(value, lower, rest, authority, i, ch, offset) {
+      if (!length(value) || length(value) > max || value ~ /[^!-~]/) return 0
+      lower = tolower(value)
+      if (substr(lower, 1, 7) == "http://") offset = 8
+      else if (substr(lower, 1, 8) == "https://") offset = 9
+      else return 0
+      rest = substr(value, offset); authority = rest
+      for (i = 1; i <= length(rest); i++) {
+        ch = substr(rest, i, 1)
+        if (ch == "/" || ch == "?" || ch == "#") { authority = substr(rest, 1, i - 1); break }
+      }
+      return length(authority) != 0
+    }
+    { logical = logical $0 }
+    END {
+      for (start = 1; start <= length(logical); start++) {
+        if (tolower(substr(logical, start, 7)) != "http://" && tolower(substr(logical, start, 8)) != "https://") continue
+        finish = start
+        while (finish <= length(logical) && substr(logical, finish, 1) != " ") finish++
+        candidate = trim_candidate(substr(logical, start, finish - start))
+        if (click_offset < start - 1 || click_offset >= start - 1 + length(candidate) || !valid_url(candidate)) continue
+        if (finish > length(logical) && trailing_wrap) continue
+        answers++; answer = candidate
+      }
+      if (answers != 1) exit 1
+      print answer
+    }' "$resolver_dir/logical"
+)
+
+# Parse OSC 8 and SGR framing; escape bytes never enter visible geometry.
+parse_osc8() {
+  parse_dir=$3
+  LC_ALL=C awk -v phase="$1" -v click_offset="$2" -v visible_file="$parse_dir/visible" -v max="$MAX_URL_BYTES" '
+    function valid_url(value, lower, rest, authority, i, ch, offset) {
+      if (!length(value) || length(value) > max || value ~ /[^!-~]/) return 0
+      lower = tolower(value)
+      if (substr(lower, 1, 7) == "http://") offset = 8
+      else if (substr(lower, 1, 8) == "https://") offset = 9
+      else return 0
+      rest = substr(value, offset); authority = rest
+      for (i = 1; i <= length(rest); i++) {
+        ch = substr(rest, i, 1)
+        if (ch == "/" || ch == "?" || ch == "#") { authority = substr(rest, 1, i - 1); break }
+      }
+      return length(authority) != 0
+    }
+    { for (field = 1; field <= NF; field++) bytes[++count] = $field }
+    END {
+      active = ""; active_invalid = 0; output = "NONE"; visible_count = 0
+      for (index_byte = 1; index_byte <= count; ) {
+        byte = bytes[index_byte]
+        if (byte == 27 && bytes[index_byte + 1] == 93) {
+          content = ""; content_invalid = 0; terminated = 0; cursor = index_byte + 2
+          while (cursor <= count) {
+            if (bytes[cursor] == 7) { terminated = 1; cursor++; break }
+            if (bytes[cursor] == 27 && bytes[cursor + 1] == 92) { terminated = 1; cursor += 2; break }
+            if (bytes[cursor] < 32 || bytes[cursor] > 126) content_invalid = 1
+            else content = content sprintf("%c", bytes[cursor])
+            cursor++
+          }
+          if (!terminated || content_invalid || substr(content, 1, 2) != "8;") { invalid = 1; break }
+          remainder = substr(content, 3); separator = index(remainder, ";")
+          if (!separator) { active = ""; active_invalid = 1 }
+          else {
+            uri = substr(remainder, separator + 1)
+            if (!length(uri)) { active = ""; active_invalid = 0 }
+            else if (length(uri) > max || !valid_url(uri)) { active = ""; active_invalid = 1 }
+            else { active = uri; active_invalid = 0 }
+          }
+          index_byte = cursor; continue
+        }
+        if (byte == 27 && bytes[index_byte + 1] == 91) {
+          cursor = index_byte + 2; terminated = 0
+          while (cursor <= count) {
+            next_byte = bytes[cursor]
+            if (next_byte == 109) { terminated = 1; cursor++; break }
+            if (!((next_byte >= 48 && next_byte <= 57) || next_byte == 59 || next_byte == 58)) break
+            cursor++
+          }
+          if (!terminated) { invalid = 1; break }
+          index_byte = cursor; continue
+        }
+        if (byte == 27) { invalid = 1; break }
+        if (byte == 10 || byte == 13) { index_byte++; continue }
+        if (byte < 32 || byte == 127) { invalid = 1; break }
+        if (phase == "visible") printf "%c", byte > visible_file
+        if (phase == "resolve" && visible_count == click_offset) {
+          if (active_invalid) output = "INVALID"
+          else if (length(active)) output = "URL:" active
+        }
+        visible_count++; index_byte++
+      }
+      if (invalid) print "INVALID"
+      else if (phase == "visible") print "OK"
+      else print output
+    }' "$parse_dir/input.bytes"
+}
+
+resolve_osc8() (
+  osc_x=$1
+  resolver_dir=$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-open-url-resolve.XXXXXX" 2>/dev/null) || { printf 'INVALID\n'; exit; }
+  trap 'rm -rf "$resolver_dir"' EXIT HUP INT TERM
+  cat >"$resolver_dir/input" || { printf 'INVALID\n'; exit; }
+  LC_ALL=C od -An -v -tu1 "$resolver_dir/input" >"$resolver_dir/input.bytes" 2>/dev/null || { printf 'INVALID\n'; exit; }
+  : >"$resolver_dir/visible"
+  framing=$(parse_osc8 visible -1 "$resolver_dir") || { printf 'INVALID\n'; exit; }
+  [ "$framing" = OK ] || { printf 'INVALID\n'; exit; }
+  validate_visible_utf8 "$resolver_dir/visible" "$resolver_dir/visible.bytes" || { printf 'INVALID\n'; exit; }
+  visible=$(cat "$resolver_dir/visible") || { printf 'INVALID\n'; exit; }
+  if byte_offset=$(display_column_to_byte "$osc_x" "$visible"); then
+    parse_osc8 resolve "$byte_offset" "$resolver_dir"
+  else
+    map_status=$?
+    [ "$map_status" -ne 2 ] || exit 2
+    printf 'NONE\n'
+  fi
+)
+
+# Copy-mode OSC links live on the displayed mode screen, not its backing
+# capture. Read a bounded snapshot and admit a move/query/restore group only
+# while that exact snapshot is still current. tmux drains immediate commands
+# without yielding, so another helper can never observe our temporary cursor.
+copy_state_format='#{pane_in_mode}:#{pane_mode}:#{scroll_position}:#{copy_cursor_x}:#{copy_cursor_y}:#{selection_start_x}:#{selection_start_y}:#{selection_end_x}:#{selection_end_y}:#{selection_active}:#{selection_present}:#{pane_width}:#{pane_height}'
+copy_cursor_state() {
+  cursor_state=$("$tmux_path" display-message -p -t "$failure_pane" "$copy_state_format" 2>/dev/null) || return 2
+  IFS=: read -r cursor_count cursor_mode cursor_scroll cursor_x cursor_y selection_sx selection_sy selection_ex selection_ey selection_active selection_present cursor_width cursor_height cursor_extra <<EOF
+$cursor_state
+EOF
+  [ "$cursor_count:$cursor_mode:$cursor_width:$cursor_height" = "1:copy-mode:$pane_width:$pane_height" ] || return 2
+  [ "$cursor_state" = "1:copy-mode:$cursor_scroll:$cursor_x:$cursor_y:$selection_sx:$selection_sy:$selection_ex:$selection_ey:$selection_active:$selection_present:$pane_width:$pane_height" ] && [ -z "$cursor_extra" ] || return 2
+  is_bounded_uint "$cursor_scroll" && is_bounded_uint "$cursor_x" && is_bounded_uint "$cursor_y" || return 2
+  # A saved Emacs cursor may be one past the last cell; clicked cells may not.
+  [ "$cursor_x" -le "$pane_width" ] && [ "$cursor_y" -lt "$pane_height" ] || return 2
+  case $selection_active:$selection_present in 0:0|0:1|1:0|1:1) ;; *) return 2 ;; esac
+  if [ -z "$selection_sx" ]; then
+    [ -z "$selection_sy$selection_ex$selection_ey" ] && [ "$selection_active:$selection_present" = 0:0 ] || return 2
+  else
+    for selection_value in "$selection_sx" "$selection_sy" "$selection_ex" "$selection_ey"; do
+      is_bounded_uint "$selection_value" || return 2
+    done
+    [ "$selection_sx" -le "$pane_width" ] && [ "$selection_ex" -le "$pane_width" ] || return 2
+    # Selection y is a backing/history coordinate, not viewport-relative.
+    # Keep it bounded and compare it opaquely before/after the transaction.
+  fi
+}
+
+# Only validated pane IDs and numbers enter this command text. Cursor formats
+# are evaluated inside the same nonwaiting tmux group, including on restoration.
+copy_move_commands() {
+  move_x=$1; move_y=$2
+  printf "if-shell -F -t %s '#{<:#{copy_cursor_y},%s}' { send-keys -t %s -N '#{e|-:%s,#{copy_cursor_y}}' -X cursor-down }; " \
+    "$failure_pane" "$move_y" "$failure_pane" "$move_y"
+  printf "if-shell -F -t %s '#{>:#{copy_cursor_y},%s}' { send-keys -t %s -N '#{e|-:#{copy_cursor_y},%s}' -X cursor-up }; " \
+    "$failure_pane" "$move_y" "$failure_pane" "$move_y"
+  printf 'send-keys -t %s -X start-of-line; ' "$failure_pane"
+  if [ "$move_x" -gt 0 ]; then
+    printf 'send-keys -t %s -N %s -X cursor-right; ' "$failure_pane" "$move_x"
+  fi
+}
+
+copy_link_at_cell() (
+  link_dir=$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-open-url-copy.XXXXXX" 2>/dev/null) || exit 2
+  trap 'rm -rf "$link_dir"' EXIT HUP INT TERM
+  copy_cursor_state || exit 2
+  [ "$cursor_scroll" = "$scroll_offset" ] || exit 2
+  original_state=$cursor_state
+  move_commands=$(copy_move_commands "$click_x" "$click_y") || exit 2
+  restore_commands=$(copy_move_commands "$cursor_x" "$cursor_y") || exit 2
+  # send-keys/display-message after-hooks could wait or change state. Reject
+  # them at group entry, without altering the user's hook configuration.
+  hooks_empty='#{&&:#{==:#{after-send-keys},},#{==:#{after-display-message},}}'
+  entry_guard="#{&&:$hooks_empty,#{==:$copy_state_format,$original_state}}"
+  transaction="$move_commands display-message -p -t $failure_pane '#{pane_in_mode}:#{pane_mode}:#{scroll_position}:#{copy_cursor_x}:#{copy_cursor_y}:#{copy_cursor_hyperlink}X'; $restore_commands display-message -p -t $failure_pane '$copy_state_format'"
+  "$tmux_path" if-shell -F -t "$failure_pane" "$entry_guard" "$transaction" \
+    >"$link_dir/reply" 2>/dev/null || exit 2
+  # Verify the reached cell and exact restored snapshot from the same group,
+  # before extracting the URL. Keep raw bytes, including trailing controls.
+  expected_prefix="1:copy-mode:$scroll_offset:$click_x:$click_y:"
+  expected_suffix=$(printf 'X\n%s\nX' "$original_state")
+  expected_suffix=${expected_suffix%X}
+  if LC_ALL=C od -An -v -tu1 "$link_dir/reply" | LC_ALL=C awk \
+    -v prefix="$expected_prefix" -v suffix="$expected_suffix" -v max="$MAX_URL_BYTES" '
+    { for (i = 1; i <= NF; i++) {
+        byte = $i; count++
+        if (byte < 32 || byte > 126) { if (byte != 10) bad = 1 }
+        character = sprintf("%c", byte)
+        ending = ending character
+        if (length(ending) > length(suffix)) ending = substr(ending, 2)
+        if (count <= max + length(prefix) + length(suffix)) value = value character
+      }
+    }
+    END {
+      if (substr(value, 1, length(prefix)) != prefix || ending != suffix) exit 2
+      if (bad || count > max + length(prefix) + length(suffix)) exit 3
+      printf "%s", substr(value, length(prefix) + 1, length(value) - length(prefix) - length(suffix))
+    }' >"$link_dir/link"; then :
+  else
+    framing_status=$?
+    # Invalid content is a silent no-op; missing/restored-state framing is an
+    # operational failure. Neither path may open or print the raw destination.
+    [ "$framing_status" -ne 3 ] || exit 1
+    exit 2
+  fi
+  validate_url_stream <"$link_dir/link"
+)
+
+# The copy-mode backing snapshot omits gutters and decorations drawn over it.
+# Only the pinned default, right-aligned row-zero position format has a
+# predictable boundary. Its pane lookup must agree with the window option
+# used by window-copy.c before tmux's own expanded width is trusted.
+copy_geometry_guard() (
+  line_numbers=$("$tmux_path" show-options -wAv -t "$failure_pane" copy-mode-line-numbers 2>/dev/null) || exit 2
+  [ "$line_numbers" = off ] || exit 1
+
+  geometry=$("$tmux_path" display-message -p -t "$failure_pane" \
+    '#{pane_in_mode}:#{pane_mode}:#{scroll_position}:#{copy_cursor_x}:#{copy_cursor_y}' 2>/dev/null) || exit 2
+  IFS=: read -r geometry_count geometry_mode geometry_scroll geometry_x geometry_y geometry_extra <<EOF
+$geometry
+EOF
+  [ "$geometry_count" = 1 ] && [ "$geometry_mode" = copy-mode ] || exit 2
+  [ "$geometry" = "1:copy-mode:$geometry_scroll:$geometry_x:$geometry_y" ] && [ -z "$geometry_extra" ] || exit 2
+  is_bounded_uint "$geometry_scroll" && is_bounded_uint "$geometry_x" && is_bounded_uint "$geometry_y" || exit 2
+  [ "$geometry_scroll" = "$scroll_offset" ] && [ "$geometry_y" -lt "$pane_height" ] || exit 2
+  # With no gutter, an Emacs cursor one past the line covers the final cell.
+  if [ "$geometry_x" -ge "$pane_width" ] && [ "$geometry_y" -eq "$click_y" ] && [ "$click_x" -eq "$((pane_width - 1))" ]; then
+    exit 1
+  fi
+
+  [ "$click_y" -eq 0 ] || exit 0
+  default_position_format='#[align=right]#{t/p:top_line_time}#{?#{e|>:#{top_line_time},0}, ,}[#{copy_position}/#{copy_position_limit}]#{?search_timed_out, (timed out),#{?search_count, (#{search_count}#{?search_count_partial,+,} results),}}'
+  window_position_format=$("$tmux_path" show-options -wAv -t "$failure_pane" copy-mode-position-format 2>/dev/null) || exit 2
+  pane_position_format=$("$tmux_path" show-options -pAv -t "$failure_pane" copy-mode-position-format 2>/dev/null) || exit 2
+  [ "$window_position_format" = "$default_position_format" ] && [ "$pane_position_format" = "$default_position_format" ] || exit 1
+  position_width=$("$tmux_path" display-message -p -t "$failure_pane" '#{w:#{E:copy-mode-position-format}}' 2>/dev/null) || exit 2
+  is_bounded_uint "$position_width" && [ "$position_width" -gt 0 ] || exit 2
+  if [ "$position_width" -gt "$pane_width" ]; then position_width=$pane_width; fi
+  [ "$click_x" -lt "$((pane_width - position_width))" ] || exit 1
+)
+
+open_candidate() {
+  candidate=$1
+  case $2 in linux) opener_name=xdg-open;; macos) opener_name=open;; *) return 1;; esac
+  opener_path=$(command -v "$opener_name" 2>/dev/null) || return 1
+  [ -x "$opener_path" ] || return 1
+  "$opener_path" "$candidate" >/dev/null 2>&1
+}
+
+cleanup_capture() { [ -z "$capture_file" ] || rm -f "$capture_file"; }
+capture_pane() {
+  capture_file=$(mktemp "${TMPDIR:-/tmp}/dotfiles-open-url.XXXXXX" 2>/dev/null) || return 1
+  "$tmux_path" capture-pane "$@" >"$capture_file" 2>/dev/null || return 1
+  bytes=$(LC_ALL=C wc -c <"$capture_file" 2>/dev/null) || return 1
+  bytes=$(printf '%s\n' "$bytes" | LC_ALL=C awk '{print $1}')
+  case $bytes in ''|*[!0-9]*) return 1;; esac
+  [ "$bytes" -le "$MAX_CAPTURE_BYTES" ]
+}
+capture_display() {
+  if [ "$mode_capture" = 1 ]; then
+    capture_pane -M "$@"
+  else
+    capture_pane "$@"
+  fi
+}
+
+if [ "$#" -ge 1 ]; then
+  case $1 in
+    --test-resolve-plain)
+      [ "$#" -eq 3 ] || usage
+      if ! is_bounded_uint "$2" || ! is_bounded_uint "$3"; then usage; fi
+      resolve_plain "$2" "$3"; exit ;;
+    --test-resolve-osc8)
+      [ "$#" -eq 2 ] || usage
+      is_bounded_uint "$2" || usage
+      resolve_osc8 "$2"; exit ;;
+    --test-open)
+      [ "$#" -eq 2 ] || usage
+      if ! candidate=$(validate_url_stream); then exit 2; fi
+      if ! open_candidate "$candidate" "$2"; then report_failure; exit 1; fi
+      exit ;;
+  esac
+fi
+
+[ "$#" -eq 8 ] || usage
+if [ "$1" != --pane ] || [ "$3" != --x ] || [ "$5" != --y ] || [ "$7" != --hyperlink ]; then usage; fi
+failure_pane=$2; click_x=$4; click_y=$6; hyperlink_expected=$8
+case $failure_pane in
+  %*) pane_digits=${failure_pane#%}; case $pane_digits in ''|*[!0-9]*) usage;; esac ;;
+  *) usage ;;
+esac
+if ! is_bounded_uint "$click_x" || ! is_bounded_uint "$click_y"; then usage; fi
+case $hyperlink_expected in 0|1);; *) usage;; esac
+tmux_path=$(command -v tmux 2>/dev/null) || { report_failure; exit 1; }
+trap cleanup_capture EXIT HUP INT TERM
+dimensions=$("$tmux_path" display-message -p -t "$failure_pane" '#{pane_width} #{pane_height}' 2>/dev/null) || { report_failure; exit 1; }
+pane_width=$(printf '%s\n' "$dimensions" | awk '{print $1}')
+pane_height=$(printf '%s\n' "$dimensions" | awk '{print $2}')
+if [ "$dimensions" != "$pane_width $pane_height" ] || ! is_bounded_uint "$pane_width" || ! is_bounded_uint "$pane_height"; then report_failure; exit 1; fi
+[ "$pane_width" -gt 0 ] || { report_failure; exit 1; }
+[ "$click_x" -lt "$pane_width" ] && [ "$click_y" -lt "$pane_height" ] || exit 0
+
+# Copy mode displays a viewport of its backing snapshot. Its visible row y
+# is backing row y-scroll_position; -M alone still captures backing row y.
+mode_metadata=$("$tmux_path" display-message -p -t "$failure_pane" '#{pane_in_mode}:#{pane_mode}:#{scroll_position}' 2>/dev/null) || { report_failure; exit 1; }
+case $mode_metadata in
+  0::) mode_capture=0; scroll_offset=0 ;;
+  1:copy-mode:*)
+    mode_capture=1; scroll_offset=${mode_metadata##*:}
+    if ! is_bounded_uint "$scroll_offset"; then report_failure; exit 1; fi
+    case $scroll_offset in 0|[1-9]*) ;; *) report_failure; exit 1 ;; esac
+    ;;
+  *) report_failure; exit 1 ;;
+esac
+display_y=$((click_y - scroll_offset))
+if [ "$mode_capture" = 1 ]; then
+  if copy_geometry_guard; then :
+  else
+    geometry_status=$?
+    [ "$geometry_status" -ne 2 ] || { report_failure; exit 1; }
+    exit 0
+  fi
+fi
+
+if [ "$hyperlink_expected" = 1 ]; then
+  if [ "$mode_capture" = 1 ]; then
+    if candidate=$(copy_link_at_cell); then :
+    else
+      link_status=$?
+      [ "$link_status" -ne 2 ] || { report_failure; exit 1; }
+      exit 0
+    fi
+  else
+    if ! capture_display -p -e -N -S "$display_y" -E "$display_y" -t "$failure_pane"; then report_failure; exit 1; fi
+    osc_result=$(resolve_osc8 "$click_x" <"$capture_file") || { report_failure; exit 1; }
+    case $osc_result in URL:*) candidate=$(printf '%s\n' "$osc_result" | cut -c5-);; NONE|INVALID) exit 0;; *) exit 0;; esac
+  fi
+else
+  radius=$(( (MAX_URL_BYTES + pane_width - 1) / pane_width + 2 ))
+  start_line=$((display_y - radius)); end_line=$((display_y + radius))
+  if ! capture_display -p -L -F -N -S "$start_line" -E "$end_line" -t "$failure_pane"; then report_failure; exit 1; fi
+  if candidate=$(resolve_plain "$click_x" "$display_y" <"$capture_file"); then
+    :
+  else
+    resolve_status=$?
+    [ "$resolve_status" -ne 2 ] || { report_failure; exit 1; }
+    exit 0
+  fi
+fi
+
+if ! candidate=$(validate_url_value "$candidate"); then exit 0; fi
+platform=$("$tmux_path" show-options -gqv @dotfiles_platform 2>/dev/null) || { report_failure; exit 1; }
+case $platform in linux|macos);; *) report_failure; exit 1;; esac
+if ! open_candidate "$candidate" "$platform"; then report_failure; exit 1; fi
