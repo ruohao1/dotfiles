@@ -162,7 +162,7 @@ preview/platform validation; listing them here does not make them optional.
 ## Verification
 
 The [Nix source tests workflow](../.github/workflows/nix-source-tests.yml) runs
-the package-checker self-test, entrypoint, ownership, clipboard checker and migration source suites
+the package-checker self-test, entrypoint, ownership, clipboard checker, migration and updater source suites
 on Ubuntu pull requests and pushes to `main`. It uses private fixture homes,
 reports test results and skips, and needs no Nix installation. These checks substitute
 activation and service managers; a passing CI job does not establish Nix builds
@@ -391,9 +391,22 @@ with fixture-only host declarations, exercised the public migration wrapper on
 an offline Ubuntu 24.04.5 x86_64 VM. Preview, apply, repeat, generation rollback
 and legacy restoration passed across two VM runs with a guarded continuation.
 Native prerequisites were prepared separately, including a scoped Bubblewrap
-AppArmor policy. The fixture kept the same package inventory; actual package
-upgrades, preservation of a nonempty native Nix package profile and full desktop
-workflows remain untested. See the [wrapper validation record](validation/2026-10-17-ubuntu-wrapper.md).
+AppArmor policy. That fixture kept the same package inventory and did not test
+actual package upgrades, preservation of a nonempty native Nix package profile
+or full desktop workflows. See the [wrapper validation record](validation/2026-10-17-ubuntu-wrapper.md).
+
+On 2026-10-19, production source `95e3bb9f3bf381ed417a64664200d94b7713f460`
+with this branch's fixture additions passed the release updater's offline
+x86_64 NixOS VM scenario: real uv
+0.11.21 → 0.11.22 → 0.11.21, installed release A → B → A, interrupted
+update recovery from the exact retained plan, and repeated apply. The original
+consumer checkout, native package profile and seven native runtime observations
+were preserved. A separate bounded run of the same snapshot passed the legacy
+migration lifecycle, edited-file restoration, service-stop failure recovery and
+interrupted-activation recovery. Discovery and candidate preparation use
+prebuilt offline projections in this VM; separate real Git/Nix fixtures verify preparation.
+This does not verify public release transport, full desktop workflows or other
+platforms. See the [release implementation evidence](../.config/docs/superpowers/plans/2026-10-19-release-updates.md).
 
 On 2026-10-17, source `6fd61bc335e5342b0c83811b658b6d526eb443cf` with the unchanged
 lock evaluated all six non-VM check derivations on each of the four systems.
@@ -507,9 +520,10 @@ the active transaction and only a journal-retained generation. Native packages,
 desktop preferences and external uv environments stay outside Nix rollback.
 For an interrupted apply or rollback, run `status` and inspect its exact retained
 recovery commands. A pending rollback names its recorded target. `restore-legacy`
-cancels an unpublished update or reverses a published handoff; it is not an update retry. Do not regenerate a new preview
-to resume an interrupted transaction. A missing executor root or changed retained
-plan stops recovery instead of selecting different source code.
+cancels an unpublished update or reverses a published handoff; it is not an update
+retry. Do not regenerate a new preview to resume an interrupted transaction.
+A missing executor root or changed retained plan stops recovery instead of
+selecting different source code.
 
 Keep candidate roots, journals and backups until you have separately reviewed
 their retention. The updater performs no cleanup. Start updates from a shell
