@@ -507,7 +507,7 @@ the active transaction and only a journal-retained generation. Native packages,
 desktop preferences and external uv environments stay outside Nix rollback.
 For an interrupted apply or rollback, run `status` and inspect its exact retained
 recovery commands. A pending rollback names its recorded target. `restore-legacy`
-reverses the handoff; it is not an update retry. Do not regenerate a new preview
+cancels an unpublished update or reverses a published handoff; it is not an update retry. Do not regenerate a new preview
 to resume an interrupted transaction. A missing executor root or changed retained
 plan stops recovery instead of selecting different source code.
 

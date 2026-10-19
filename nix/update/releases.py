@@ -252,7 +252,7 @@ def _backoff(headers, now):
     return max(deadline for deadline in deadlines if _timestamp(deadline))
 
 
-def check(root, *, force=False):
+def check(root, *, force=False, identities=()):
     """Refresh metadata under the caller-held updater lock; transient errors retain cache."""
     root = Path(root)
     cache = read_cache(root)
@@ -261,13 +261,17 @@ def check(root, *, force=False):
         cache['lastAttempt'] = now
         cache['nextAttempt'] = max(now + DAILY, cache['rateLimitUntil'])
         state.write_json(root / 'cache.json', cache)
-    if now < cache['rateLimitUntil'] or (not force and now < cache['nextAttempt']):
-        return cache['release']
-    cache['lastAttempt'] = now
-    cache['nextAttempt'] = max(now + DAILY, cache['rateLimitUntil'])
-    state.write_json(root / 'cache.json', cache)
+    due = now >= cache['rateLimitUntil'] and (force or now >= cache['nextAttempt'])
+    if due:
+        cache['lastAttempt'] = now
+        cache['nextAttempt'] = max(now + DAILY, cache['rateLimitUntil'])
+        state.write_json(root / 'cache.json', cache)
     history = _history(root)
+    for record in identities:
+        _remember(root, history, validate_record(record) if record is not None else None)
     _remember(root, history, cache['release'])
+    if not due:
+        return cache['release']
     try:
         with _budget() as deadline:
             client = _Client(deadline)
@@ -297,29 +301,44 @@ def check(root, *, force=False):
     return cache['release']
 
 
-def validate_exact(record):
+def validate_exact(record, root):
     """Fresh identity/eligibility check for the reviewed release; never substitute Latest."""
     record = validate_record(record)
-    with _budget() as deadline:
-        client = _Client(deadline)
-        try:
-            _, payload, _ = client.get('/releases/' + str(record['releaseId']))
-        except _HTTPFailure as error:
-            if error.status == 404:
-                raise ReleaseConflict('updates: reviewed release no longer exists') from error
-            raise
-        try:
-            preliminary = parse_release(payload, record['commit'])
-        except ReleaseError as error:
-            raise ReleaseConflict('updates: reviewed release is no longer eligible') from error
-        if preliminary != record:
-            raise ReleaseConflict('updates: reviewed release ID or tag changed')
-        try:
-            commit = client.resolve(record['version'])
-        except _HTTPFailure as error:
-            if error.status == 404:
-                raise ReleaseConflict('updates: reviewed tag no longer exists') from error
-            raise
-        if commit != record['commit']:
-            raise ReleaseConflict('updates: reviewed release commit changed')
+    root = Path(root)
+    cache = read_cache(root)
+    now = time.time()
+    if now < cache['rateLimitUntil']:
+        raise ReleaseError('updates: server backoff is active; retry after ' + str(cache['rateLimitUntil']))
+    cache['lastAttempt'] = now
+    cache['nextAttempt'] = max(now + DAILY, cache['rateLimitUntil'])
+    state.write_json(root / 'cache.json', cache)
+    try:
+        with _budget() as deadline:
+            client = _Client(deadline)
+            try:
+                _, payload, _ = client.get('/releases/' + str(record['releaseId']))
+            except _HTTPFailure as error:
+                if error.status == 404:
+                    raise ReleaseConflict('updates: reviewed release no longer exists') from error
+                raise
+            try:
+                preliminary = parse_release(payload, record['commit'])
+            except ReleaseError as error:
+                raise ReleaseConflict('updates: reviewed release is no longer eligible') from error
+            if preliminary != record:
+                raise ReleaseConflict('updates: reviewed release ID or tag changed')
+            try:
+                commit = client.resolve(record['version'])
+            except _HTTPFailure as error:
+                if error.status == 404:
+                    raise ReleaseConflict('updates: reviewed tag no longer exists') from error
+                raise
+            if commit != record['commit']:
+                raise ReleaseConflict('updates: reviewed release commit changed')
+    except _HTTPFailure as error:
+        if error.status in (403, 429):
+            cache['rateLimitUntil'] = max(cache['rateLimitUntil'], _backoff(error.headers, now))
+            cache['nextAttempt'] = max(cache['nextAttempt'], cache['rateLimitUntil'])
+            state.write_json(root / 'cache.json', cache)
+        raise
     return record

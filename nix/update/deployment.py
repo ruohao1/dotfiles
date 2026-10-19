@@ -390,11 +390,12 @@ def install(root):
     if installed['state'] != 'installed':
         raise UpdateError('installation is '+installed['state']+'; complete explicit consumer adoption or retained recovery first')
     config = configuration(root)
-    release = releases.check(root, force=True)
+    release = releases.check(root, force=True, identities=[installed['release'],
+        *[item['release'] for item in installed['retained']]])
     if not release or not releases.is_newer(release, installed['release']):
         print('No newer stable release is available.')
         return 0
-    releases.validate_exact(release)
+    releases.validate_exact(release, root)
     candidate = prepare(config['sourceRoot'], config['profile'], release, root)
     candidate['callerPath'] = os.environ.get('DOTFILES_UPDATE_CALLER_PATH', os.environ.get('PATH', os.defpath))
     review = Path(tempfile.mkdtemp(prefix='dotfiles-update-review-', dir='/tmp'))/'review.json'
@@ -418,11 +419,11 @@ def install(root):
     _, revision, _ = validate_source(candidate['originalRoot'])
     if revision != candidate['originalCommit']:
         raise UpdateError('personal source changed during review; prepare a new candidate')
-    releases.validate_exact(release)
+    releases.validate_exact(release, root)
     try:
         _execute(candidate, ['apply', '--plan', candidate['planPath']])
     except BaseException:
-        print('Update interrupted. Retained recovery commands (restore-legacy reverses the handoff):')
+        print('Update interrupted. Retained recovery commands (restore-legacy cancels an unpublished update or reverses a published handoff):')
         print(recovery_commands(candidate))
         raise
     print('Update applied; status follows the selected Home Manager generation.')

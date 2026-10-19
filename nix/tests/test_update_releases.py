@@ -68,12 +68,12 @@ class ReleaseTests(unittest.TestCase):
         self.clock.start()
         self.addCleanup(self.clock.stop)
 
-    def run_check(self, responses, *, force=False):
+    def run_check(self, responses, *, force=False, identities=()):
         transport = Transport(responses)
         with patch.object(self.releases.urllib.request, 'build_opener', return_value=transport), \
                 patch.object(subprocess, 'run', side_effect=AssertionError('metadata ran code')):
             with self.state.lock(self.root, blocking=True):
-                result = self.releases.check(self.root, force=force)
+                result = self.releases.check(self.root, force=force, identities=identities)
         return result, transport.requests
 
     def seed(self):
@@ -279,17 +279,38 @@ class ReleaseTests(unittest.TestCase):
         self.seed()
         transport = Transport([Response(PAYLOAD), Response({'object': {'type': 'commit', 'sha': COMMIT}})])
         with patch.object(self.releases.urllib.request, 'build_opener', return_value=transport):
-            self.assertEqual(self.releases.validate_exact(RECORD), RECORD)
+            self.assertEqual(self.releases.validate_exact(RECORD, self.root), RECORD)
         self.assertEqual(transport.requests[0][0].full_url, 'https://api.github.com/repos/ruohao1/dotfiles/releases/12')
         for payload in [dict(PAYLOAD, id=13), dict(PAYLOAD, tag_name='v1.2.4'), dict(PAYLOAD, draft=True)]:
             transport = Transport([Response(payload)])
             with patch.object(self.releases.urllib.request, 'build_opener', return_value=transport):
                 with self.assertRaises(self.releases.ReleaseConflict):
-                    self.releases.validate_exact(RECORD)
+                    self.releases.validate_exact(RECORD, self.root)
         transport = Transport([URLError('offline')])
         with patch.object(self.releases.urllib.request, 'build_opener', return_value=transport):
             with self.assertRaises(self.releases.ReleaseError):
-                self.releases.validate_exact(RECORD)
+                self.releases.validate_exact(RECORD, self.root)
+
+    def test_exact_validation_respects_and_persists_server_backoff(self):
+        self.seed()
+        for status, during_tag in [(429, False), (403, True)]:
+            self.now += 200000
+            responses = [Response(PAYLOAD)] if during_tag else []
+            responses.append(Response(b'', status, {'Retry-After': '120000'}))
+            transport = Transport(responses)
+            with patch.object(self.releases.urllib.request, 'build_opener', return_value=transport):
+                with self.assertRaises(self.releases.ReleaseError):
+                    self.releases.validate_exact(RECORD, self.root)
+            cache = self.releases.read_cache(self.root)
+            self.assertEqual(cache['release'], RECORD)
+            self.assertEqual(cache['lastAttempt'], self.now)
+            self.assertEqual(cache['rateLimitUntil'], self.now + 120000)
+            self.assertEqual(cache['nextAttempt'], self.now + 120000)
+            blocked = Transport([])
+            with patch.object(self.releases.urllib.request, 'build_opener', return_value=blocked):
+                with self.assertRaisesRegex(self.releases.ReleaseError, 'backoff'):
+                    self.releases.validate_exact(RECORD, self.root)
+            self.assertEqual(blocked.requests, [])
 
     def test_historical_release_identity_survives_latest_moving_away_and_back(self):
         self.seed()
@@ -305,6 +326,23 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(self.state.read_json(self.root / 'cache.json')['release'], record)
         history = self.state.read_json(self.root / 'identities.json')
         self.assertEqual(history['records'], [RECORD, record])
+
+    def test_first_check_rejects_changes_to_installed_and_retained_identities(self):
+        older = dict(RECORD, releaseId=11, version='v1.0.0', commit='c' * 40)
+        for payload, commit in [(dict(PAYLOAD, tag_name='v2.0.0'), OTHER),
+                                (PAYLOAD, OTHER), (dict(PAYLOAD, id=13), COMMIT),
+                                (dict(PAYLOAD, id=11, tag_name='v3.0.0'), OTHER)]:
+            with self.subTest(payload=payload), self.assertRaises(self.releases.ReleaseConflict):
+                self.run_check([Response(payload), Response({'object': {'type': 'commit', 'sha': commit}})],
+                               force=True, identities=[RECORD, older, None])
+        self.assertEqual(self.state.read_json(self.root / 'identities.json')['records'], [RECORD, older])
+
+    def test_known_identity_collision_in_cache_refuses_even_during_backoff(self):
+        cache = self.releases._empty_cache()
+        cache.update(release=dict(RECORD, version='v2.0.0'), rateLimitUntil=self.now + 1000)
+        self.state.write_json(self.root / 'cache.json', cache)
+        with self.assertRaises(self.releases.ReleaseConflict):
+            self.run_check([], identities=[RECORD])
 
     def test_corrupt_history_cannot_reset_known_identity_or_trigger_fetch(self):
         self.seed()

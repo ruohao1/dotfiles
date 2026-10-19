@@ -632,7 +632,8 @@ def restore_legacy(home, transaction, *, runtime=None):
                 chain.append(journal)
                 selected = journal.data.get('parentTransaction')
             if transaction not in [item.data['transactionId'] for item in chain]:
-                raise Conflict('another transaction owns this home')
+                _cancel_unpublished_child(Journal(home, transaction), chain[0], owner, lock, runtime)
+                return
         for journal in chain:
             if journal.data['phase'] != 'restored':
                 _restore_frame(journal, lock, runtime)
@@ -642,6 +643,41 @@ def restore_legacy(home, transaction, *, runtime=None):
             if owner['transactionId'] not in [item.data['transactionId'] for item in chain]:
                 raise Conflict('ownership changed during recovery')
             (ownership_root(home) / 'owner.json').unlink()
+
+
+def _cancel_unpublished_child(child, parent, owner, lock, runtime):
+    # The initial journal save can precede ownership publication. Reversing
+    # that frame must not restore or stop the still-active parent deployment.
+    if (owner['phase'] != 'home-manager' or parent.data['phase'] != 'active'
+            or parent.data.get('rollback', {}).get('state') == 'intent'
+            or owner['journalPath'] != str(parent.path)
+            or owner['manifestFingerprint'] != parent.data['plan']['manifestFingerprint']
+            or owner['selectedGeneration'] != parent.data['selectedGeneration']
+            or child.data.get('parentTransaction') != owner['transactionId']
+            or child.data['plan'].get('ownership') != owner
+            or child.data['phase'] not in ['prepared', 'restored']
+            or child.data['steps'] not in [{}, {'publish-transferring': 'intent'}]
+            or child.data.get('rollback')
+            or child.data['selectedGeneration'] != child.data['plan']['selectedGeneration']
+            or child.data['nativePackagesBefore'] != parent.data['nativePackagesBefore']):
+        raise Conflict('another transaction owns this home; child is not provably unpublished')
+    for record in child.data['records']:
+        path, backup = Path(record['path']), Path(record['backupPath'])
+        check_profile_parents(path, child.home)
+        check_profile_parents(backup, child.home)
+        if leaf_state(path) != record['state'] or leaf_state(backup)['type'] != 'absent':
+            raise Conflict('unpublished child files changed; retaining recovery guard')
+    for text, before in child.data['profilesBefore'].items():
+        check_profile_parents(Path(text), child.home)
+        if leaf_state(text) != before:
+            raise Conflict('unpublished child profile changed; retaining recovery guard')
+    verify_transaction(parent, parent.data['generations'][owner['selectedGeneration']], runtime)
+    lock.recheck()
+    if read_owner(child.home) != owner:
+        raise Conflict('ownership changed during unpublished child recovery')
+    if child.data['phase'] != 'restored':
+        child.data['phase'] = 'restored'
+        child.save()
 
 
 def archive_profile(journal, path, current, label):

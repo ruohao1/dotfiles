@@ -80,10 +80,11 @@ def main(argv=None):
         with state.lock(root, blocking=not tmux) as acquired:
             if not acquired:
                 return 0
+            identities = [observed.get('release'), *[item['release'] for item in observed['retained']]]
             if tmux:
-                print(_badge(observed, releases.check(root)), flush=True)
+                print(_badge(observed, releases.check(root, identities=identities)), flush=True)
             elif args.command == 'check':
-                releases.check(root, force=True)
+                releases.check(root, force=True, identities=identities)
                 _status(root, observed)
             elif args.command == 'install':
                 return deployment.install(root)
@@ -92,7 +93,9 @@ def main(argv=None):
         return 0
     except (UpdateError, Conflict, OSError, ValueError, KeyError, TypeError,
             subprocess.TimeoutExpired, InterruptedError, KeyboardInterrupt) as error:
-        if not tmux:
+        if tmux:
+            print('', flush=True)
+        else:
             print('dotfiles-update: '+str(error), file=sys.stderr)
         return 1
 

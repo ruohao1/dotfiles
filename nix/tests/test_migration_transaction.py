@@ -98,6 +98,93 @@ class TransactionTests(unittest.TestCase):
         module.restore_legacy(self.home, self.plan['transactionId'], runtime=self.runtime)
         self.assertEqual(self.target.read_text(), 'reviewed configuration\n')
 
+    def unpublished_update(self, *, publish_intent=False):
+        """Crash after a real child journal save while the active owner stays A."""
+        module = self.module()
+        module.apply(self.plan, self.manifest, runtime=self.runtime)
+        owner = read_owner(self.home)
+        source = self.root/'updated-source'
+        source.write_text('reviewed updated configuration\n')
+        generation = '/nix/store/' + '1'*32 + '-updated-generation'
+        real_generation = self.root/'updated-generation'
+        real_generation.mkdir()
+        from migration import plan as inspection
+        original = inspection.fingerprint
+        patch.object(inspection, 'fingerprint', side_effect=lambda path:
+                     original(real_generation if str(path) == generation else path)).start()
+        profile = self.home/'.local/state/nix/profiles/home-manager'
+        manifest = dict(self.manifest, activationPackage=generation, profilePaths=[str(profile)],
+                        files=[dict(self.manifest['files'][0], source=str(source))])
+        plan = inspect(manifest, self.home)
+        self.assertEqual(plan['conflicts'], [])
+        save = module.Journal.save
+        def interrupt(journal):
+            result = save(journal)
+            boundary = {'publish-transferring': 'intent'} if publish_intent else {}
+            if journal.data['transactionId'] == plan['transactionId'] and journal.data['steps'] == boundary:
+                raise InterruptedError('unpublished prepared child')
+            return result
+        with patch.object(module.Journal, 'save', new=interrupt), self.assertRaises(InterruptedError):
+            module.apply(plan, manifest, runtime=self.runtime)
+        self.assertEqual(read_owner(self.home), owner)
+        return owner, plan, manifest
+
+    def test_unpublished_child_recovery_preserves_active_parent_and_is_idempotent(self):
+        module = self.module()
+        for publish_intent in [False, True]:
+            with self.subTest(publish_intent=publish_intent):
+                self.setUp()
+                owner, plan, manifest = self.unpublished_update(publish_intent=publish_intent)
+                owner_path = self.home/'.local/state/dotfiles-ownership/owner.json'
+                owner_bytes = owner_path.read_bytes()
+                with self.assertRaises(Conflict):
+                    module.apply(plan, manifest, runtime=self.runtime)
+                with patch.object(module.Services, 'stop', side_effect=AssertionError('stopped active parent service')):
+                    module.restore_legacy(self.home, plan['transactionId'], runtime=self.runtime)
+                    module.restore_legacy(self.home, plan['transactionId'], runtime=self.runtime)
+                self.assertEqual(owner_path.read_bytes(), owner_bytes)
+                self.assertEqual(read_owner(self.home), owner)
+                self.assertEqual(self.target.resolve(), self.source)
+                self.assertEqual(self.runtime.calls, [str(self.generation)])
+                self.assertEqual(module.Journal(self.home, plan['transactionId']).data['phase'], 'restored')
+                self.assertEqual(module.Journal(self.home, owner['transactionId']).data['phase'], 'active')
+                self.runtime.manifest = manifest
+                fresh = inspect(manifest, self.home)
+                self.assertEqual(fresh['conflicts'], [])
+                module.apply(fresh, manifest, runtime=self.runtime)
+                self.assertEqual(self.target.resolve(), Path(manifest['files'][0]['source']))
+
+    def test_unpublished_child_recovery_refuses_unproven_lineage_or_effects(self):
+        module = self.module()
+        for drift in ['parent', 'owner', 'phase', 'step', 'published-step', 'target', 'backup', 'profile', 'parent-phase']:
+            with self.subTest(drift=drift):
+                self.setUp()
+                owner, plan, manifest = self.unpublished_update()
+                child = module.Journal(self.home, plan['transactionId'])
+                if drift == 'parent': child.data['parentTransaction'] = 'f'*32
+                elif drift == 'owner': child.data['plan']['ownership'] = dict(owner, transactionId='f'*32)
+                elif drift == 'phase': child.data['phase'] = 'active'
+                elif drift == 'step': child.data['steps'] = {'archive-0': 'intent'}
+                elif drift == 'published-step': child.data['steps'] = {'publish-transferring': 'complete'}
+                elif drift == 'target':
+                    self.target.unlink(); self.target.write_text('later local edit')
+                elif drift == 'backup':
+                    backup = Path(child.data['records'][0]['backupPath'])
+                    backup.parent.mkdir(parents=True)
+                    backup.write_text('unexplained retained original')
+                elif drift == 'profile':
+                    profile = Path(manifest['profilePaths'][0])
+                    profile.parent.mkdir(parents=True)
+                    profile.symlink_to('/nix/store/unreviewed-generation')
+                else:
+                    parent = module.Journal(self.home, owner['transactionId'])
+                    parent.data['phase'] = 'prepared'; parent.save()
+                child.save()
+                with self.assertRaises(Conflict):
+                    module.restore_legacy(self.home, plan['transactionId'], runtime=self.runtime)
+                self.assertEqual(read_owner(self.home), owner)
+                if drift == 'target': self.assertEqual(self.target.read_text(), 'later local edit')
+
     def test_stale_and_edited_plan_never_overwrite_newer_content(self):
         module = self.module()
         self.target.write_text('new local behavior')

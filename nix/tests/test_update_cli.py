@@ -85,7 +85,7 @@ class Commands(unittest.TestCase):
         result, exact = self.install()
         self.assertEqual(result, 0)
         self.assertEqual([call[0] for call in self.calls], ['plan', 'apply'])
-        self.assertEqual([call.args[0] for call in exact], [RELEASE, RELEASE])
+        self.assertEqual([call.args for call in exact], [(RELEASE, self.state), (RELEASE, self.state)])
         self.assertEqual(state.read_json(self.directory/'recovery.json')['release'], RELEASE)
 
     def test_conflicts_and_changed_source_refuse_apply(self):
@@ -130,6 +130,40 @@ class Commands(unittest.TestCase):
         self.assertEqual(self.install(exact_effect=[RELEASE, UpdateError('release moved')])[0], 1)
         self.assertFalse(any(call[0] == 'apply' for call in self.calls))
 
+    def test_install_during_server_backoff_never_fetches_or_prepares(self):
+        cli = self.cli()
+        cache = cli.releases._empty_cache()
+        cache.update(release=RELEASE, rateLimitUntil=cli.releases.time.time() + 120000)
+        state.write_json(self.state/'cache.json', cache)
+        with patch.object(cli.sys.stdin, 'isatty', return_value=True), \
+             patch.object(deployment, 'read_installed', return_value=dict(state='installed', release=OLD,
+                 generation='/nix/store/old', retained=[])), \
+             patch.object(deployment, 'prepare') as prepare, \
+             patch.object(cli.releases.urllib.request, 'build_opener') as network:
+            self.assertEqual(cli.main(['install']), 1)
+        network.assert_not_called()
+        prepare.assert_not_called()
+
+    def test_discovery_remembers_installed_and_retained_release_identity(self):
+        cli = self.cli()
+        for command in (['install'], ['check'], ['status', '--tmux']):
+            cache = cli.releases._empty_cache()
+            cache.update(release=dict(OLD, version='v2.0.0'),
+                         rateLimitUntil=cli.releases.time.time() + 120000)
+            state.write_json(self.state/'cache.json', cache)
+            with self.subTest(command=command), \
+                 patch.object(cli.sys.stdin, 'isatty', return_value=True), \
+                 patch.object(deployment, 'read_installed', return_value=dict(state='installed', release=RELEASE,
+                     generation='/nix/store/current', retained=[dict(generation='/nix/store/old', release=OLD)])), \
+                 patch.object(deployment, 'prepare') as prepare, \
+                 patch.object(cli.releases.urllib.request, 'build_opener') as network, \
+                 patch('sys.stdout', new_callable=io.StringIO) as output:
+                self.assertEqual(cli.main(command), 1)
+                if command == ['status', '--tmux']:
+                    self.assertEqual(output.getvalue().splitlines()[-1], '')
+            network.assert_not_called()
+            prepare.assert_not_called()
+
     def test_rollback_uses_retained_executor_offline_and_rejects_unknown_target(self):
         self.assertEqual(self.install()[0], 0)
         cli = self.cli()
@@ -157,7 +191,7 @@ class Commands(unittest.TestCase):
     def test_tmux_prints_cached_notice_before_refresh(self):
         cli = self.cli()
         state.write_json(self.state/'cache.json', dict(cli.releases.read_cache(self.state), release=RELEASE))
-        with patch.object(deployment, 'read_installed', return_value=dict(state='installed', release=OLD)), \
+        with patch.object(deployment, 'read_installed', return_value=dict(state='installed', release=OLD, retained=[])), \
              patch('sys.stdout', new_callable=io.StringIO) as output:
             def refresh(*args, **kwargs):
                 self.assertEqual(output.getvalue().strip(), 'update v1.2.3')
