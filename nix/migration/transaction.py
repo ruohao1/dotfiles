@@ -405,6 +405,7 @@ def verify_resumed_native(journal, lock, runtime):
         raise Conflict('native retry provider PATH or user identity changed')
     transitions = {item['command']: item for item in plan.get('providerTransitions', [])}
     directions = {command: verify_provider_transition(item, journal, runtime) for command, item in transitions.items()}
+    introduced_routes = {}
     for provider in plan['providers']:
         if fingerprint(provider['executable']) != provider['state']:
             raise Conflict('reviewed executable changed before resumed handoff')
@@ -415,11 +416,11 @@ def verify_resumed_native(journal, lock, runtime):
             raise Conflict('caller executable no longer resolves to reviewed provider')
         if selected == provider['selectedExecutable']:
             continue
-        # Installing the reviewed package can make a previously absent caller
-        # command available. Only the journal-owned profile may introduce it.
+        # Activation can introduce the canonical route for an absent command or
+        # one previously selected directly from its exact pinned provider.
         profile = home / '.nix-profile'
         generation = Path(manifest['activationPackage'])
-        if (provider['selectedExecutable'] is not None
+        if (provider['selectedExecutable'] not in [None, provider['executable']]
                 or journal.data['steps'].get('activate') not in ['intent', 'complete']
                 or str(profile) not in journal.data['profilesBefore']
                 or selected != str(profile / 'bin' / provider['command'])):
@@ -429,6 +430,7 @@ def verify_resumed_native(journal, lock, runtime):
             raise Conflict('new caller provider does not select reviewed generation')
         check_package_selection(runtime.profile_packages(profile), journal.data['nativePackagesBefore'],
                                 {str((generation / 'home-path').resolve())})
+        introduced_routes[selected] = provider
     owned = {str(home / item['target']): item for item in normalized_files(manifest)}
     originals = {item['path']: item for item in plan['files']}
     records = {item['path']: (index, item) for index, item in enumerate(journal.data['records'])}
@@ -497,6 +499,26 @@ def verify_resumed_native(journal, lock, runtime):
     for old, new in zip(previous, current):
         config_route(old)
         config_route(new)
+        for route, provider in introduced_routes.items():
+            if route not in new['observations'] or route in old['observations']:
+                continue
+            pinned = provider['executable']
+            def observed(path):
+                info = Path(path).lstat()
+                return dict(fingerprint(path), device=info.st_dev, inode=info.st_ino)
+            # uv's collector observes its caller route separately from the
+            # pinned runtime probe. Reconcile only the proven alias, retaining
+            # original provider evidence (or recorded absence) and queries.
+            before = old['observations'].get(pinned)
+            if (fingerprint(pinned) != provider['state']
+                    or (before is None and provider['selectedExecutable'] is not None)
+                    or (before is not None and before != observed(pinned))
+                    or new['observations'][route] != observed(route)
+                    or (pinned in new['observations'] and new['observations'][pinned] != before)):
+                raise Conflict('native canonical provider route differs from reviewed executable')
+            new['observations'].pop(route)
+            if before is not None:
+                new['observations'][pinned] = before
         for path in old['observations'].keys() | new['observations'].keys():
             if old['observations'].get(path) == new['observations'].get(path):
                 continue

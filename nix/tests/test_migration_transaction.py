@@ -1271,6 +1271,164 @@ class TransactionTests(unittest.TestCase):
                     self.assertIn('provider-shadowed', [item['code'] for item in plan['conflicts']])
                     self.assertEqual(plan.get('providerTransitions', []), [])
 
+    def adoption_routes(self, *, previous_alias=False, previous_absent=False):
+        """Initial profile introduction, retaining real collector/provider I/O."""
+        module = self.module()
+        from migration.prerequisites import inspect_native
+        profile = self.home / '.nix-profile'
+        selected = self.home / '.local/state/nix/profiles/home-manager'
+        selected.parent.mkdir(parents=True)
+        provider = self.root / 'pinned-provider'
+        (provider / 'bin').mkdir(parents=True)
+        uv = provider / 'bin/uv'
+        uv.write_text('#!/bin/sh\nprintf "uv 1.0.0\\n"\n'); uv.chmod(0o755)
+        result = self.root / 'probe-result'
+        result.write_text('{"parquet":{"ok":true},"data_query":{"duckdb":{"ok":true}}}')
+        nvim = provider / 'bin/nvim'
+        nvim.write_text('#!/bin/sh\n/bin/cat ' + str(result) + '\n'); nvim.chmod(0o755)
+        caller_uv = uv
+        if previous_alias:
+            caller_uv = self.root / 'foreign-bin/uv'
+            caller_uv.parent.mkdir()
+            caller_uv.symlink_to(uv)
+        self.manifest['profilePaths'] = [str(profile), str(selected)]
+        self.manifest['commandRequirements'] = [{'command': command, 'provider': str(provider)} for command in ['uv', 'nvim']]
+        self.manifest['nativeDependencies'] = [{'id': 'uv-visidata'}]
+        actual_generation = self.root / 'generation'
+        resolve = Path.resolve
+        def resolve_selector(path, *args, **kwargs):
+            actual = resolve(path, *args, **kwargs)
+            return self.generation if path == selected and actual == actual_generation else actual
+        patch.object(Path, 'resolve', new=resolve_selector).start()
+        activate = self.runtime.activate
+        def install(generation):
+            activate(generation)
+            for path, target in [(profile, provider), (selected, actual_generation)]:
+                if path.is_symlink(): path.unlink()
+                path.symlink_to(target)
+        def packages(path):
+            if not profile.is_symlink(): return []
+            return [{'name': 'home-manager-path', 'paths': [str(selected.resolve() / 'home-path')],
+                     'active': True, 'priority': None}]
+        def collector(manifest, home):
+            probe = dict(manifest, files=[{'target': '.config/nvim/lua/data_query/tool.lua',
+                         'source': '/nix/store/fixture-native-runtime/lua/data_query/tool.lua'}])
+            return inspect_native(probe, home)
+        patch.object(self.runtime, 'activate', side_effect=install).start()
+        patch.object(self.runtime, 'profile_packages', side_effect=packages).start()
+        patch.object(self.runtime, 'selected_generation', side_effect=lambda manifest:
+                     module.Runtime.selected_generation(self.runtime, manifest)).start()
+        patch('migration.prerequisites.inspect_native', side_effect=collector).start()
+        caller = [str(profile / 'bin'), str(self.root / 'foreign-bin')]
+        if not previous_absent: caller.append(str(provider / 'bin'))
+        patch.dict(os.environ, {'DOTFILES_CALLER_PATH': os.pathsep.join(caller)}).start()
+        self.plan = inspect(self.manifest, self.home)
+        self.assertEqual(self.plan['conflicts'], [])
+        self.assertEqual(self.plan['providerTransitions'], [])
+        self.assertEqual(self.plan['providers'][0]['selectedExecutable'], None if previous_absent else str(caller_uv))
+        if previous_absent:
+            self.assertNotIn(str(uv), self.plan['nativePrerequisites'][0]['observations'])
+        else:
+            self.assertIn(str(caller_uv), self.plan['nativePrerequisites'][0]['observations'])
+        return profile, selected, provider, result
+
+    def exercise_adoption_routes(self, *, previous_absent=False):
+        module = self.module()
+        for boundary in ['none', 'publish-transferring', 'activate-before-action',
+                         'activate-after-action', 'activate', 'publish-active']:
+            with self.subTest(boundary=boundary):
+                patch.stopall()
+                self.setUp()
+                profile, selected, provider, result = self.adoption_routes(previous_absent=previous_absent)
+                step = module.Journal.step
+                def interrupt(journal, name, action):
+                    if name == 'activate' and boundary in ['activate-before-action', 'activate-after-action']:
+                        journal.data['steps'][name] = 'intent'; journal.save()
+                        if boundary == 'activate-after-action': action()
+                        raise InterruptedError('initial adoption activation intent')
+                    value = step(journal, name, action)
+                    if name == boundary: raise InterruptedError('initial adoption boundary')
+                    return value
+                if boundary != 'none':
+                    with patch.object(module.Journal, 'step', new=interrupt), self.assertRaises(InterruptedError):
+                        module.apply(self.plan, self.manifest, runtime=self.runtime)
+                module.apply(self.plan, self.manifest, runtime=self.runtime)
+                module.apply(self.plan, self.manifest, runtime=self.runtime)
+                self.assertEqual(read_owner(self.home)['phase'], 'home-manager')
+                self.assertEqual(self.runtime.calls, [str(self.generation)] * (2 if boundary == 'activate-after-action' else 1))
+                saved = module.Journal(self.home, self.plan['transactionId']).data['plan']
+                self.assertEqual(saved, self.plan, 'reconciliation must retain exact preview evidence')
+                self.assertEqual((profile / 'bin/uv').resolve(), provider / 'bin/uv')
+
+    def test_initial_adoption_reconciles_same_provider_route_and_real_uv_observations(self):
+        self.exercise_adoption_routes()
+
+    def test_initial_adoption_reconciles_absent_uv_route_with_real_collector(self):
+        self.exercise_adoption_routes(previous_absent=True)
+
+    def test_initial_adoption_route_reconciliation_refuses_unproven_changes(self):
+        module = self.module()
+        drifts = ['early', 'provider', 'provider-inode', 'previous-alias', 'foreign-route', 'missing', 'generation', 'package',
+                  'native-package', 'undeclared-profile', 'caller-path', 'runtime-path', 'uid', 'query', 'binding', 'observation']
+        cases = [(absent, drift) for absent in [False, True] for drift in drifts
+                 if not (absent and drift in ['previous-alias', 'provider-inode'])]
+        for previous_absent, drift in cases:
+            with self.subTest(previous_absent=previous_absent, drift=drift):
+                patch.stopall()
+                self.setUp()
+                profile, selected, provider, result = self.adoption_routes(
+                    previous_alias=drift == 'previous-alias', previous_absent=previous_absent)
+                boundary = 'publish-transferring' if drift == 'early' else 'activate'
+                step = module.Journal.step
+                def interrupt(journal, name, action):
+                    value = step(journal, name, action)
+                    if name == boundary: raise InterruptedError('adoption drift boundary')
+                    return value
+                with patch.object(module.Journal, 'step', new=interrupt), self.assertRaises(InterruptedError):
+                    module.apply(self.plan, self.manifest, runtime=self.runtime)
+                if drift == 'early':
+                    profile.symlink_to(provider)
+                    selected.symlink_to(self.root / 'generation')
+                elif drift == 'provider': (provider / 'bin/uv').write_text('#!/bin/sh\nexit 9\n')
+                elif drift == 'provider-inode':
+                    uv = provider / 'bin/uv'
+                    replacement = provider / 'bin/replacement'
+                    replacement.write_bytes(uv.read_bytes()); replacement.chmod(0o755)
+                    replacement.replace(uv)
+                elif drift == 'foreign-route':
+                    foreign = self.root / 'foreign-bin'; foreign.mkdir()
+                    (foreign / 'uv').symlink_to(provider / 'bin/uv')
+                    empty = self.root / 'empty-package'; empty.mkdir()
+                    profile.unlink(); profile.symlink_to(empty)
+                elif drift == 'missing': (provider / 'bin/uv').unlink()
+                elif drift == 'generation': selected.unlink(); selected.symlink_to(self.root)
+                elif drift in ['package', 'native-package']:
+                    entry = {'name': 'home-manager-path' if drift == 'package' else 'native',
+                             'paths': ['/nix/store/unreviewed-profile'], 'active': True, 'priority': None}
+                    patch.object(self.runtime, 'profile_packages', return_value=[entry]).start()
+                elif drift == 'undeclared-profile':
+                    journal = module.Journal(self.home, self.plan['transactionId'])
+                    journal.data['profilesBefore'].pop(str(profile)); journal.save()
+                elif drift == 'caller-path': os.environ['DOTFILES_CALLER_PATH'] += os.pathsep + str(self.root)
+                elif drift == 'runtime-path': os.environ['PATH'] += os.pathsep + str(self.root)
+                elif drift == 'uid':
+                    identity = patch.object(module.os, 'getuid', return_value=os.getuid() + 1)
+                    identity.start()
+                elif drift == 'query': result.write_text('{"parquet":{"ok":true,"changed":true},"data_query":{"duckdb":{"ok":true}}}')
+                elif drift != 'previous-alias':
+                    from migration import prerequisites
+                    collector = prerequisites.inspect_native
+                    def changed(manifest, home):
+                        records = collector(manifest, home)
+                        if drift == 'binding': records[0]['binding']['collector'] = 'changed'
+                        else: records[0]['observations'][str(profile / 'bin/uv')]['inode'] += 1
+                        return records
+                    patch.object(prerequisites, 'inspect_native', side_effect=changed).start()
+                with self.assertRaises(Conflict):
+                    module.apply(self.plan, self.manifest, runtime=self.runtime)
+                if drift == 'uid': identity.stop()
+                self.assertEqual(read_owner(self.home)['phase'], 'transferring')
+
     def test_newly_available_caller_command_requires_exact_owned_profile_and_provider(self):
         module = self.module()
         for scenario in ['reviewed', 'foreign-command', 'foreign-profile', 'wrong-generation', 'undeclared-profile']:
