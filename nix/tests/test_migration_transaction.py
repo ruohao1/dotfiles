@@ -1285,7 +1285,7 @@ class TransactionTests(unittest.TestCase):
         result = self.root / 'probe-result'
         result.write_text('{"parquet":{"ok":true},"data_query":{"duckdb":{"ok":true}}}')
         nvim = provider / 'bin/nvim'
-        nvim.write_text('#!/bin/sh\n/bin/cat ' + str(result) + '\n'); nvim.chmod(0o755)
+        nvim.write_text(f'#!{sys.executable}\nfrom pathlib import Path\nprint(Path({str(result)!r}).read_text())\n'); nvim.chmod(0o755)
         caller_uv = uv
         if previous_alias:
             caller_uv = self.root / 'foreign-bin/uv'
