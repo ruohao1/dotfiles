@@ -40,4 +40,5 @@ jobs:
               python3 -B -m unittest discover -v -s nix/tests -p test_ownership.py
               python3 -B -m unittest discover -v -s nix/tests -p test_checker_clipboard.py
               python3 -B -m unittest discover -v -s nix/tests -p "test_migration_*.py"
+              python3 -B -m unittest discover -v -s nix/tests -p "test_update_*.py"
             '

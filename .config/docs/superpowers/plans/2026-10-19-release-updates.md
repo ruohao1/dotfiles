@@ -10,7 +10,7 @@
 
 **Spec:** [Release update design](../specs/2026-10-19-release-updates-design.md).
 
-**Status:** Draft for review; no implementation started. Base main `f758c1f540f850741ca52772f8c369fc7fa31da9`; branch `agent/release-updates-20261019`. Keep both documents in the implementation PR; no standalone plan PR.
+**Status:** Approved by the user’s “continue”; implementation and isolated validation are in progress. Base main `f758c1f540f850741ca52772f8c369fc7fa31da9`; branch `agent/release-updates-20261019`. Keep both documents in the implementation PR; no standalone plan PR.
 
 ## Global Constraints
 
@@ -189,6 +189,19 @@ Tasks 1 and 2 can be developed independently. Task 3 uses both; Task 4 joins the
 
 Coverage maps as follows: host preservation/executor/identity → Task 1; discovery/state/offline behavior → Task 2; immutable candidate → Task 3; confirmation/status/recovery → Task 4; package/notification/no target growth → Task 5; platform evidence/runbook/CI → Task 6.
 
-No product code, tests, installation, VM, settings change or release publication was executed to create this plan. Nix is unavailable in the current shell; pinned-Nix evaluation and runtime assertions above are future implementation gates, not current evidence.
+The original planning pass changed no product code or runtime state. The approved implementation now uses an isolated retained Nix builder; the evidence below supersedes the planning-only status. No live-home activation, release publication or repository-setting change is authorized by this implementation task.
 
-Recommended execution: one implementer for the coupled deployment work, with independent review of the final branch. Discovery and focused reviews can run in parallel. Begin implementation only after the user reviews this plan.
+Execution: the coordinator owns coupled candidate/CLI integration; delegated tasks cover identity, release/state checks, owned-provider transitions, packaging and independent reviews. The user approved implementation before these tasks began. The design and plan stay with the implementation branch.
+
+
+## Implementation evidence — 2026-10-19
+
+- Tracking: coordinator [ISQ-486](https://linear.app/isqrd/issue/ISQ-486); foundations ISQ-487/488/489; packaging ISQ-492; real lock fixture ISQ-493; disposable Linux integration ISQ-494; reviews ISQ-495/496.
+- Isolated source run: 211 tests, 19 skips, no failures; the skips are recorded unavailable Nix/prepared-native cases. Later affected tests are rerun after review fixes. Native bootstrap: all 561 regressions pass, with its source tree unchanged.
+- Real identity suite: 6 tests pass. Release identity changes the generation without changing targets or stateVersion; Git/path evaluation agrees; the rooted executor retains consumer, dotfiles, nixpkgs and Home Manager evaluation sources.
+- Real lock fixture passes with repository-pinned Nix 2.34.7 and builder Nix 2.35.2. It proves exact targeted and transitive revisions, untouched original/unrelated inputs, paths with spaces, immutable reevaluation and executable/source GC roots. Nix 2.35’s cold metadata exposes an unmaterialized source path: preparation now consumes the returned lock graph.
+- Linux files and terminal checks build; all four platform manifests/package derivations evaluate. Actual attached tmux tests cover cached output before HTTP completes, widths, missing/malformed helper output, editor/keytable cues and detached clients. The full package contract caught a helper version-format mismatch, now corrected and awaiting its build rerun.
+- Review fixes include dependency-node semantics, realized executor validation, interrupted rollback instructions, desktop/SSH evidence preservation, and retained evaluation-source closure. State/transport review additionally covers truncated HTTP responses and restrictive umask handling.
+- The Linux release integration remains a required gate: real uv 0.11.21 → 0.11.22 → rollback, native runtime preservation and interrupted install recovery. It substitutes remote discovery and candidate preparation with immutable offline projections; separate real Git/Nix tests cover preparation. Public release transport and native macOS/ARM activation are not claimed by that fixture.
+
+Current local evidence is retained under `/tmp/dotfiles-updates-20261019`; immutable commits and the final gate result will be recorded here before delivery. No cleanup, live adoption, publication, push or merge has run.

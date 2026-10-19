@@ -362,6 +362,38 @@ def validate_activation_inputs(journal, runtime):
     validate_profile_inputs(journal, runtime, journal.data['generations'], allow_missing=True)
 
 
+def verify_provider_transition(transition, journal, runtime):
+    """Prove only the old/new selection authorized by activation's journal phase."""
+    plan, home = journal.data['plan'], journal.home
+    profile = home / '.nix-profile'
+    command = transition['command']
+    if transition['profile'] != str(profile) or str(profile) not in journal.data['profilesBefore']:
+        raise Conflict('provider transition does not name the owned canonical profile')
+    for prefix in ['from', 'to']:
+        generation = transition[prefix + 'Generation']
+        manifest = journal.data['generations'].get(generation)
+        requirement = next((item for item in (manifest or {}).get('commandRequirements', [])
+                            if item['command'] == command and 'provider' in item), None)
+        if (requirement is None or str(profile) not in manifest['profilePaths']
+                or str((Path(requirement['provider']) / 'bin' / command).resolve(strict=True)) != transition[prefix + 'Executable']
+                or fingerprint(transition[prefix + 'Executable']) != transition[prefix + 'State']):
+            raise Conflict('reviewed provider transition changed')
+    if transition['toGeneration'] != journal.data['manifest']['activationPackage']:
+        raise Conflict('provider transition selects an unreviewed generation')
+    phase = journal.data['steps'].get('activate')
+    allowed = (['from', 'to'] if phase == 'intent' else ['to'] if phase == 'complete' else ['from'])
+    generation = runtime.selected_generation(journal.data['manifest'])
+    direction = next((prefix for prefix in allowed if str(Path(transition[prefix + 'Generation']).resolve()) == generation), None)
+    selected = shutil.which(command, path=plan['providerPath'])
+    if (direction is None or selected != str(profile / 'bin' / command)
+            or str(Path(selected).resolve(strict=True)) != transition[direction + 'Executable']):
+        raise Conflict('caller provider transition differs from the proven activation phase')
+    check_profile_parents(profile, home)
+    check_package_selection(runtime.profile_packages(profile), journal.data['nativePackagesBefore'],
+                            {str((Path(generation) / 'home-path').resolve())})
+    return direction
+
+
 def verify_resumed_native(journal, lock, runtime):
     """Reobserve readiness; reconcile only journal-proven deployment effects."""
     from .prerequisites import inspect_native
@@ -371,9 +403,13 @@ def verify_resumed_native(journal, lock, runtime):
     if (plan['providerPath'] != caller or plan['runtimePath'] != os.environ.get('PATH', os.defpath)
             or plan['uid'] != os.getuid()):
         raise Conflict('native retry provider PATH or user identity changed')
+    transitions = {item['command']: item for item in plan.get('providerTransitions', [])}
+    directions = {command: verify_provider_transition(item, journal, runtime) for command, item in transitions.items()}
     for provider in plan['providers']:
         if fingerprint(provider['executable']) != provider['state']:
             raise Conflict('reviewed executable changed before resumed handoff')
+        if provider['command'] in transitions:
+            continue
         selected = shutil.which(provider['command'], path=caller)
         if selected is not None and Path(selected).resolve(strict=True) != Path(provider['executable']).resolve(strict=True):
             raise Conflict('caller executable no longer resolves to reviewed provider')
@@ -463,6 +499,16 @@ def verify_resumed_native(journal, lock, runtime):
         config_route(new)
         for path in old['observations'].keys() | new['observations'].keys():
             if old['observations'].get(path) == new['observations'].get(path):
+                continue
+            transition = next((item for command, item in transitions.items()
+                               if directions[command] == 'to' and path == str(Path(item['profile']) / 'bin' / command)), None)
+            if transition is not None and path in old['observations'] and path in new['observations']:
+                before = {key: value for key, value in old['observations'][path].items() if key not in ['device', 'inode']}
+                info = Path(path).lstat()
+                after = dict(fingerprint(path), device=info.st_dev, inode=info.st_ino)
+                if before != plan['evidence'][path] or new['observations'][path] != after:
+                    raise Conflict('native owned-provider observation differs from reviewed transition')
+                new['observations'][path] = old['observations'][path]
                 continue
             if path not in owned or path not in old['observations'] or path not in new['observations']:
                 raise Conflict('native provider or session observation changed: ' + path)

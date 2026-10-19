@@ -1,6 +1,6 @@
 # Nix release detection and confirmed updates
 
-Status: draft for review, 2026-10-19. The user approved Nix-first scope; implementation and installation have not started.
+Status: approved for implementation, 2026-10-19. Isolated implementation/validation is underway; live installation and release publication are separate tasks.
 Tracking: [ISQ-471](https://linear.app/isqrd/issue/ISQ-471) / [ISQ-484](https://linear.app/isqrd/issue/ISQ-484).
 Base: main `f758c1f540f850741ca52772f8c369fc7fa31da9`.
 Delivery: keep this design and its implementation plan on the feature branch and include both in the implementation PR.

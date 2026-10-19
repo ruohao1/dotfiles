@@ -27,20 +27,15 @@ Relative plan/output paths are relative to your current directory.
 """
 
 
-def main(arguments):
-    if arguments == ['--help']:
-        print(HELP, end='')
-        return 0
-    if len(arguments) < 4 or arguments[0] != '--source-root' or arguments[2] != '--':
-        print(HELP, file=sys.stderr, end='')
-        return 2
+def validate_source(source_root):
+    """Validate one committed checkout without evaluating or activating it."""
     # Neither Git inspection nor Nix's Git fetch may inherit a different worktree,
     # index, config injection or discovery boundary from the caller environment.
     environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
     environment.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1')
     if not shutil.which('git'):
         raise ValueError('Git is required to validate the explicit source checkout')
-    root = Path(arguments[1]).resolve(strict=True)
+    root = Path(source_root).resolve(strict=True)
     homes = [Path(os.environ.get('HOME', '')).resolve(strict=True), Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()]
     if not root.is_dir() or any(root == home or root in home.parents for home in homes):
         raise ValueError('source root must not be HOME or an ancestor of HOME')
@@ -73,6 +68,17 @@ def main(arguments):
             raise ValueError(name + ' must be a tracked regular file')
     if git('status', '--porcelain=v1', '--untracked-files=no', '--ignore-submodules=none'):
         raise ValueError('source checkout has uncommitted tracked changes; review and commit them first')
+    return root, revision, environment
+
+
+def main(arguments):
+    if arguments == ['--help']:
+        print(HELP, end='')
+        return 0
+    if len(arguments) < 4 or arguments[0] != '--source-root' or arguments[2] != '--':
+        print(HELP, file=sys.stderr, end='')
+        return 2
+    root, revision, environment = validate_source(arguments[1])
     nix = shutil.which('nix')
     if not nix:
         raise ValueError('Nix is required; install explicitly using https://nixos.org/download/')

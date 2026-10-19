@@ -78,6 +78,12 @@ class TerminalTests(unittest.TestCase):
         return subprocess.run(command, env=self.env, cwd=self.home,
                               capture_output=True, text=True, timeout=60, **kwargs)
 
+    def test_updater_status_with_private_attached_clients(self):
+        environment = dict(self.env, DOTFILES_UPDATE_TMUX_TEST_ROOT=str(self.root / "updater"))
+        result = subprocess.run([sys.executable, "-B", str(ARGS.source_root / "nix/tests/test_update_tmux.py")],
+                                env=environment, cwd=self.home, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_relative_link_invocations_find_workspace_source(self):
         real = self.home / "real"
         real.mkdir()

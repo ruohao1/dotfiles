@@ -114,6 +114,12 @@ installer after Home Manager takes ownership. Current legacy entrypoints enforce
 the ownership guard; arbitrary old bootstrap copies cannot acquire that protection
 retroactively. Retain the migration journals and backups for explicit recovery.
 
+For confirmed release updates, keep personal settings in the
+[consumer host template](nix/templates/host/flake.nix), then use
+`dotfiles-update configure`, `check`, `install`, and `rollback`. An attached tmux
+client can display a cached update notice; activation always requires confirmation.
+See [release adoption and recovery](nix/README.md#confirmed-release-updates).
+
 ---
 
 ## Get started

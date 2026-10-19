@@ -998,6 +998,192 @@ class TransactionTests(unittest.TestCase):
                             self.assertEqual(read_owner(self.home)['phase'], 'home-manager')
                         self.assertEqual(len(self.runtime.calls), 1)
 
+    def provider_upgrade(self):
+        """Real old/new uv commands with private models of Nix store selection."""
+        patch.stopall()
+        module = self.module()
+        selected_generation = module.Runtime.selected_generation
+        from migration.model import fingerprint
+        profile = self.home / '.nix-profile'
+        selected = self.home / '.local/state/nix/profiles/home-manager'
+        selected.parent.mkdir(parents=True)
+        old_generation = self.generation
+        new_generation = Path('/nix/store/' + '1' * 32 + '-fixture-generation')
+        generations = {str(old_generation): self.root / 'generation',
+                       str(new_generation): self.root / 'new-generation'}
+        generations[str(new_generation)].mkdir()
+        original_resolve = Path.resolve
+        def resolve(path, *args, **kwargs):
+            actual = original_resolve(path, *args, **kwargs)
+            if path == selected:
+                # Model an immutable store selector without creating /nix.
+                return next((Path(generation) for generation, fixture in generations.items()
+                             if actual == fixture), actual)
+            return actual
+        patch.object(Path, 'resolve', new=resolve).start()
+        original_fingerprint = fingerprint
+        patch('migration.plan.fingerprint', side_effect=lambda path:
+              original_fingerprint(generations.get(str(path), path))).start()
+        providers = {}
+        for version, generation in [('1.0.0', old_generation), ('2.0.0', new_generation)]:
+            provider = self.root / ('uv-' + version)
+            (provider / 'bin').mkdir(parents=True)
+            executable = provider / 'bin/uv'
+            executable.write_text('#!/bin/sh\nprintf "uv ' + version + '\\n"\n')
+            executable.chmod(0o755)
+            providers[str(generation)] = provider
+        self.manifest['profilePaths'] = [str(profile), str(selected)]
+        self.manifest['commandRequirements'] = [{'command': 'uv', 'provider': str(providers[str(old_generation)])}]
+        self.runtime.manifest = self.manifest
+        activate = self.runtime.activate
+        def install(generation):
+            activate(generation)
+            for link, target in [(profile, providers[generation]), (selected, generations[generation])]:
+                if link.is_symlink(): link.unlink()
+                link.symlink_to(target)
+        def packages(path):
+            if not profile.is_symlink(): return []
+            return [{'name': 'home-manager-path', 'paths': [str(selected.resolve() / 'home-path')],
+                     'active': True, 'priority': None}]
+        patch.object(self.runtime, 'activate', side_effect=install).start()
+        patch.object(self.runtime, 'profile_packages', side_effect=packages).start()
+        patch.object(self.runtime, 'selected_generation', side_effect=lambda manifest:
+                     selected_generation(self.runtime, manifest)).start()
+        patch('migration.transaction.Runtime', return_value=self.runtime).start()
+        self.plan = inspect(self.manifest, self.home)
+        module.apply(self.plan, self.manifest, runtime=self.runtime)
+        newer = dict(self.manifest, activationPackage=str(new_generation), commandRequirements=[
+            {'command': 'uv', 'provider': str(providers[str(new_generation)])}])
+        self.runtime.manifest = newer
+        return profile, selected, old_generation, new_generation, providers, newer
+
+    def test_owned_provider_upgrade_preview_apply_and_retries(self):
+        import subprocess
+        module = self.module()
+        for boundary in ['publish-transferring', 'archive-0', 'activate-before-action',
+                         'activate-after-action', 'activate', 'publish-active']:
+            with self.subTest(boundary=boundary):
+                self.setUp()
+                profile = self.home / '.nix-profile'
+                with patch.dict(os.environ, {'DOTFILES_CALLER_PATH': str(profile / 'bin')}):
+                    profile, selected, old, new, providers, newer = self.provider_upgrade()
+                    self.assertEqual(subprocess.check_output([str(profile / 'bin/uv')], text=True), 'uv 1.0.0\n')
+                    plan = inspect(newer, self.home)
+                    self.assertEqual(plan['conflicts'], [])
+                    self.assertEqual(len(plan['providerTransitions']), 1)
+                    step = module.Journal.step
+                    def interrupt(journal, name, action):
+                        if name == 'activate' and boundary in ['activate-before-action', 'activate-after-action']:
+                            journal.data['steps'][name] = 'intent'
+                            journal.save()
+                            if boundary == 'activate-after-action': action()
+                            raise InterruptedError('upgrade activation intent')
+                        result = step(journal, name, action)
+                        if name == boundary: raise InterruptedError('upgrade boundary')
+                        return result
+                    with patch.object(module.Journal, 'step', new=interrupt), self.assertRaises(InterruptedError):
+                        module.apply(plan, newer, runtime=self.runtime)
+                    module.apply(plan, newer, runtime=self.runtime)
+                    module.apply(plan, newer, runtime=self.runtime)
+                    self.assertEqual(read_owner(self.home)['selectedGeneration'], str(new))
+                    self.assertEqual(subprocess.check_output([str(profile / 'bin/uv')], text=True), 'uv 2.0.0\n')
+                    self.assertEqual(self.runtime.calls, [str(old), str(new)]
+                                     + ([str(new)] if boundary == 'activate-after-action' else []))
+
+    def test_owned_uv_transition_preserves_native_observation_evidence(self):
+        module = self.module()
+        from migration.prerequisites import inspect_native
+        import subprocess
+        for same_provider in [False, True]:
+            with self.subTest(same_provider=same_provider):
+                self.setUp()
+                profile = self.home / '.nix-profile'
+                with patch.dict(os.environ, {'DOTFILES_CALLER_PATH': str(profile / 'bin')}):
+                    profile, selected, old, new, providers, newer = self.provider_upgrade()
+                    if same_provider:
+                        package = self.root / 'new-package-environment'
+                        (package / 'bin').mkdir(parents=True)
+                        (package / 'bin/uv').symlink_to(providers[str(old)] / 'bin/uv')
+                        newer['commandRequirements'][0]['provider'] = str(providers[str(old)])
+                        providers[str(new)] = package
+                    nvim = self.root / 'nvim/bin/nvim'
+                    nvim.parent.mkdir(parents=True)
+                    nvim.write_text('#!/bin/sh\nprintf \'%s\\n\' \'{"parquet":{"ok":true},"data_query":{"duckdb":{"ok":true}}}\'\n')
+                    nvim.chmod(0o755)
+                    newer['nativeDependencies'] = [{'id': 'uv-visidata'}]
+                    newer['commandRequirements'].append({'command': 'nvim', 'provider': str(nvim.parent.parent)})
+                    def collector(manifest, home):
+                        # Real collector/provider fingerprints; immutable Lua execution
+                        # is represented by a fixed Neovim process response in this source suite.
+                        probe = dict(manifest, files=[{'target': '.config/nvim/lua/data_query/tool.lua',
+                                     'source': '/nix/store/fixture-native-runtime/lua/data_query/tool.lua'}])
+                        return inspect_native(probe, home)
+                    with patch('migration.prerequisites.inspect_native', side_effect=collector):
+                        plan = inspect(newer, self.home)
+                        self.assertEqual(plan['conflicts'], [])
+                        before = plan['nativePrerequisites'][0]['observations'][str(profile / 'bin/uv')]
+                        self.assertEqual(before['sha256'], module.fingerprint(providers[str(old)] / 'bin/uv')['sha256'])
+                        module.apply(plan, newer, runtime=self.runtime)
+                        module.apply(plan, newer, runtime=self.runtime)
+                        self.assertEqual(subprocess.check_output([str(profile / 'bin/uv')], text=True), 'uv 1.0.0\n' if same_provider else 'uv 2.0.0\n')
+                        if not same_provider:
+                            self.assertNotEqual(module.fingerprint(profile / 'bin/uv')['sha256'], before['sha256'])
+
+    def test_provider_transition_rejects_wrong_phase_and_post_activation_drift(self):
+        module = self.module()
+        for boundary, drift in [('publish-transferring', 'early-new'), ('activate', 'old'),
+                                ('activate', 'foreign'), ('activate', 'wrong-package')]:
+            with self.subTest(boundary=boundary, drift=drift):
+                self.setUp()
+                profile = self.home / '.nix-profile'
+                with patch.dict(os.environ, {'DOTFILES_CALLER_PATH': str(profile / 'bin')}):
+                    profile, selected, old, new, providers, newer = self.provider_upgrade()
+                    plan = inspect(newer, self.home)
+                    self.assertEqual(plan['conflicts'], [])
+                    step = module.Journal.step
+                    def interrupt(journal, name, action):
+                        result = step(journal, name, action)
+                        if name == boundary: raise InterruptedError('provider phase boundary')
+                        return result
+                    with patch.object(module.Journal, 'step', new=interrupt), self.assertRaises(InterruptedError):
+                        module.apply(plan, newer, runtime=self.runtime)
+                    if drift == 'early-new':
+                        self.runtime.activate(str(new))
+                    elif drift == 'old':
+                        self.runtime.activate(str(old))
+                    elif drift == 'foreign':
+                        profile.unlink(); profile.symlink_to(providers[str(old)])
+                    else:
+                        patch.object(self.runtime, 'profile_packages', return_value=[]).start()
+                    with self.assertRaises(Conflict):
+                        module.apply(plan, newer, runtime=self.runtime)
+
+    def test_owned_provider_preview_rejects_foreign_shadow_and_unproven_selection(self):
+        module = self.module()
+        for scenario in ['direct-store', 'foreign-path', 'wrong-generation', 'wrong-package', 'undeclared-profile']:
+            with self.subTest(scenario=scenario):
+                self.setUp()
+                profile = self.home / '.nix-profile'
+                with patch.dict(os.environ, {'DOTFILES_CALLER_PATH': str(profile / 'bin')}):
+                    profile, selected, old, new, providers, newer = self.provider_upgrade()
+                    if scenario == 'direct-store':
+                        os.environ['DOTFILES_CALLER_PATH'] = str(providers[str(old)] / 'bin')
+                    elif scenario == 'foreign-path':
+                        foreign = self.root / 'foreign-bin'; foreign.mkdir()
+                        (foreign / 'uv').symlink_to(providers[str(old)] / 'bin/uv')
+                        os.environ['DOTFILES_CALLER_PATH'] = str(foreign)
+                    elif scenario == 'wrong-generation':
+                        selected.unlink(); selected.symlink_to('/nix/store/unreviewed-generation')
+                    elif scenario == 'wrong-package':
+                        patch.object(self.runtime, 'profile_packages', return_value=[
+                            {'name': 'home-manager-path', 'paths': ['/nix/store/unreviewed-home-manager-path'],
+                             'active': True, 'priority': None}]).start()
+                    else:
+                        newer['profilePaths'] = [str(selected)]
+                    plan = inspect(newer, self.home)
+                    self.assertIn('provider-shadowed', [item['code'] for item in plan['conflicts']])
+                    self.assertEqual(plan.get('providerTransitions', []), [])
+
     def test_newly_available_caller_command_requires_exact_owned_profile_and_provider(self):
         module = self.module()
         for scenario in ['reviewed', 'foreign-command', 'foreign-profile', 'wrong-generation', 'undeclared-profile']:
