@@ -49,6 +49,7 @@ eq(theme.opts, {
   style = "night",
   transparent = false,
   terminal_colors = true,
+  on_highlights = theme.opts.on_highlights,
   styles = {
     comments = { italic = true },
     keywords = { italic = true },
@@ -56,6 +57,7 @@ eq(theme.opts, {
     floats = "dark",
   },
 }, "TokyoNight options")
+assert(type(theme.opts.on_highlights) == "function", "TokyoNight highlight callback missing")
 assert(type(theme.config) == "function", "TokyoNight config callback missing")
 
 do

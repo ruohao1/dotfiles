@@ -150,3 +150,20 @@ StyLua, whitespace checks and independent review. New regressions failed before
 their fixes. Unsupported-option fallback was tested with a private wrapper;
 actual older Git and macOS were not run. No live activation or dependency change.
 Deliver this as a scoped follow-up commit on the existing draft PR.
+
+## Visual acceptance polish — 2026-10-19
+
+The accepted preview exposed a pointer without distinct selected-item styling.
+Use TokyoNight's existing `on_highlights` hook to link `MiniStarterCurrent` to
+the semantic `Visual` selection background, including after colorscheme reload.
+Keep layout, navigation and dependencies unchanged. Extend the existing theme
+options and configured startup checks, reproduce the failure before the fix,
+then rerun those checks and capture the selected item in the isolated preview.
+Keep this fix on the existing feature branch and draft PR; no merge or activation.
+
+Validation: the configured regression failed on the missing selected background
+before the fix. The complete configured startup matrix and focused TokyoNight /
+Treesitter suite then passed, as did scoped StyLua, whitespace checks and an
+independent read-only review. The seven-view Linux TUI preview confirmed the
+highlight after theme reload, navigation and resizing. No macOS or live
+activation was tested.

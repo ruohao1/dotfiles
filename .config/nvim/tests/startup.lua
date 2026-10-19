@@ -1561,6 +1561,21 @@ local live_ok, live_error = xpcall(function()
     wait_for_starter(child, "bare startup")
     assert_bare_starter(inspect_starter(child), "bare launch")
 
+    child_lua(
+      child,
+      [[
+      for _, reload in ipairs({ false, true }) do
+        if reload then
+          vim.cmd.colorscheme("tokyonight-night")
+        end
+        local selected = vim.api.nvim_get_hl(0, { name = "MiniStarterCurrent", link = false })
+        local item = vim.api.nvim_get_hl(0, { name = "MiniStarterItem", link = false })
+        assert(selected.bg ~= nil and selected.bg ~= item.bg,
+          "selected starter item needs a distinct background, including after colorscheme reload")
+      end
+    ]]
+    )
+
     local regular = vim.fs.joinpath(child.root, "restored.lua")
     write_file(regular, { "return true" })
     local restored = edit_and_inspect(child, regular)
