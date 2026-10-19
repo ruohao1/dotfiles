@@ -17,6 +17,9 @@ import sys
 TERMINAL_TESTS = ["workspace-state", "workspace-restore", "location-pins"]
 
 EDITOR_TESTS = {
+    "startup_git": "Startup Git assertions: ok",
+    "startup_layout": "Startup layout assertions: ok",
+    "startup": "Neovim startup pure assertions: ok",
     "oil_workspace": "Responsive Oil workspace assertions: ok",
     "location_pin_picker": "Line-pin picker assertions: ok (10201 preview cases)",
     "location_pins": "Line-pin editor assertions: ok",

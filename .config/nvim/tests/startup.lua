@@ -12,7 +12,6 @@ for _, name in ipairs({
   "discover_projects",
   "has_editing_intent",
   "is_bare_launch",
-  "minimal_content",
   "new",
   "project_is_current",
 }) do
@@ -135,27 +134,6 @@ local repeated_window = vim.deepcopy(bare_context)
 repeated_window.window_buffers = { 1, 1 }
 eq(test.is_bare_launch(repeated_window), true, "multiple windows may show the initial buffer")
 
-local reduced = test.minimal_content({
-  { { type = "header", string = "NEOVIM" } },
-  { { type = "empty", string = "" } },
-  { { type = "section", string = "" } },
-  { { type = "item", string = "p  Projects", action = function() end } },
-  { { type = "item", string = "r  Recent files", action = function() end } },
-  { { type = "empty", string = "" } },
-  { { type = "footer", string = "footer" } },
-})
-
-eq(
-  vim.tbl_map(function(line)
-    return line[1].string
-  end, reduced),
-  { "NEOVIM", "", "p  Projects", "r  Recent files" },
-  "minimal visible content"
-)
-eq(reduced[1][1].type, "header", "header unit retained")
-eq(reduced[3][1].type, "item", "first item action unit retained")
-eq(reduced[4][1].type, "item", "second item action unit retained")
-
 local function new_controller_harness(context)
   local harness = {
     starter_setup_calls = {},
@@ -179,19 +157,50 @@ local function new_controller_harness(context)
     set_current_dir_calls = {},
     action_calls = {},
     fail_set_current_dir = false,
+    requests = {},
+    scheduled = {},
+    timers = {},
+    refreshes = {},
+    selected = 1,
+    pointers = {},
+    composed = {},
   }
   harness.oldfiles = { harness.project_file }
 
   local fake_starter = {
     gen_hook = {
-      aligning = function(horizontal, vertical)
-        eq({ horizontal, vertical }, { "center", "center" }, "center hook request")
-        return function(content, bufnr)
-          table.insert(harness.status_calls, { phase = "align", bufnr = bufnr })
+      aligning = function()
+        return function(content)
           return content
         end
       end,
     },
+    get_content = function()
+      local line = {}
+      for _, item in ipairs(harness.starter_setup_calls[1].items) do
+        table.insert(line, { type = "pointer", string = "  " })
+        table.insert(
+          line,
+          { type = "item", string = item.name .. string.rep(" ", 18 - #item.name), item = item }
+        )
+      end
+      return { {}, line }
+    end,
+    content_to_items = function()
+      local items = {}
+      for index, item in ipairs(harness.starter_setup_calls[1].items) do
+        items[index] = { action = item.action, _cursorpos = { 2, (index - 1) * 20 + 2 } }
+      end
+      return items
+    end,
+    update_current_item = function(direction)
+      harness.selected = (harness.selected - 1 + (direction == "next" and 1 or -1)) % 3 + 1
+    end,
+    refresh = function(bufnr)
+      table.insert(harness.refreshes, bufnr)
+      harness.selected = 1
+      harness.starter_setup_calls[1].content_hooks[1]({}, bufnr)
+    end,
     setup = function(options)
       table.insert(harness.starter_setup_calls, options)
     end,
@@ -218,6 +227,54 @@ local function new_controller_harness(context)
   }
 
   harness.dependencies = {
+    collect = function(directory, callback)
+      local request = { directory = directory, callback = callback, canceled = false }
+      function request:cancel()
+        self.canceled = true
+      end
+      table.insert(harness.requests, request)
+      return request
+    end,
+    compose = function(content, view, dimensions)
+      table.insert(harness.composed, { view = view, dimensions = dimensions })
+      return content
+    end,
+    schedule = function(callback)
+      table.insert(harness.scheduled, callback)
+    end,
+    new_timer = function()
+      local timer = { closed = false }
+      function timer:start(delay, repeat_delay, callback)
+        self.delay = delay
+        self.callback = callback
+      end
+      function timer:stop()
+        self.callback = nil
+      end
+      function timer:close()
+        self.closed = true
+      end
+      table.insert(harness.timers, timer)
+      return timer
+    end,
+    buffer_valid = function(bufnr)
+      return harness.filetypes[bufnr] ~= nil
+    end,
+    buffer_visible = function(bufnr)
+      return harness.current_buffer == bufnr
+    end,
+    dimensions = function()
+      return { width = 80, height = 23 }
+    end,
+    cursor = function()
+      return { 2, (harness.selected - 1) * 20 + 2 }
+    end,
+    write_pointer = function(bufnr, row, column, text)
+      table.insert(harness.pointers, { bufnr, row, column, text })
+    end,
+    quit = function()
+      harness.quit_called = true
+    end,
     starter = function()
       return fake_starter
     end,
@@ -327,7 +384,21 @@ local function new_controller_harness(context)
     },
   }
 
+  function harness:flush()
+    while #self.scheduled > 0 do
+      local queued = self.scheduled
+      self.scheduled = {}
+      for _, callback in ipairs(queued) do
+        callback()
+      end
+    end
+  end
+
   function harness:invoke(event)
+    if event == "VimResized" then
+      fake_starter.refresh(self.current_buffer)
+      return
+    end
     local matches = {}
     for _, route in ipairs(self.autocmds) do
       local registered = route.event
@@ -370,7 +441,14 @@ assert(controller:setup() == controller, "setup must return its controller")
 assert(controller:setup() == controller, "repeated setup must return its controller")
 eq(#harness.starter_setup_calls, 1, "MiniStarter setup once")
 eq(#harness.augroup_calls, 1, "one startup augroup")
-eq(#harness.autocmds, 4, "exact startup event routes")
+eq(
+  vim.tbl_map(function(item)
+    return item.name
+  end, harness.starter_setup_calls[1].items),
+  { "p  Projects", "r  Recent files", "q  Quit" },
+  "approved menu preserves all three actions"
+)
+eq(#harness.autocmds, 9, "startup event routes")
 eq(harness.augroup_calls, {
   { name = "dotfiles-startup", options = { clear = true } },
 }, "exact startup augroup")
@@ -383,6 +461,11 @@ eq(
     "VimEnter",
     "User",
     { "BufEnter", "WinEnter" },
+    "WinResized",
+    "CursorMoved",
+    "DirChanged",
+    "FocusGained",
+    { "BufWipeout", "VimLeavePre" },
   },
   "exact startup events"
 )
@@ -391,7 +474,7 @@ eq(harness.autocmds[3].options.pattern, "MiniStarterOpened", "exact opened event
 local options = harness.starter_setup_calls[1]
 eq(options.autoopen, false, "plugin autoopen disabled")
 eq(options.evaluate_single, false, "single item never autoexecutes")
-eq(options.header, "NEOVIM", "exact startup header")
+eq(options.header, "", "empty startup header")
 eq(options.footer, "", "empty startup footer")
 eq(options.query_updaters, "", "query mappings disabled")
 eq(
@@ -401,6 +484,7 @@ eq(
   {
     "p  Projects",
     "r  Recent files",
+    "q  Quit",
   },
   "exact startup item names"
 )
@@ -408,23 +492,15 @@ eq(
   vim.tbl_map(function(item)
     return item.section
   end, options.items),
-  { "", "" },
+  { "", "", "" },
   "empty item sections"
 )
-eq(#options.content_hooks, 2, "minimal and status-aware alignment hooks")
-
-local hook_content = {
-  { { type = "header", string = "NEOVIM" } },
-  { { type = "section", string = "" } },
-  { { type = "item", string = "p  Projects" } },
-}
-local minimal = options.content_hooks[1](hook_content, harness.current_buffer)
-local aligned = options.content_hooks[2](minimal, harness.current_buffer)
-eq(aligned, minimal, "alignment hook result")
+eq(#options.content_hooks, 1, "one composition hook")
+options.content_hooks[1]({}, harness.current_buffer)
+eq(harness.composed[1].view, { kind = "loading" }, "initial content renders loading")
 eq(harness.status_calls, {
   { phase = "status", visible = true },
-  { phase = "align", bufnr = harness.current_buffer },
-}, "status suppression precedes center alignment")
+}, "status suppression precedes composition")
 eq(harness.find_root_calls, 0, "project discovery waits for its action")
 
 local stdin_harness = new_controller_harness()
@@ -462,7 +538,7 @@ harness:invoke("User")
 eq(harness.status_calls, {
   { phase = "status", visible = true },
 }, "MiniStarterOpened suppresses the statusline")
-eq(#harness.mappings, 2, "MiniStarterOpened installs exactly two mappings")
+eq(#harness.mappings, 11, "MiniStarterOpened action and native navigation mappings")
 eq(
   vim.tbl_map(function(mapping)
     return { mapping.bufnr, mapping.lhs, mapping.description }
@@ -470,6 +546,15 @@ eq(
   {
     { harness.current_buffer, "p", "Open projects" },
     { harness.current_buffer, "r", "Open recent files" },
+    { harness.current_buffer, "q", "Quit" },
+    { harness.current_buffer, "j", "Next startup item" },
+    { harness.current_buffer, "<Down>", "Next startup item" },
+    { harness.current_buffer, "<C-n>", "Next startup item" },
+    { harness.current_buffer, "<M-j>", "Next startup item" },
+    { harness.current_buffer, "k", "Previous startup item" },
+    { harness.current_buffer, "<Up>", "Previous startup item" },
+    { harness.current_buffer, "<C-p>", "Previous startup item" },
+    { harness.current_buffer, "<M-k>", "Previous startup item" },
   },
   "exact buffer-local startup mappings"
 )
@@ -562,6 +647,121 @@ eq(failure_harness.notifications, {
   warning("Recent project is no longer available: ~/src/project"),
 }, "failed cwd change warning")
 eq(picker_call_count(failure_harness, "files"), 0, "failed cwd change opens no files")
+
+-- These checks catch stale callbacks, uncanceled work, overlapping focus requests,
+-- and losing an action when native MiniStarter repositions its items.
+local lifecycle = new_controller_harness()
+local lifecycle_controller = test.new(lifecycle.dependencies)
+lifecycle_controller:setup()
+lifecycle:invoke("User")
+eq(#lifecycle.requests, 1, "opening starts one asynchronous request")
+eq(lifecycle.requests[1].directory, "/workspace", "request captures the buffer directory")
+lifecycle:flush()
+lifecycle.mappings[4].callback()
+eq(lifecycle.selected, 2, "j selects Recent files natively")
+lifecycle.mappings[4].callback()
+lifecycle.mappings[4].callback()
+eq(lifecycle.selected, 1, "j cycles back to Projects")
+lifecycle.mappings[8].callback()
+eq(lifecycle.selected, 3, "k cycles backward to Quit")
+lifecycle.requests[1].callback({ kind = "repository", name = "fixture" })
+lifecycle:flush()
+eq(lifecycle.selected, 3, "async refresh preserves the selected action")
+eq(
+  lifecycle.pointers[#lifecycle.pointers],
+  { 9, 2, 40, "> " },
+  "shared-row pointer uses byte column"
+)
+lifecycle:invoke("VimResized")
+lifecycle:flush()
+eq(#lifecycle.requests, 1, "resize uses cached Git data")
+local window_refreshes = #lifecycle.refreshes
+lifecycle:invoke("WinResized")
+lifecycle:flush()
+eq(#lifecycle.refreshes, window_refreshes + 1, "window resize recomposes the visible starter")
+eq(lifecycle.selected, 3, "window resize preserves the selected action")
+eq(#lifecycle.requests, 1, "window resize uses cached Git data")
+lifecycle.current_buffer = 10
+lifecycle:invoke("WinResized")
+eq(#lifecycle.refreshes, window_refreshes + 1, "window resize skips hidden starters")
+lifecycle.current_buffer = 9
+lifecycle:invoke("FocusGained")
+local stale_focus = lifecycle.timers[1].callback
+stale_focus()
+lifecycle:invoke("FocusGained")
+lifecycle:flush()
+eq(#lifecycle.requests, 1, "queued old focus does not preempt newer debounce")
+eq(lifecycle.timers[2].closed, false, "queued old focus leaves its replacement open")
+eq(lifecycle.timers[1].closed, true, "repeat focus closes its old debounce timer")
+local focus_timer = lifecycle.timers[2]
+eq(focus_timer.delay, 150, "focus debounce delay")
+focus_timer.callback()
+lifecycle:flush()
+eq(#lifecycle.requests, 2, "focus starts one request after debounce")
+lifecycle:invoke("FocusGained")
+eq(#lifecycle.timers, 2, "focus does not overlap an active request")
+lifecycle.cwd = "/other"
+lifecycle:invoke("DirChanged")
+eq(lifecycle.requests[2].canceled, true, "directory change cancels old work")
+eq(lifecycle.requests[3].directory, "/other", "directory change collects the new directory")
+local refresh_count = #lifecycle.refreshes
+lifecycle.requests[2].callback({ kind = "error" })
+eq(#lifecycle.refreshes, refresh_count, "late old-directory callback cannot refresh")
+lifecycle.requests[3].callback({ kind = "error" })
+lifecycle:flush()
+eq(#lifecycle.notifications, 1, "Git failure warns once")
+lifecycle:invoke("FocusGained")
+lifecycle.timers[#lifecycle.timers].callback()
+lifecycle:flush()
+lifecycle.requests[4].callback({ kind = "error" })
+eq(#lifecycle.notifications, 1, "repeated Git failure remains quiet")
+lifecycle.current_buffer = 10
+lifecycle.filetypes[10] = "ministarter"
+lifecycle:invoke("User")
+eq(#lifecycle.requests, 5, "second starter owns a separate request")
+lifecycle:invoke("FocusGained")
+eq(#lifecycle.timers, 3, "second buffer request also prevents focus overlap")
+lifecycle:invoke("BufWipeout")
+eq(lifecycle.requests[5].canceled, true, "wipe cancels the owning buffer request")
+refresh_count = #lifecycle.refreshes
+lifecycle.current_buffer = 9
+lifecycle.requests[5].callback({ kind = "repository" })
+eq(#lifecycle.refreshes, refresh_count, "closed buffer completion cannot refresh another starter")
+lifecycle:invoke("FocusGained")
+local closing_timer = lifecycle.timers[#lifecycle.timers]
+lifecycle:invoke("BufWipeout")
+eq(closing_timer.closed, true, "wipe closes its focus timer")
+refresh_count = #lifecycle.refreshes
+lifecycle:invoke("WinResized")
+eq(#lifecycle.refreshes, refresh_count, "window resize ignores closed starter buffers")
+local restore_navigation = new_controller_harness()
+test.new(restore_navigation.dependencies):setup()
+restore_navigation:invoke("User")
+restore_navigation:flush()
+restore_navigation.mappings[4].callback()
+restore_navigation:invoke("VimResized")
+restore_navigation.mappings[8].callback()
+restore_navigation.requests[1].callback({ kind = "non_repository" })
+restore_navigation:flush()
+eq(
+  restore_navigation.selected,
+  3,
+  "explicit navigation replaces saved action during resize reconciliation"
+)
+
+local exiting = new_controller_harness()
+test.new(exiting.dependencies):setup()
+exiting:invoke("User")
+exiting.requests[1].callback({ kind = "non_repository" })
+exiting:invoke("FocusGained")
+exiting.current_buffer = 10
+exiting.filetypes[10] = "ministarter"
+exiting:invoke("User")
+exiting:invoke("VimLeavePre")
+eq(exiting.timers[1].closed, true, "editor exit closes owned focus timers")
+eq(exiting.requests[2].canceled, true, "editor exit cancels pending requests")
+options.items[3].action()
+eq(harness.quit_called, true, "Quit action uses the normal quit boundary")
 
 local function path_is_within(path, root)
   return path == root or path:sub(1, #root + 1) == root .. "/"
@@ -1101,6 +1301,12 @@ local function child_input(child, keys)
 end
 
 local function stop_child(child)
+  if child.process:is_closing() then
+    local result = child.process:wait(5000)
+    pcall(vim.fn.chanclose, child.channel)
+    assert(result.code == 0 and result.signal == 0, "child normal quit failed")
+    return
+  end
   local rpc_ok, rpc_error = pcall(vim.rpcnotify, child.channel, "nvim_command", "qa!")
   local exited = rpc_ok
     and vim.wait(5000, function()
@@ -1266,6 +1472,7 @@ local function inspect_starter(child)
     end
     local p = vim.fn.maparg("p", "n", false, true)
     local r = vim.fn.maparg("r", "n", false, true)
+    local q = vim.fn.maparg("q", "n", false, true)
     return {
       filetype = vim.bo.filetype,
       visible = visible,
@@ -1274,6 +1481,7 @@ local function inspect_starter(child)
       laststatus = vim.o.laststatus,
       p_buffer = p.buffer,
       r_buffer = r.buffer,
+      q_buffer = q.buffer,
     }
   ]]
   )
@@ -1316,14 +1524,19 @@ end
 
 local function assert_bare_starter(state, label)
   eq(state.filetype, "ministarter", label .. " filetype")
-  eq(state.visible, { "NEOVIM", "p  Projects", "r  Recent files" }, label .. " visible content")
-  eq(state.laststatus, 0, label .. " row hidden before alignment")
-  assert(
-    math.abs((state.rows[1] - 1) - (state.height - state.rows[#state.rows])) <= 1,
-    label .. " not vertically centered"
-  )
+  local menu = {}
+  for _, line in ipairs(state.visible) do
+    for _, name in ipairs({ "p  Projects", "r  Recent files", "q  Quit" }) do
+      if line:find(name, 1, true) then
+        menu[#menu + 1] = name
+      end
+    end
+  end
+  eq(menu, { "p  Projects", "r  Recent files", "q  Quit" }, label .. " visible actions")
+  eq(state.laststatus, 0, label .. " status row hidden")
   eq(state.p_buffer, 1, label .. " p mapping is buffer-local")
   eq(state.r_buffer, 1, label .. " r mapping is buffer-local")
+  eq(state.q_buffer, 1, label .. " q mapping is buffer-local")
 end
 
 local function edit_and_inspect(child, path)
@@ -1347,6 +1560,21 @@ local live_ok, live_error = xpcall(function()
   with_child({ name = "bare" }, function(child)
     wait_for_starter(child, "bare startup")
     assert_bare_starter(inspect_starter(child), "bare launch")
+
+    child_lua(
+      child,
+      [[
+      for _, reload in ipairs({ false, true }) do
+        if reload then
+          vim.cmd.colorscheme("tokyonight-night")
+        end
+        local selected = vim.api.nvim_get_hl(0, { name = "MiniStarterCurrent", link = false })
+        local item = vim.api.nvim_get_hl(0, { name = "MiniStarterItem", link = false })
+        assert(selected.bg ~= nil and selected.bg ~= item.bg,
+          "selected starter item needs a distinct background, including after colorscheme reload")
+      end
+    ]]
+    )
 
     local regular = vim.fs.joinpath(child.root, "restored.lua")
     write_file(regular, { "return true" })
@@ -1501,108 +1729,257 @@ local live_ok, live_error = xpcall(function()
     )
   end, start_none_child)
 
+  local function fixture_git(directory, arguments)
+    local argv =
+      { "git", "-c", "user.name=Startup fixture", "-c", "user.email=startup@example.invalid" }
+    vim.list_extend(argv, arguments)
+    local result = vim.system(argv, { cwd = directory, text = true }):wait(5000)
+    assert(result.code == 0, result.stderr or "Git fixture failed")
+  end
+  for _, kind in ipairs({ "clean", "dirty", "dense", "detached", "unborn" }) do
+    local directory = vim.fs.joinpath(fixtures_root, "git-" .. kind)
+    make_directory(directory)
+    fixture_git(directory, { "init", "--initial-branch=main" })
+    if kind ~= "unborn" then
+      write_file(vim.fs.joinpath(directory, "tracked.lua"), { "initial" })
+      fixture_git(directory, { "add", "." })
+      fixture_git(directory, { "commit", "-m", "Startup fixture commit" })
+    end
+    local expected = { "main", "Working tree clean", "Startup fixture commit" }
+    if kind == "dirty" then
+      write_file(vim.fs.joinpath(directory, "tracked.lua"), { "staged" })
+      fixture_git(directory, { "add", "." })
+      write_file(vim.fs.joinpath(directory, "tracked.lua"), { "unstaged" })
+      write_file(vim.fs.joinpath(directory, "src", "new.lua"), { "new" })
+      expected = { "MM", "??", "src/", "2 changed" }
+    elseif kind == "dense" then
+      for index = 1, 15 do
+        write_file(vim.fs.joinpath(directory, "file-" .. index), { "new" })
+      end
+      expected = { "15 changed", "more paths" }
+    elseif kind == "detached" then
+      fixture_git(directory, { "checkout", "--detach" })
+      expected = { "detached HEAD", "Working tree clean" }
+    elseif kind == "unborn" then
+      expected = { "main", "No commits yet", "Working tree clean" }
+    end
+    with_child({ name = "git-" .. kind, cwd = directory }, function(child)
+      wait_for_starter(child, "Git " .. kind .. " startup")
+      child_lua(
+        child,
+        [[vim.o.columns = 120; vim.o.lines = 45; vim.api.nvim_exec_autocmds("VimResized", {})]]
+      )
+      for _, text in ipairs(expected) do
+        wait_child_lua(
+          child,
+          "local text = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), '\\n'); return text:find("
+            .. string.format("%q", text)
+            .. ", 1, true) ~= nil",
+          "Git " .. kind .. " displays " .. text
+        )
+      end
+      assert_bare_starter(inspect_starter(child), "Git " .. kind .. " menu")
+    end)
+  end
+
+  with_child({ name = "quit-enter" }, function(child)
+    wait_for_starter(child, "normal Enter Quit startup")
+    child_input(child, "k<CR>")
+    assert(
+      vim.wait(5000, function()
+        return child.process:is_closing()
+      end, 20),
+      "native Enter Quit did not exit"
+    )
+    eq(child.process:wait(5000).code, 0, "native Enter Quit exits normally")
+  end)
+
   with_child({ name = "native-mechanics" }, function(child)
     wait_for_vimenter(child, "native mechanics startup")
     local checkout = vim.fs.joinpath(data_home, "nvim", "lazy", "mini.starter")
     assert_directory(checkout, "MiniStarter checkout")
-    local setup_source = "vim.opt.runtimepath:prepend("
-      .. string.format("%q", checkout)
-      .. [[)
-      local starter = require("mini.starter")
-      _G.dotfiles_startup_native_counts = { 0, 0 }
-      local function minimal_content(content)
-        local result = {}
-        local inserted_gap = false
-        for _, line in ipairs(content) do
-          local kept = {}
-          local first_type
+    child_lua(child, "vim.opt.runtimepath:prepend(" .. string.format("%q", checkout) .. ")")
+    child_lua(child, "vim.opt.runtimepath:prepend(" .. string.format("%q", nvim_root) .. ")")
+    child_lua(
+      child,
+      [[
+      _G.startup_requests, _G.startup_recent = {}, 0
+      local git = require("ui.startup.git")
+      git.collect = function(directory, callback)
+        local request = { callback = callback, directory = directory }
+        function request:cancel() self.canceled = true end
+        table.insert(_G.startup_requests, request)
+        return request
+      end
+      package.loaded["navigation.pickers"] = { recent = function() _G.startup_recent = _G.startup_recent + 1 end }
+      require("ui.statusline").setup()
+      require("ui.startup").setup()
+      vim.o.columns = 120
+      require("mini.starter").open()
+    ]]
+    )
+    wait_for_starter(child, "native first open")
+    local function selection()
+      return child_lua(
+        child,
+        [[
+        local starter = require("mini.starter")
+        local cursor = vim.api.nvim_win_get_cursor(0)
+        local selected, pointers, active = nil, 0, nil
+        for _, item in ipairs(starter.content_to_items()) do
+          if vim.deep_equal(item._cursorpos, cursor) then selected = item.name end
+        end
+        for row, line in ipairs(starter.get_content()) do
+          local column = 0
           for _, unit in ipairs(line) do
-            if unit.type == "header" or unit.type == "item" then
-              first_type = first_type or unit.type
-              table.insert(kept, unit)
+            if unit.type == "pointer" and unit.string == "> " then
+              pointers = pointers + 1
+              active = { row, column + 2 }
             end
-          end
-          if #kept > 0 then
-            if first_type == "item" and not inserted_gap then
-              table.insert(result, { { type = "empty", string = "" } })
-              inserted_gap = true
-            end
-            table.insert(result, kept)
+            column = column + #unit.string
           end
         end
-        return result
-      end
-      starter.setup({
-        autoopen = false,
-        evaluate_single = false,
-        header = "NEOVIM",
-        footer = "",
-        query_updaters = "",
-        items = {
-          {
-            name = "p  Projects",
-            action = function()
-              _G.dotfiles_startup_native_counts[1] = _G.dotfiles_startup_native_counts[1] + 1
-            end,
-            section = "",
-          },
-          {
-            name = "r  Recent files",
-            action = function()
-              _G.dotfiles_startup_native_counts[2] = _G.dotfiles_startup_native_counts[2] + 1
-            end,
-            section = "",
-          },
-        },
-        content_hooks = {
-          minimal_content,
-          starter.gen_hook.aligning("center", "center"),
-        },
-      })
-      starter.open()
-      return vim.api.nvim_get_current_buf()
-    ]]
-    local first_buffer = child_lua(child, setup_source)
-    wait_for_starter(child, "native first open")
+        return { name = selected, pointers = pointers, matches = vim.deep_equal(cursor, active) and active ~= nil
+            and vim.api.nvim_buf_get_lines(0, active[1] - 1, active[1], false)[1]:sub(active[2] - 1, active[2]) == "> ",
+          requests = #_G.startup_requests, recent = _G.startup_recent }
+      ]]
+      )
+    end
+    local function assert_selection(name, label)
+      local state = selection()
+      eq(state.name, name, label .. " selected action")
+      eq(state.pointers, 1, label .. " one visible pointer")
+      eq(state.matches, true, label .. " pointer matches row and byte column")
+      return state
+    end
+    assert_selection("p  Projects", "initial")
+    child_input(child, "k")
+    wait_child_lua(child, [[return vim.api.nvim_win_get_cursor(0)[1] > 0]], "native key delivery")
+    -- RPC requests run after queued input, so inspections observe native selection.
+    assert_selection("q  Quit", "backward wrap")
+    child_input(child, "j")
+    assert_selection("p  Projects", "forward wrap")
     child_input(child, "<Down>")
-    child_input(child, "<Up>")
+    assert_selection("r  Recent files", "arrow next")
     child_input(child, "<CR>")
-    local first_counts = wait_child_lua(
-      child,
-      [[
-      local counts = _G.dotfiles_startup_native_counts
-      if counts and counts[1] == 1 then
-        return vim.deepcopy(counts)
-      end
-      return false
-    ]],
-      "native first action"
+    eq(
+      wait_child_lua(child, [[return _G.startup_recent == 1]], "native Recent Enter"),
+      true,
+      "Enter invokes Recent once"
     )
-    eq(first_counts, { 1, 0 }, "native Down Up Enter executes first action once")
-
-    local second_buffer = child_lua(
+    child_lua(
       child,
       [[
-      require("mini.starter").open()
-      return vim.api.nvim_get_current_buf()
+      _G.startup_requests[1].callback({ kind = "repository", name = "fixture", root = "/fixture",
+        branch = { head = "main" }, history = {}, changes = {}, counts = { total = 0 } })
     ]]
     )
-    assert(second_buffer ~= first_buffer, "native second open did not create a new buffer")
-    wait_for_starter(child, "native second open")
+    assert_selection("r  Recent files", "async completion")
+    child_lua(child, [[vim.o.columns = 70; vim.api.nvim_exec_autocmds("VimResized", {})]])
+    assert_selection("r  Recent files", "narrow resize")
     child_input(child, "<Down>")
-    child_input(child, "<CR>")
-    local second_counts = wait_child_lua(
+    assert_selection("q  Quit", "shared-row Quit")
+    child_lua(child, [[vim.o.columns = 120; vim.api.nvim_exec_autocmds("VimResized", {})]])
+    eq(assert_selection("q  Quit", "wide resize").requests, 1, "resize never recollects Git")
+    child_lua(
       child,
       [[
-      local counts = _G.dotfiles_startup_native_counts
-      if counts and counts[1] == 1 and counts[2] == 1 then
-        return vim.deepcopy(counts)
-      end
-      return false
-    ]],
-      "native second action"
+      _G.startup_window = vim.api.nvim_get_current_win()
+      vim.cmd.vnew()
+      vim.api.nvim_win_set_width(_G.startup_window, 39)
+    ]]
     )
-    eq(second_counts, { 1, 1 }, "native Down Enter executes second action once")
+    wait_child_lua(
+      child,
+      [[
+      local buffer = vim.api.nvim_win_get_buf(_G.startup_window)
+      local width = vim.api.nvim_win_get_width(_G.startup_window)
+      for _, line in ipairs(vim.api.nvim_buf_get_lines(buffer, 0, -1, false)) do
+        if vim.fn.strdisplaywidth(line) > width then return false end
+      end
+      return true
+    ]],
+      "window resize fits cached Starter content without entering its buffer"
+    )
+    eq(
+      child_lua(child, [[return { vim.o.laststatus, #_G.startup_requests }]]),
+      { 3, 1 },
+      "background window resize preserves the regular statusline and cached Git request"
+    )
+    child_lua(child, [[vim.cmd.close()]])
+    eq(
+      assert_selection("q  Quit", "closing the adjacent split").requests,
+      1,
+      "closing an adjacent split does not collect Git"
+    )
+    child_lua(child, [[vim.cmd.vsplit(); vim.api.nvim_win_set_width(0, 80)]])
+    wait_child_lua(
+      child,
+      [[
+      local buffer = vim.api.nvim_get_current_buf()
+      for _, window in ipairs(vim.fn.win_findbuf(buffer)) do
+        local width = vim.api.nvim_win_get_width(window)
+        for _, line in ipairs(vim.api.nvim_buf_get_lines(buffer, 0, -1, false)) do
+          if vim.fn.strdisplaywidth(line) > width then return false end
+        end
+      end
+      return true
+    ]],
+      "shared Starter content fits both asymmetric windows"
+    )
+    eq(
+      assert_selection("q  Quit", "shared Starter resize").requests,
+      1,
+      "shared resize uses cached Git"
+    )
+    child_lua(child, [[vim.cmd.close()]])
+    assert_selection("q  Quit", "closing one shared Starter window")
+    child_lua(child, [[require("mini.starter").open()]])
+    assert_selection("p  Projects", "second buffer")
+    child_lua(child, [[_G.startup_requests[1].callback({ kind = "non_repository" })]])
+    assert_selection("p  Projects", "closed-buffer late completion")
+    child_lua(
+      child,
+      [[
+      vim.cmd.vnew()
+      assert(vim.bo.filetype ~= "ministarter" and vim.o.laststatus == 3)
+      _G.startup_requests[2].callback({ kind = "non_repository" })
+    ]]
+    )
+    eq(
+      child_lua(child, [[return vim.o.laststatus]]),
+      3,
+      "background Starter completion preserves current regular statusline"
+    )
+    child_lua(child, [[vim.cmd.close(); require("mini.starter").open()]])
+    assert_selection("p  Projects", "pending resize buffer")
+    child_input(child, "j")
+    assert_selection("r  Recent files", "before queued resize completion")
+    child_lua(
+      child,
+      [[
+      vim.schedule(function()
+        vim.o.columns = 70
+        vim.api.nvim_exec_autocmds("VimResized", {})
+      end)
+      vim.schedule(function()
+        _G.startup_requests[3].callback({ kind = "non_repository" })
+        vim.schedule(function() _G.startup_resize_race_done = true end)
+      end)
+    ]]
+    )
+    wait_child_lua(child, [[return _G.startup_resize_race_done]], "queued resize completion")
+    assert_selection("r  Recent files", "completion before resize reconciliation")
+    child_lua(child, [[require("mini.starter").open()]])
+    assert_selection("p  Projects", "pending quit buffer")
+    child_input(child, "q")
+    assert(
+      vim.wait(5000, function()
+        return child.process:is_closing()
+      end, 20),
+      "normal q did not exit while Git pending"
+    )
+    eq(child.process:wait(5000).code, 0, "normal q exits successfully")
   end, start_none_child)
 end, debug.traceback)
 

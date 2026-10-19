@@ -7556,6 +7556,8 @@ for static_lint_file in \
   "$nvim_root/lua/plugins/theme.lua" \
   "$nvim_root/lua/plugins/treesitter.lua" \
   "$nvim_root/lua/ui/startup.lua" \
+  "$nvim_root/lua/ui/startup/git.lua" \
+  "$nvim_root/lua/ui/startup/layout.lua" \
   "$nvim_root/lua/ui/statusline.lua" \
   "$nvim_root/scripts/data-query-runner.py" \
   "$nvim_root/python/pyproject.toml" \
@@ -7596,6 +7598,8 @@ for static_lint_file in \
   "$nvim_root/tests/taplo.lua" \
   "$nvim_root/tests/yamlls.lua" \
   "$nvim_root/tests/startup.lua" \
+  "$nvim_root/tests/startup_git.lua" \
+  "$nvim_root/tests/startup_layout.lua" \
   "$nvim_root/tests/statusline.lua" \
   "$nvim_root/tests/theme_treesitter.lua"
 do
@@ -12370,6 +12374,8 @@ for nvim_file in \
   "$nvim_root/lua/plugins/theme.lua" \
   "$nvim_root/lua/plugins/treesitter.lua" \
   "$nvim_root/lua/ui/startup.lua" \
+  "$nvim_root/lua/ui/startup/git.lua" \
+  "$nvim_root/lua/ui/startup/layout.lua" \
   "$nvim_root/lua/ui/statusline.lua" \
   "$nvim_root/lua/integrations/tmux_status.lua" \
   "$nvim_root/scripts/data-query-runner.py" \
@@ -12411,6 +12417,8 @@ for nvim_file in \
   "$nvim_root/tests/taplo.lua" \
   "$nvim_root/tests/yamlls.lua" \
   "$nvim_root/tests/startup.lua" \
+  "$nvim_root/tests/startup_git.lua" \
+  "$nvim_root/tests/startup_layout.lua" \
   "$nvim_root/tests/statusline.lua" \
   "$nvim_root/tests/theme_treesitter.lua" \
   "$config_root/dotfiles/git-summary"
@@ -12781,7 +12789,7 @@ if [ "$nvim_config_ready" = true ] && [ "$plugins_trusted" = true ] && command -
     -c "luafile $nvim_root/tests/editing.lua" \
     -c 'lua for _, name in ipairs({ "navigation", "oil_workspace", "location_pin_picker" }) do dofile(vim.fs.joinpath(vim.env.DOTFILES_NVIM_ROOT, "tests", name .. ".lua")) end' \
     -c "luafile $nvim_root/tests/statusline.lua" \
-    -c "luafile $nvim_root/tests/startup.lua" \
+    -c 'lua for _, name in ipairs({ "startup_git", "startup_layout", "startup" }) do dofile(vim.fs.joinpath(vim.env.DOTFILES_NVIM_ROOT, "tests", name .. ".lua")) end' \
     -c 'lua for _, name in ipairs({ "bashls", "jsonls", "lua_ls", "pyright", "taplo", "yamlls" }) do assert(#vim.lsp.get_clients({ name = name, _uninitialized = true }) == 0, name .. " client spawned during configured foundation assertions") end' \
     -c 'qa!' > "$check_tmp/nvim-tests.txt" 2>&1 \
     && ! nvim_log_has_error "$check_tmp/nvim-tests.txt" \

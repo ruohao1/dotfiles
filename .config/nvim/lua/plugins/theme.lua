@@ -8,6 +8,9 @@ return {
       style = "night",
       transparent = false,
       terminal_colors = true,
+      on_highlights = function(highlights)
+        highlights.MiniStarterCurrent = { link = "Visual" }
+      end,
       styles = {
         comments = { italic = true },
         keywords = { italic = true },
