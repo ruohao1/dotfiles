@@ -7,11 +7,15 @@ import importlib.util
 import json
 import os
 import plistlib
+import pty
+import select
+import signal
 import sys
 from pathlib import Path
 import shutil
 import subprocess
 import shlex
+import time
 from unittest.mock import patch
 import unittest
 
@@ -83,6 +87,91 @@ class TerminalTests(unittest.TestCase):
         result = subprocess.run([sys.executable, "-B", str(ARGS.source_root / "nix/tests/test_update_tmux.py")],
                                 env=environment, cwd=self.home, capture_output=True, text=True, timeout=90)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_navigation_routes_to_editor_or_tmux_in_all_directions(self):
+        self.env["TERM"] = "xterm-256color"
+        receiver = self.root / "receiver.py"
+        receiver.write_text("import os, pathlib, sys, tty\n"
+                            "tty.setraw(0)\n"
+                            "with pathlib.Path(sys.argv[1]).open('wb', buffering=0) as capture:\n"
+                            "    while True:\n"
+                            "        data = os.read(0, 1024)\n"
+                            "        if not data: break\n"
+                            "        capture.write(data)\n")
+
+        def tmux(*args):
+            result = self.command([self.tmux, "-S", str(self.socket), *args])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip()
+
+        def pane_command(name):
+            return shlex.join([sys.executable, str(receiver), str(self.root / name)])
+
+        left = tmux("-f", "/dev/null", "new-session", "-d", "-P", "-F", "#{pane_id}",
+                    "-x", "120", "-y", "40", "-s", "navigation", pane_command("left"))
+        right = tmux("split-window", "-h", "-P", "-F", "#{pane_id}", "-t", left, pane_command("right"))
+        top = tmux("new-window", "-P", "-F", "#{pane_id}", "-t", "navigation:", pane_command("top"))
+        bottom = tmux("split-window", "-v", "-P", "-F", "#{pane_id}", "-t", top, pane_command("bottom"))
+        tmux("source-file", str(ARGS.source_root / ".config/tmux/conf/keys.conf"))
+        tmux("set-option", "-g", "escape-time", "10")
+        tmux("set-window-option", "-g", "mode-keys", "vi")
+        pid, master = pty.fork()
+        if pid == 0:
+            os.execve(self.tmux, [self.tmux, "-S", str(self.socket), "attach-session", "-t", "navigation"], self.env)
+
+        def stop_client():
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            os.waitpid(pid, 0)
+            os.close(master)
+
+        self.addCleanup(stop_client)
+
+        def wait(predicate):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                while select.select([master], [], [], 0)[0]:
+                    try:
+                        if not os.read(master, 65536):
+                            break
+                    except OSError:
+                        break
+                if predicate():
+                    return
+                time.sleep(0.02)
+            self.fail("navigation did not reach the expected pane or deliver the key")
+
+        wait(lambda: tmux("list-clients", "-F", "#{client_name}"))
+        for key, source, target, name in [("h", right, left, "right"), ("l", left, right, "left"),
+                                          ("j", top, bottom, "top"), ("k", bottom, top, "bottom")]:
+            capture = self.root / name
+            wait(capture.exists)
+            for marker in [None, "1", "0"]:
+                with self.subTest(key=key, marker=marker):
+                    tmux("select-window", "-t", source)
+                    tmux("select-pane", "-t", source)
+                    if marker is None:
+                        tmux("set-option", "-pu", "-t", source, "@pane-is-vim")
+                    else:
+                        tmux("set-option", "-p", "-t", source, "@pane-is-vim", marker)
+                    before = capture.read_bytes()
+                    os.write(master, b"\x1b" + key.encode())
+                    if marker == "1":
+                        wait(lambda: capture.read_bytes() != before)
+                        self.assertEqual(capture.read_bytes(), before + b"\x1b" + key.encode())
+                        self.assertEqual(tmux("display-message", "-p", "#{pane_id}"), source)
+                    else:
+                        wait(lambda: tmux("display-message", "-p", "#{pane_id}") == target)
+                        self.assertEqual(capture.read_bytes(), before)
+            with self.subTest(key=key, mode="copy-mode-vi"):
+                tmux("select-pane", "-t", source)
+                tmux("set-option", "-p", "-t", source, "@pane-is-vim", "1")
+                tmux("copy-mode", "-t", source)
+                os.write(master, b"\x1b" + key.encode())
+                wait(lambda: tmux("display-message", "-p", "#{pane_id}") == target)
+                tmux("send-keys", "-t", source, "-X", "cancel")
 
     def test_relative_link_invocations_find_workspace_source(self):
         real = self.home / "real"

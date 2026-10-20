@@ -22,6 +22,11 @@ split navigation still work. The configured stack opts in through
 registration is checked at startup; enabling the stack later requires restarting
 Neovim. Status handoff can recover while the editor stays open.
 
+With the dotfiles tmux bindings, `Alt+h/j/k/l` moves through Neovim splits
+and into tmux panes at editor edges. Shell panes and tmux copy mode use those
+keys for direct tmux navigation. The eagerly loaded `smart-splits` plugin marks
+the editor pane and clears its mark when Neovim exits or suspends.
+
 A bare `nvim` launch opens a single MiniStarter buffer. Opening a file, reading
 stdin, restoring a session, or using a remote invocation keeps the usual startup
 behavior.

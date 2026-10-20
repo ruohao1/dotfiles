@@ -556,10 +556,10 @@ tmux_pristine_binding_delta_is_exact() {
         approve("root", "M-Q", "kill-window")
         approve("root", ENVIRON["TMUX_EXPECTED_BACKSLASH_KEY"], "split-window -h -c \"#{pane_current_path}\"")
         approve("root", "M-|", "split-window -v -c \"#{pane_current_path}\"")
-        approve("root", "M-h", "select-pane -L")
-        approve("root", "M-j", "select-pane -D")
-        approve("root", "M-k", "select-pane -U")
-        approve("root", "M-l", "select-pane -R")
+        approve("root", "M-h", "if-shell -F \"#{@pane-is-vim}\" \"send-keys M-h\" \"select-pane -L\"")
+        approve("root", "M-j", "if-shell -F \"#{@pane-is-vim}\" \"send-keys M-j\" \"select-pane -D\"")
+        approve("root", "M-k", "if-shell -F \"#{@pane-is-vim}\" \"send-keys M-k\" \"select-pane -U\"")
+        approve("root", "M-l", "if-shell -F \"#{@pane-is-vim}\" \"send-keys M-l\" \"select-pane -R\"")
         approve("root", "M-q", "confirm-before -p \"Kill pane #P? (y/n)\" kill-pane")
         approve("root", "M-f", "resize-pane -Z")
 
@@ -10907,10 +10907,10 @@ TASK6_APPLICATION_CASES
   # Default list-keys escapes a backslash as M-\\; ENVIRON preserves both bytes.
   require_tmux_binding "$check_tmp/tmux-root-keys.txt" root "$serialized_backslash_key" 'split-window -h -c "#{pane_current_path}"' "tmux Meta-backslash splits right" || true
   require_tmux_binding "$check_tmp/tmux-root-keys.txt" root 'M-|' 'split-window -v -c "#{pane_current_path}"' "tmux Meta-pipe splits down" || true
-  require_tmux_binding "$check_tmp/tmux-root-keys.txt" root M-h 'select-pane -L' "tmux Meta-h always focuses the left tmux pane" || true
-  require_tmux_binding "$check_tmp/tmux-root-keys.txt" root M-j 'select-pane -D' "tmux Meta-j always focuses the lower tmux pane" || true
-  require_tmux_binding "$check_tmp/tmux-root-keys.txt" root M-k 'select-pane -U' "tmux Meta-k always focuses the upper tmux pane" || true
-  require_tmux_binding "$check_tmp/tmux-root-keys.txt" root M-l 'select-pane -R' "tmux Meta-l always focuses the right tmux pane" || true
+  require_tmux_binding "$check_tmp/tmux-root-keys.txt" root M-h 'if-shell -F "#{@pane-is-vim}" "send-keys M-h" "select-pane -L"' "tmux Meta-h routes left through Neovim splits" || true
+  require_tmux_binding "$check_tmp/tmux-root-keys.txt" root M-j 'if-shell -F "#{@pane-is-vim}" "send-keys M-j" "select-pane -D"' "tmux Meta-j routes down through Neovim splits" || true
+  require_tmux_binding "$check_tmp/tmux-root-keys.txt" root M-k 'if-shell -F "#{@pane-is-vim}" "send-keys M-k" "select-pane -U"' "tmux Meta-k routes up through Neovim splits" || true
+  require_tmux_binding "$check_tmp/tmux-root-keys.txt" root M-l 'if-shell -F "#{@pane-is-vim}" "send-keys M-l" "select-pane -R"' "tmux Meta-l routes right through Neovim splits" || true
   require_tmux_binding "$check_tmp/tmux-root-keys.txt" root M-q \
     'confirm-before -p "Kill pane #P? (y/n)" kill-pane' \
     "tmux Meta-q confirms before closing the pane" || true
@@ -10923,12 +10923,6 @@ TASK6_APPLICATION_CASES
       "$key" \
       "tmux root key $key is reserved for direct Neovim pass-through" || true
   done
-
-  if grep -Fq '#{@pane-is-vim}' "$check_tmp/tmux-root-keys.txt"; then
-    fail "tmux root table still contains conditional Neovim routing"
-  else
-    pass "tmux root table always owns multiplexer pane focus"
-  fi
 
   require_tmux_binding "$check_tmp/tmux-resize-keys.txt" resize h 'resize-pane -L 1 \; switch-client -T resize' "tmux resize h shrinks left by one cell and stays active" || true
   require_tmux_binding "$check_tmp/tmux-resize-keys.txt" resize j 'resize-pane -D 1 \; switch-client -T resize' "tmux resize j grows down by one cell and stays active" || true
@@ -15368,7 +15362,7 @@ run_interactive_matrix() {
   ask "tmux Meta-n created a window and Meta-1 through 9 selected windows"
   ask "tmux Meta-r renamed a window and Meta-Shift-q closed a disposable window"
   ask "tmux Meta-backslash split right and Meta-pipe split down"
-  ask "tmux Meta-h j k l always moved between tmux panes, including over Neovim"
+  ask "tmux Meta-h j k l moved through Neovim splits, crossed into tmux panes at editor edges, and returned"
   ask "tmux prefix+Shift-h j k l swapped with the matching neighbor and kept that process focused"
   ask "tmux pane swaps did not wrap at outer edges"
   ask "tmux prefix+m moved a disposable pane to the right side of a selected window and followed it"
