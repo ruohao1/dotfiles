@@ -8,6 +8,7 @@ import shutil
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import time
@@ -169,25 +170,60 @@ class UpdateTmuxTests(unittest.TestCase):
         time.sleep(1.2)
         self.assertEqual(self.calls.read_text(), calls)
 
-    def test_checker_accepts_only_the_exact_updater_job(self):
+    def audit_status_jobs(self):
         source = (SOURCE / '.config/dotfiles/check-terminal-stack').read_text()
         function = 'tmux_status_jobs_are_exact() {' + source.split('tmux_status_jobs_are_exact() {', 1)[1].split('\n}\n', 1)[0] + '\n}\n'
         harness = self.root / 'audit.sh'
         harness.write_text(function + '\ntmux_status_jobs_are_exact "$1" updates\n')
-        def audit():
-            return subprocess.run(['/bin/sh', str(harness), str(self.socket)], env=self.env,
-                                  cwd=self.home, text=True, capture_output=True, timeout=10)
-        result = audit()
+        return subprocess.run(['/bin/sh', str(harness), str(self.socket)], env=self.env,
+                              cwd=self.home, text=True, capture_output=True, timeout=10)
+
+    def test_checker_accepts_only_the_exact_updater_job(self):
+        result = self.audit_status_jobs()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         original = self.command('show-options', '-gv', 'status-right')
         for replacement in ['check', 'status --tmux && id', 'status --tmux --unsafe']:
             with self.subTest(replacement=replacement):
                 self.command('set-option', '-g', 'status-right', original.replace('status --tmux', replacement))
-                self.assertNotEqual(audit().returncode, 0)
+                self.assertNotEqual(self.audit_status_jobs().returncode, 0)
         self.command('set-option', '-g', 'status-right', original.replace('command -v dotfiles-update >/dev/null 2>&1 && exec ', ''))
-        self.assertNotEqual(audit().returncode, 0)
+        self.assertNotEqual(self.audit_status_jobs().returncode, 0)
         self.command('set-option', '-g', 'status-right', original)
-        self.assertEqual(audit().returncode, 0)
+        self.assertEqual(self.audit_status_jobs().returncode, 0)
+
+    def test_checker_accepts_escaped_show_output_without_decoding_stored_escapes(self):
+        # tmux 3.4 escapes variable dollars in cmdq_print, including both commands.
+        wrapper = self.bin / 'tmux'
+        wrapper.write_text('#!' + sys.executable + '\nimport re, subprocess, sys\n'
+                           + 'result = subprocess.run([' + repr(self.tmux) + ', *sys.argv[1:]], capture_output=True)\n'
+                           + 'value = result.stdout\n'
+                           + 'if "show-options" in sys.argv or "display-message" in sys.argv:\n'
+                           + '    value = re.sub(rb"\\$(?=[A-Za-z_{])", lambda m: b"\\\\" + m[0], value)\n'
+                           + 'sys.stdout.buffer.write(value)\nsys.stderr.buffer.write(result.stderr)\n'
+                           + 'sys.exit(result.returncode)\n')
+        wrapper.chmod(0o755)
+        result = self.audit_status_jobs()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        original = next(line for line in (SOURCE / '.config/tmux/conf/status.conf').read_text().splitlines()
+                        if line.startswith("set -g status-left '")).split("'", 1)[1][:-1]
+        for replacement in [r'\$HOME', r'\\$HOME', '${HOME}', '$HOME/../foreign']:
+            with self.subTest(replacement=replacement):
+                self.command('set-option', '-g', 'status-left', original.replace('$HOME', replacement))
+                self.assertNotEqual(self.audit_status_jobs().returncode, 0)
+        self.command('set-option', '-g', 'status-left', original)
+        self.assertEqual(self.audit_status_jobs().returncode, 0)
+
+    def test_checker_audits_global_values_without_expanding_jobs(self):
+        original = next(line for line in (SOURCE / '.config/tmux/conf/status.conf').read_text().splitlines()
+                        if line.startswith("set -g status-left '")).split("'", 1)[1][:-1]
+        marker = self.root / 'must-not-exist'
+        self.command('set-option', '-g', '@unsafe', '#(touch ' + str(marker) + ')')
+        self.command('set-option', '-g', 'status-left', original + ' #{E:@unsafe} #(touch ' + str(marker) + ')')
+        self.command('set-option', '-t', 'updates', 'status-left', original)
+        self.assertNotEqual(self.audit_status_jobs().returncode, 0, 'safe local override hid altered global status')
+        self.assertFalse(marker.exists(), 'auditing expanded or executed the stored format')
+        self.command('set-option', '-g', 'status-left', original)
+        self.assertEqual(self.audit_status_jobs().returncode, 0)
 
     def test_detached_session_does_not_start_updater(self):
         self.helper()

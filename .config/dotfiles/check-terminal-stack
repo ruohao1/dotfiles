@@ -1639,8 +1639,10 @@ tmux_status_jobs_are_exact() {
       ;;
   esac
 
-  # shellcheck disable=SC2016  # This is the exact literal native job key.
-  TMUX_EXPECTED_STATUS_JOB='#($HOME/.config/dotfiles/git-summary --tmux-pane #{pane_id} --profile #{?#{e|>=:#{client_width},120},wide,#{?#{e|>=:#{client_width},100},medium,compact}})'
+  # Encode only the known literal through the same version-specific print transport.
+  # shellcheck disable=SC2016  # l: prevents expansion or execution of the exact job key.
+  TMUX_EXPECTED_STATUS_JOB=$(tmux -S "$tmux_audit_socket" display-message -p \
+    '#{l:#($HOME/.config/dotfiles/git-summary --tmux-pane #{pane_id} --profile #{?#{e|>=:#{client_width},120},wide,#{?#{e|>=:#{client_width},100},medium,compact}})}') || return 1
   TMUX_EXPECTED_UPDATE_JOB='#(command -v dotfiles-update >/dev/null 2>&1 && exec dotfiles-update status --tmux 2>/dev/null)'
   export TMUX_EXPECTED_STATUS_JOB TMUX_EXPECTED_UPDATE_JOB
 
