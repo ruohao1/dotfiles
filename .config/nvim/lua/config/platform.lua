@@ -35,7 +35,7 @@ function M.tmux_probe_argv(origin)
 end
 
 function M.parse_tmux_probe(origin, result)
-  if not result or result.code ~= 0 then
+  if not result or result.code ~= 0 or (result.signal or 0) ~= 0 then
     return nil, "The editor's tmux session is no longer available"
   end
   for line in (result.stdout or ""):gmatch("[^\n]+") do

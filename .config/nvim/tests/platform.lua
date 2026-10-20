@@ -165,8 +165,12 @@ for _, case in ipairs({
   { text = "42\t$3\t%7\t1\tinvalid\n" },
   { text = "" },
   { text = "42\t$3\t%7\t1\ton\n", code = 124 },
+  { text = "42\t$3\t%7\t1\ton\n", signal = 9 },
 }) do
-  local result = platform.parse_tmux_probe(origin, { code = case.code or 0, stdout = case.text })
+  local result = platform.parse_tmux_probe(
+    origin,
+    { code = case.code or 0, signal = case.signal or 0, stdout = case.text }
+  )
   assert_equal(
     result,
     case.want,

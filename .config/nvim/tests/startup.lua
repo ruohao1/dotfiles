@@ -1599,7 +1599,7 @@ local live_ok, live_error = xpcall(function()
     local regular = vim.fs.joinpath(child.root, "tmux.lua")
     write_file(regular, { "return true" })
     local restored = edit_and_inspect(child, regular)
-    eq(restored.laststatus, 0, "tmux keeps status row hidden after starter")
+    eq(restored.laststatus, 3, "invalid tmux restores native status after starter")
     assert(restored.filetype ~= "ministarter", "tmux regular file retained starter filetype")
   end)
 

@@ -12898,10 +12898,10 @@ if [ "$nvim_config_ready" = true ] && [ "$plugins_trusted" = true ] && command -
     TMUX=/tmp/dotfiles-invalid,0,0 TMUX_PANE=invalid-pane \
     XDG_CONFIG_HOME="$config_root" XDG_DATA_HOME="$data_home" TERM_PROGRAM=ghostty \
     nvim --headless -i NONE \
-    -c 'lua assert(vim.o.laststatus == 0); assert(vim.o.cmdheight == 0); assert(vim.o.showmode == false); assert(vim.o.statusline == "" or not vim.o.statusline:find("dotfiles_statusline", 1, true))' \
+    -c 'lua require("ui.statusline").set_startup_visible(false); assert(vim.o.laststatus == 3); assert(vim.o.cmdheight == 0); assert(vim.o.showmode == false); assert(vim.o.statusline:find("dotfiles_statusline", 1, true))' \
     -c qa > "$check_tmp/nvim-invalid-tmux.txt" 2>&1 \
     && ! nvim_log_has_error "$check_tmp/nvim-invalid-tmux.txt"; then
-    pass "Neovim keeps tmux row ownership for an invalid pane without publishing"
+    pass "Neovim retains native row ownership for an invalid tmux pane"
   else
     sed 's/^/      /' "$check_tmp/nvim-invalid-tmux.txt" >&2
     fail "Neovim invalid-pane tmux ownership assertions failed"
