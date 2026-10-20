@@ -1,6 +1,6 @@
 # Self-contained Neovim with optional dotfiles integrations
 
-Status: proposed design for user review; no implementation or runtime validation performed.
+Status: accepted on 2026-10-20. Implementation and validation are tracked in [ISQ-517](https://linear.app/isqrd/issue/ISQ-517).
 Tracking: [ISQ-512](https://linear.app/isqrd/issue/ISQ-512), planning [ISQ-513](https://linear.app/isqrd/issue/ISQ-513).
 Base: main `00de4799fbc3c2f10b09fac50def55cdaec1cceb`.
 Branch: `agent/nvim-boundaries-20261020`.

@@ -11,12 +11,16 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 
 TERMINAL_TESTS = ["workspace-state", "workspace-restore", "location-pins"]
 
 EDITOR_TESTS = {
+    "platform": "platform clipboard matrix: ok",
+    "statusline": "statusline ownership and event wiring: ok",
+    "tmux_persistence": "tmux persistence: ok",
     "startup_git": "Startup Git assertions: ok",
     "startup_layout": "Startup layout assertions: ok",
     "startup": "Neovim startup pure assertions: ok",
@@ -35,6 +39,13 @@ EDITOR_TESTS = {
     "data_query_tool": "data query tool assertions: ok",
     "data_query_workflow": "data query workflow assertions: ok",
     "data_query_health": "data query health assertions: ok",
+}
+
+STANDALONE_TESTS = {
+    name: EDITOR_TESTS[name] for name in [
+        "platform", "statusline", "tmux_persistence", "startup", "startup_git",
+        "startup_layout", "location_pin_picker", "location_pins",
+    ]
 }
 
 
@@ -71,7 +82,7 @@ def child_environment(home, nvim_root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=["editor-sources", "terminal", "bootstrap"], required=True)
+    parser.add_argument("--suite", choices=["editor-sources", "editor-standalone", "terminal", "bootstrap"], required=True)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--fixture-root", type=Path, required=True)
     parser.add_argument("--generation", type=Path)
@@ -146,16 +157,29 @@ def main():
                 raise RuntimeError("terminal source inputs changed during focused tests")
         print(f"terminal sources: {len(TERMINAL_TESTS)}/{len(TERMINAL_TESTS)} passed; source unchanged")
         return
-    for name in EDITOR_TESTS:
+    standalone = args.suite == "editor-standalone"
+    tests = STANDALONE_TESTS if standalone else EDITOR_TESTS
+    for name in tests:
         if not (nvim_root / "tests" / f"{name}.lua").is_file():
             parser.error(f"missing source test: {name}")
     before = fingerprint(nvim_root)
     fixture.mkdir(mode=0o700)
+    source_nvim = nvim_root
     try:
-        for name, marker in EDITOR_TESTS.items():
-            home = fixture / name / "home"
+        if standalone:
+            # A source link could silently reintroduce the sibling dependency.
+            for path in [nvim_root, *nvim_root.rglob("*")]:
+                if path.is_symlink() or not (path.is_file() or path.is_dir()):
+                    raise RuntimeError(f"standalone source must contain only regular files/directories: {path}")
+            nvim_root = fixture / "nvim"
+            shutil.copytree(source_nvim, nvim_root)
+        for index, (name, marker) in enumerate(tests.items()):
+            # Keep Unix socket names below the platform's path-length limit.
+            home = fixture / str(index) / "h"
             home.mkdir(mode=0o700, parents=True)
             env = child_environment(home, nvim_root)
+            if standalone:
+                env["DOTFILES_EDITOR_STANDALONE"] = "1"
             command = ["nvim", "--clean", "--headless", "-u", "NONE", "-i", "NONE",
                        "-c", "lua vim.opt.runtimepath:prepend(vim.env.DOTFILES_NVIM_ROOT)",
                        "-l", str(nvim_root / "tests" / f"{name}.lua")]
@@ -172,9 +196,9 @@ def main():
                 raise RuntimeError(f"focused editor source check failed: {name}")
             print(f"PASS {name}")
     finally:
-        if fingerprint(nvim_root) != before:
+        if fingerprint(source_nvim) != before:
             raise RuntimeError("editor source inputs changed during focused tests")
-    print(f"editor sources: {len(EDITOR_TESTS)}/{len(EDITOR_TESTS)} passed; source unchanged")
+    print(f"{args.suite}: {len(tests)}/{len(tests)} passed; source unchanged")
 
 
 if __name__ == "__main__":

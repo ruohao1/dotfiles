@@ -10,7 +10,7 @@
 
 **Spec:** [Neovim boundaries design](../specs/2026-10-20-neovim-boundaries-design.md).
 
-Status: proposed plan for user review; all implementation steps remain unchecked.
+Status: accepted on 2026-10-20; execution and exact validation evidence are tracked in [ISQ-517](https://linear.app/isqrd/issue/ISQ-517).
 Tracking: [ISQ-512](https://linear.app/isqrd/issue/ISQ-512) / [ISQ-513](https://linear.app/isqrd/issue/ISQ-513).
 Base: `00de4799fbc3c2f10b09fac50def55cdaec1cceb`.
 Branch: `agent/nvim-boundaries-20261020`. Keep both planning documents in the implementation PR.
@@ -40,6 +40,11 @@ Branch: `agent/nvim-boundaries-20261020`. Keep both planning documents in the im
 Use four sequential implementation commits, each with focused tests and a review checkpoint. Tasks 2 and 3 share Task 1 interfaces; do not let separate writers edit `config/platform.lua`, `ui/statusline.lua` or their tests concurrently. Root coordinates commits and acceptance.
 
 Recommended execution: one implementer handles the four dependent tasks; an independent reviewer checks the resulting branch and critical status-ownership changes. Source/deployment analysis has already been parallelized. Do not rerun the large migration VM unless implementation changes its actual ownership/schema scope.
+
+Execution adjustment: after Task 1 fixed the common interfaces, Tasks 2 and 3
+received disjoint file ownership and ran in parallel. The coordinator owns shared
+APIs, runner/documentation changes, integration and final review. No deployed
+files are added or moved.
 
 Before implementation, create an exact active Linear writing assignment from this plan and assign private test roots. Preserve this planning branch and old release evidence. A new runtime or builder lease belongs in that assignment; this document alone does not authorize starting retained infrastructure.
 

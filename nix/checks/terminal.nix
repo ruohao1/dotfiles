@@ -30,6 +30,10 @@ in pkgs.runCommand "dotfiles-terminal-check" {
   export HOME="$TMPDIR/check-home"
   export PYTHONDONTWRITEBYTECODE=1
   mkdir -p "$HOME"
+  python3 -B ${sourceRoot}/nix/tests/test_editor_runner.py
+  ${testPrefix} python3 ${../tests/run-focused.py} --suite editor-standalone \
+    --source-root ${sourceRoot} \
+    --fixture-root "$TMPDIR/e"
   ${testPrefix} python3 ${../tests/test_terminal.py} \
     --source-root ${sourceRoot} --generation ${home.activationPackage} \
     --fixture-root "$TMPDIR/t"

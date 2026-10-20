@@ -168,6 +168,24 @@ reports test results and skips, and needs no Nix installation. These checks subs
 activation and service managers; a passing CI job does not establish Nix builds
 or native platform acceptance.
 
+The terminal Nix check also runs a copied Neovim-only source suite. Its fixture
+contains no sibling tmux or dotfiles tree, and each editor child has a private
+HOME, data/cache directories, temporary directory and log. To run it directly
+with installed Neovim 0.12 or newer and tmux, select a short, previously absent
+fixture path:
+
+```sh
+python3 -B nix/tests/run-focused.py --suite editor-standalone \
+  --source-root "$PWD" --fixture-root /tmp/nvim-standalone-check
+```
+
+This source gate uses `-u NONE`; it does not establish full plugin startup.
+Configured-editor validation uses separate isolated homes and prepared pinned
+plugins. Ordinary tmux keeps native editor status; dotfiles integrations remain
+optional. This refactor retains the existing deployed target list, canonical
+helper/RPC paths, writable `lazy-lock.json` and native bootstrap ownership.
+It introduces no additional installer or updater.
+
 From a normal source checkout, with the committed lock:
 
 ```sh
