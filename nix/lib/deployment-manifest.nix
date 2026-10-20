@@ -1,5 +1,5 @@
 # Schema 1 is consumed by preview/recovery; evaluated HM outputs are included.
-{ lib, pkgs, config, profile, system, nativeDependencies, mutableSeeds, selectedFiles }:
+{ lib, pkgs, config, profile, system, nativeDependencies, mutableSeeds, selectedFiles, deploymentIdentity ? null }:
 let
   home = config.home.homeDirectory;
   user = config.home.username;
@@ -161,4 +161,4 @@ assert builtins.all (seed: safeTarget seed.target && lib.hasPrefix "/nix/store/"
     partialFailure = "Pinned HM disables errexit and continues after agent failures; activation success alone does not prove manager success";
     preservation = "Unchanged copies skipped; diverged obsolete copies retained";
   } ];
-}
+} // lib.optionalAttrs (deploymentIdentity != null) { inherit deploymentIdentity; }

@@ -16,7 +16,7 @@
       mkHome = import ./nix/lib/mk-home.nix { inherit nixpkgs home-manager; };
       hosts = import ./nix/hosts.nix;
       homes = builtins.mapAttrs (_: identity: mkHome identity) hosts;
-      mkDotfilesApp = { system, flakeSource }:
+      mkDotfilesExecutor = { system, flakeSource }:
         let
           pkgs = import nixpkgs { inherit system; };
           inventory = import ./nix/packages.nix { inherit pkgs; };
@@ -25,6 +25,8 @@
           cliSource = pkgs.runCommand "dotfiles-migration-source" { } ''
             mkdir -p "$out/migration"
             cp ${./nix/migration}/*.py "$out/migration/"
+            # Recovery reevaluates the consumer; keep its locked input sources live.
+            printf '%s\n' ${self.outPath} ${nixpkgs.outPath} ${home-manager.outPath} > "$out/evaluation-sources"
             substituteInPlace "$out/migration/cli.py" \
               --replace-fail 'PACKAGED_FLAKE_SOURCE = None' \
               ${pkgs.lib.escapeShellArg ("PACKAGED_FLAKE_SOURCE = " + builtins.toJSON (toString flakeSource))}
@@ -43,16 +45,29 @@
             export DOTFILES_CALLER_PATH="$PATH"
             exec ${dotfiles}/bin/dotfiles "$@"
           '';
-        in {
-          type = "app";
-          program = toString launcher;
-          meta.description = "Inspect dotfiles ownership and preview Nix home migrations";
-        };
+        in launcher;
+      mkDotfilesApp = arguments: {
+        type = "app";
+        program = toString (mkDotfilesExecutor arguments);
+        meta.description = "Inspect dotfiles ownership and preview Nix home migrations";
+      };
     in {
-      lib = { inherit mkHome mkDotfilesApp; };
+      lib = { inherit mkHome mkDotfilesExecutor mkDotfilesApp; };
+      templates.host = {
+        path = ./nix/templates/host;
+        description = "Private host configuration with a reviewed dotfiles release";
+      };
       homeConfigurations = homes;
+      packages = forSystems (system:
+        let pkgs = import nixpkgs { inherit system; };
+        in { dotfiles-update = pkgs.callPackage ./nix/update/package.nix { }; });
       apps = forSystems (system: {
         dotfiles = mkDotfilesApp { inherit system; flakeSource = self.outPath; };
+        dotfiles-update = {
+          type = "app";
+          program = "${self.packages.${system}.dotfiles-update}/bin/dotfiles-update";
+          meta.description = "Check and confirm updates to a configured dotfiles consumer";
+        };
       });
       checks = forSystems (system:
         let pkgs = import nixpkgs { inherit system; };
@@ -71,6 +86,7 @@
             touch "$out"
           '';
           migration = import ./nix/checks/migration.nix { inherit pkgs; };
+          update-lock = import ./nix/tests/update-lock.nix { inherit pkgs; };
           home = homes."check-${system}".activationPackage;
           terminal = import ./nix/checks/terminal.nix { inherit pkgs; home = homes."check-${system}"; };
           files = import ./nix/checks/files.nix { inherit pkgs mkHome; home = homes."check-${system}"; };

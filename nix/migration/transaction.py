@@ -362,6 +362,38 @@ def validate_activation_inputs(journal, runtime):
     validate_profile_inputs(journal, runtime, journal.data['generations'], allow_missing=True)
 
 
+def verify_provider_transition(transition, journal, runtime):
+    """Prove only the old/new selection authorized by activation's journal phase."""
+    plan, home = journal.data['plan'], journal.home
+    profile = home / '.nix-profile'
+    command = transition['command']
+    if transition['profile'] != str(profile) or str(profile) not in journal.data['profilesBefore']:
+        raise Conflict('provider transition does not name the owned canonical profile')
+    for prefix in ['from', 'to']:
+        generation = transition[prefix + 'Generation']
+        manifest = journal.data['generations'].get(generation)
+        requirement = next((item for item in (manifest or {}).get('commandRequirements', [])
+                            if item['command'] == command and 'provider' in item), None)
+        if (requirement is None or str(profile) not in manifest['profilePaths']
+                or str((Path(requirement['provider']) / 'bin' / command).resolve(strict=True)) != transition[prefix + 'Executable']
+                or fingerprint(transition[prefix + 'Executable']) != transition[prefix + 'State']):
+            raise Conflict('reviewed provider transition changed')
+    if transition['toGeneration'] != journal.data['manifest']['activationPackage']:
+        raise Conflict('provider transition selects an unreviewed generation')
+    phase = journal.data['steps'].get('activate')
+    allowed = (['from', 'to'] if phase == 'intent' else ['to'] if phase == 'complete' else ['from'])
+    generation = runtime.selected_generation(journal.data['manifest'])
+    direction = next((prefix for prefix in allowed if str(Path(transition[prefix + 'Generation']).resolve()) == generation), None)
+    selected = shutil.which(command, path=plan['providerPath'])
+    if (direction is None or selected != str(profile / 'bin' / command)
+            or str(Path(selected).resolve(strict=True)) != transition[direction + 'Executable']):
+        raise Conflict('caller provider transition differs from the proven activation phase')
+    check_profile_parents(profile, home)
+    check_package_selection(runtime.profile_packages(profile), journal.data['nativePackagesBefore'],
+                            {str((Path(generation) / 'home-path').resolve())})
+    return direction
+
+
 def verify_resumed_native(journal, lock, runtime):
     """Reobserve readiness; reconcile only journal-proven deployment effects."""
     from .prerequisites import inspect_native
@@ -371,19 +403,24 @@ def verify_resumed_native(journal, lock, runtime):
     if (plan['providerPath'] != caller or plan['runtimePath'] != os.environ.get('PATH', os.defpath)
             or plan['uid'] != os.getuid()):
         raise Conflict('native retry provider PATH or user identity changed')
+    transitions = {item['command']: item for item in plan.get('providerTransitions', [])}
+    directions = {command: verify_provider_transition(item, journal, runtime) for command, item in transitions.items()}
+    introduced_routes = {}
     for provider in plan['providers']:
         if fingerprint(provider['executable']) != provider['state']:
             raise Conflict('reviewed executable changed before resumed handoff')
+        if provider['command'] in transitions:
+            continue
         selected = shutil.which(provider['command'], path=caller)
         if selected is not None and Path(selected).resolve(strict=True) != Path(provider['executable']).resolve(strict=True):
             raise Conflict('caller executable no longer resolves to reviewed provider')
         if selected == provider['selectedExecutable']:
             continue
-        # Installing the reviewed package can make a previously absent caller
-        # command available. Only the journal-owned profile may introduce it.
+        # Activation can introduce the canonical route for an absent command or
+        # one previously selected directly from its exact pinned provider.
         profile = home / '.nix-profile'
         generation = Path(manifest['activationPackage'])
-        if (provider['selectedExecutable'] is not None
+        if (provider['selectedExecutable'] not in [None, provider['executable']]
                 or journal.data['steps'].get('activate') not in ['intent', 'complete']
                 or str(profile) not in journal.data['profilesBefore']
                 or selected != str(profile / 'bin' / provider['command'])):
@@ -393,6 +430,7 @@ def verify_resumed_native(journal, lock, runtime):
             raise Conflict('new caller provider does not select reviewed generation')
         check_package_selection(runtime.profile_packages(profile), journal.data['nativePackagesBefore'],
                                 {str((generation / 'home-path').resolve())})
+        introduced_routes[selected] = provider
     owned = {str(home / item['target']): item for item in normalized_files(manifest)}
     originals = {item['path']: item for item in plan['files']}
     records = {item['path']: (index, item) for index, item in enumerate(journal.data['records'])}
@@ -461,8 +499,38 @@ def verify_resumed_native(journal, lock, runtime):
     for old, new in zip(previous, current):
         config_route(old)
         config_route(new)
+        for route, provider in introduced_routes.items():
+            if route not in new['observations'] or route in old['observations']:
+                continue
+            pinned = provider['executable']
+            def observed(path):
+                info = Path(path).lstat()
+                return dict(fingerprint(path), device=info.st_dev, inode=info.st_ino)
+            # uv's collector observes its caller route separately from the
+            # pinned runtime probe. Reconcile only the proven alias, retaining
+            # original provider evidence (or recorded absence) and queries.
+            before = old['observations'].get(pinned)
+            if (fingerprint(pinned) != provider['state']
+                    or (before is None and provider['selectedExecutable'] is not None)
+                    or (before is not None and before != observed(pinned))
+                    or new['observations'][route] != observed(route)
+                    or (pinned in new['observations'] and new['observations'][pinned] != before)):
+                raise Conflict('native canonical provider route differs from reviewed executable')
+            new['observations'].pop(route)
+            if before is not None:
+                new['observations'][pinned] = before
         for path in old['observations'].keys() | new['observations'].keys():
             if old['observations'].get(path) == new['observations'].get(path):
+                continue
+            transition = next((item for command, item in transitions.items()
+                               if directions[command] == 'to' and path == str(Path(item['profile']) / 'bin' / command)), None)
+            if transition is not None and path in old['observations'] and path in new['observations']:
+                before = {key: value for key, value in old['observations'][path].items() if key not in ['device', 'inode']}
+                info = Path(path).lstat()
+                after = dict(fingerprint(path), device=info.st_dev, inode=info.st_ino)
+                if before != plan['evidence'][path] or new['observations'][path] != after:
+                    raise Conflict('native owned-provider observation differs from reviewed transition')
+                new['observations'][path] = old['observations'][path]
                 continue
             if path not in owned or path not in old['observations'] or path not in new['observations']:
                 raise Conflict('native provider or session observation changed: ' + path)
@@ -586,7 +654,8 @@ def restore_legacy(home, transaction, *, runtime=None):
                 chain.append(journal)
                 selected = journal.data.get('parentTransaction')
             if transaction not in [item.data['transactionId'] for item in chain]:
-                raise Conflict('another transaction owns this home')
+                _cancel_unpublished_child(Journal(home, transaction), chain[0], owner, lock, runtime)
+                return
         for journal in chain:
             if journal.data['phase'] != 'restored':
                 _restore_frame(journal, lock, runtime)
@@ -596,6 +665,41 @@ def restore_legacy(home, transaction, *, runtime=None):
             if owner['transactionId'] not in [item.data['transactionId'] for item in chain]:
                 raise Conflict('ownership changed during recovery')
             (ownership_root(home) / 'owner.json').unlink()
+
+
+def _cancel_unpublished_child(child, parent, owner, lock, runtime):
+    # The initial journal save can precede ownership publication. Reversing
+    # that frame must not restore or stop the still-active parent deployment.
+    if (owner['phase'] != 'home-manager' or parent.data['phase'] != 'active'
+            or parent.data.get('rollback', {}).get('state') == 'intent'
+            or owner['journalPath'] != str(parent.path)
+            or owner['manifestFingerprint'] != parent.data['plan']['manifestFingerprint']
+            or owner['selectedGeneration'] != parent.data['selectedGeneration']
+            or child.data.get('parentTransaction') != owner['transactionId']
+            or child.data['plan'].get('ownership') != owner
+            or child.data['phase'] not in ['prepared', 'restored']
+            or child.data['steps'] not in [{}, {'publish-transferring': 'intent'}]
+            or child.data.get('rollback')
+            or child.data['selectedGeneration'] != child.data['plan']['selectedGeneration']
+            or child.data['nativePackagesBefore'] != parent.data['nativePackagesBefore']):
+        raise Conflict('another transaction owns this home; child is not provably unpublished')
+    for record in child.data['records']:
+        path, backup = Path(record['path']), Path(record['backupPath'])
+        check_profile_parents(path, child.home)
+        check_profile_parents(backup, child.home)
+        if leaf_state(path) != record['state'] or leaf_state(backup)['type'] != 'absent':
+            raise Conflict('unpublished child files changed; retaining recovery guard')
+    for text, before in child.data['profilesBefore'].items():
+        check_profile_parents(Path(text), child.home)
+        if leaf_state(text) != before:
+            raise Conflict('unpublished child profile changed; retaining recovery guard')
+    verify_transaction(parent, parent.data['generations'][owner['selectedGeneration']], runtime)
+    lock.recheck()
+    if read_owner(child.home) != owner:
+        raise Conflict('ownership changed during unpublished child recovery')
+    if child.data['phase'] != 'restored':
+        child.data['phase'] = 'restored'
+        child.save()
 
 
 def archive_profile(journal, path, current, label):

@@ -299,7 +299,7 @@ time.sleep(10)
 # Independent contract inventory: removing a declaration cannot make coverage pass.
 COMMON_COMMANDS = {
     "git", "python3", "nvim", "tmux", "fzf", "rg", "jq", "shellcheck", "stylua",
-    "tree-sitter", "herdr", "identify", "convert", "uv", "node", "npm",
+    "tree-sitter", "herdr", "identify", "convert", "uv", "node", "npm", "dotfiles-update",
     "bash-language-server", "pyright", "pyright-langserver", "vscode-json-language-server",
     "yaml-language-server", "lua-language-server", "taplo", "iconv", "sha256sum",
     "shasum", "bash", "curl", "awk", "sed", "grep", "find", "diff", "tar", "gzip",

@@ -14,38 +14,73 @@ let
     home.activation.fixtureInterruptionWindow = lib.hm.dag.entryAfter [ "linkGeneration" ] "${pkgs.coreutils}/bin/sleep 12";
   };
   second = mkHome (identity // { modules = [ common secondModule ]; });
+  # Official immutable uv release 338153758; GitHub's asset SHA256 pins the
+  # actual older binary, rather than relabeling the locked package's version.
+  releaseNixpkgs = nixpkgs // {
+    outPath = builtins.toFile "fixture-release-nixpkgs.nix" ''
+      args: let pkgs = import ${nixpkgs} args; in pkgs.extend (_: _: {
+        uv = pkgs.stdenvNoCC.mkDerivation {
+          pname = "uv"; version = "0.11.21";
+          src = pkgs.fetchurl {
+            url = "https://github.com/astral-sh/uv/releases/download/0.11.21/uv-x86_64-unknown-linux-musl.tar.gz";
+            sha256 = "9dadff5b9e7b1d2d011e41852a1cbca713d9d5d88194f2eb6bd240fa4fb0a719";
+          };
+          sourceRoot = "uv-x86_64-unknown-linux-musl";
+          preUnpack = "export TAR_OPTIONS=--no-same-owner";
+          installPhase = "mkdir -p $out/bin; install -m755 uv uvx $out/bin/";
+          dontStrip = true;
+        };
+      })
+    '';
+  };
+  releaseLibA = ((import ../../flake.nix).outputs {
+    self.outPath = source; nixpkgs = releaseNixpkgs; inherit home-manager;
+  }).lib;
+  releaseInventoryA = import ../packages.nix { pkgs = import releaseNixpkgs { system = identity.system; }; };
+  releaseRecords = {
+    releaseA = { repository = "ruohao1/dotfiles"; releaseId = 1001; version = "v1.0.0"; commit = lib.concatStrings (lib.replicate 40 "a"); };
+    releaseB = { repository = "ruohao1/dotfiles"; releaseId = 1002; version = "v1.1.0"; commit = lib.concatStrings (lib.replicate 40 "b"); };
+  };
+  releaseSources = lib.mapAttrs (_: record: pkgs.writeTextDir "dotfiles-release.json" (builtins.toJSON record)) releaseRecords;
+  releaseHome = name: factory: factory (identity // {
+    modules = [ common ];
+    deploymentIdentity = { schema = 1; release = releaseRecords.${name}; consumerSource = toString releaseSources.${name}; profile = "fixture-host"; };
+  });
+  releaseA = releaseHome "releaseA" releaseLibA.mkHome;
+  releaseB = releaseHome "releaseB" mkHome;
   manifest = pkgs.writeText "fixture-manifest.json" (builtins.toJSON first.deploymentManifest);
-  # Evaluate both full HM configurations here; the guest projects those exact
+  # Evaluate the full HM configurations here; the guest projects those exact
   # immutable manifests and output derivations instead of reevaluating modules.
   fixtureProfiles = pkgs.writeTextDir "profiles.json" (builtins.toJSON (lib.mapAttrs (_: profile: {
     manifest = profile.deploymentManifest;
     generation = toString profile.activationPackage;
     # Provenance only: guest realizes the exact already-built immutable output.
     drvPath = builtins.unsafeDiscardStringContext profile.activationPackage.drvPath;
-  }) { inherit first second; }));
-  fixtureFlake = pkgs.writeText "flake.nix" ''
+  }) { inherit first second releaseA releaseB; }));
+  mkFixtureFlake = selected: pkgs.writeText "flake.nix" ''
     {
       inputs.profiles = { url = "path:${fixtureProfiles}"; flake = false; };
       outputs = { profiles, ... }:
-      let data = builtins.fromJSON (builtins.readFile (profiles + "/profiles.json"));
-      in {
-        homeConfigurations = builtins.mapAttrs (_: profile: {
+      let
+        data = builtins.fromJSON (builtins.readFile (profiles + "/profiles.json"));
+        configurations = builtins.mapAttrs (_: profile: {
           deploymentManifest = profile.manifest;
           activationPackage = builtins.appendContext profile.generation {
             "''${profile.generation}" = { path = true; };
           };
           activationDerivation = profile.drvPath;
         }) data;
-
+      in {
+        homeConfigurations = ${if selected == null then "configurations" else "{ fixture-host = configurations.${selected}; }"};
       };
     }
   '';
   # Hash the actual immutable payload, without daemon realization in a build.
-  fixtureSource = pkgs.runCommand "dotfiles-fixture-profile-source" {
+  mkFixtureSource = selected: pkgs.runCommand "dotfiles-fixture-profile-source" {
     nativeBuildInputs = [ pkgs.nix pkgs.python3 ];
   } ''
     mkdir -p "$out"
-    cp ${fixtureFlake} "$out/flake.nix"
+    cp ${mkFixtureFlake selected} "$out/flake.nix"
     payloadHash=$(nix --extra-experimental-features nix-command hash path --sri ${fixtureProfiles})
     python3 - "$out/flake.lock" "$payloadHash" <<'PY'
     import json,sys
@@ -57,7 +92,20 @@ let
         json.dump(lock,stream,sort_keys=True,indent=2); stream.write('\n')
     PY
   '';
+  fixtureFlake = mkFixtureFlake null;
+  fixtureSource = mkFixtureSource null;
   fixtureApp = mkDotfilesApp { system = "x86_64-linux"; flakeSource = fixtureSource; };
+  releaseAppA = releaseLibA.mkDotfilesApp { system = identity.system; flakeSource = mkFixtureSource "releaseA"; };
+  releaseAppB = mkDotfilesApp { system = identity.system; flakeSource = mkFixtureSource "releaseB"; };
+  releaseFixture = pkgs.writeText "fixture-release-update.json" (builtins.toJSON {
+    source = toString source;
+    profiles = "${fixtureProfiles}/profiles.json";
+    sources = { releaseA = toString (mkFixtureSource "releaseA"); releaseB = toString (mkFixtureSource "releaseB"); };
+    executors = { releaseA = releaseAppA.program; releaseB = releaseAppB.program; };
+    inventories = { releaseA = releaseInventoryA.commandRequirements; releaseB = inventory.commandRequirements; };
+    versions = { releaseA = "0.11.21"; releaseB = pkgs.uv.version; };
+    nativePackage = toString pkgs.weston;
+  });
   # Separate facade avoids source -> app -> source recursion; the real outer
   # nix run remains covered, and nested evaluation selects fixtureSource.
   fixtureFacade = pkgs.runCommand "dotfiles-fixture-app-source" { } ''
@@ -175,7 +223,7 @@ let
         evidence[name]={'generation':generation,'prebuildDerivation':derivation,'fullManifestEqual':True,'offlineBuild':True}
     with open('/var/tmp/isq318-reviews/projection.json','w') as stream:
         json.dump(evidence,stream,sort_keys=True)
-    print('Both actual profile projections verified:',json.dumps(evidence,sort_keys=True))
+    print('All actual profile projections verified:',json.dumps(evidence,sort_keys=True))
     PYTHON
     # Real native package baseline; all migration operations must preserve it.
     mkdir -p "$HOME/.local/state/nix/profiles"
@@ -255,6 +303,14 @@ let
     ${userEnvironment}
     exec nix run --offline --no-update-lock-file path:${fixtureFacade}#dotfiles -- "$@"
   '';
+  releaseCommand = pkgs.writeShellScript "fixture-release-update" ''
+    set -eu
+    ${userEnvironment}
+    # The owned canonical profile must win after adoption. The older fallback
+    # supplies real native prerequisites before release A owns that profile.
+    export PATH="$HOME/.nix-profile/bin:${lib.makeBinPath (releaseInventoryA.packages ++ [ pkgs.nix pkgs.systemd pkgs.ghostty pkgs.wl-clipboard pkgs.cliphist pkgs.bubblewrap ])}:$HOME/.local/bin"
+    exec ${pkgs.python3}/bin/python3 -B ${./update-integration.py} ${releaseFixture}
+  '';
 in pkgs.testers.runNixOSTest {
   name = "dotfiles-migration-vm";
   requiredFeatures = { kvm = false; devnet = false; uid-range = false; };
@@ -309,7 +365,7 @@ in pkgs.testers.runNixOSTest {
         qemu.networkingOptions = lib.mkForce [ ];
         qemu.options = [ "-cpu max" "-nic none" ];
       };
-      system.extraDependencies = [ first.activationPackage second.activationPackage prerequisites.wheelhouse prepare seedLegacy snapshot diagnose command fixtureFlake fixtureProfiles fixtureSource fixtureFacade ];
+      system.extraDependencies = [ first.activationPackage second.activationPackage releaseA.activationPackage releaseB.activationPackage prerequisites.wheelhouse prepare seedLegacy snapshot diagnose command releaseCommand fixtureFlake fixtureProfiles fixtureSource fixtureFacade ];
     };
   };
   testScript = ''
@@ -334,7 +390,28 @@ in pkgs.testers.runNixOSTest {
         try:
             return user("${command} " + args)
         except Exception:
+            retain_reviews("failed-command")
             print("Native failure diagnostics:", user("${diagnose}"))
+            raise
+    def retain_reviews(label):
+        # Guest-created profile symlinks cannot be dereferenced by the host.
+        archive = "/var/tmp/" + label + ".tar"
+        arguments = ["-C", "/var/tmp", "isq318-reviews"]
+        for name in ["dotfiles-update", "dotfiles-ownership"]:
+            parent = "/home/migrator/.local/state"
+            if machine.execute("test -d " + shlex.quote(parent + "/" + name))[0] == 0:
+                arguments += ["-C", parent, name]
+        machine.succeed("${pkgs.gnutar}/bin/tar -cf " + shlex.quote(archive) + " " + shlex.join(arguments))
+        machine.copy_from_machine(archive, label + ".tar")
+    def plan_fields(name, *fields):
+        # Full native observations can exceed the guest command channel's
+        # reliable output size. Keep the full plan in the evidence archive.
+        script = "import json,sys; p=json.load(open(sys.argv[1])); print(json.dumps({key:p[key] for key in sys.argv[2:]}))"
+        arguments = ["/var/tmp/isq318-reviews/" + name + ".json", *fields]
+        try:
+            return json.loads(user("${pkgs.python3}/bin/python3 -c " + shlex.quote(script) + " " + shlex.join(arguments)))
+        except Exception:
+            retain_reviews("failed-plan-read")
             raise
     def service_selection():
         output = user("${pkgs.systemd}/bin/systemctl --user show tmux-workspace.service --property=FragmentPath,ExecStart,LoadState,ActiveState,UnitFileState")
@@ -364,15 +441,15 @@ in pkgs.testers.runNixOSTest {
         """)
         return json.loads(user("${pkgs.python3}/bin/python3 -c " + shlex.quote(script) + " " + shlex.quote(label) + " " + shlex.quote(transaction)))
     user("${prepare}")
-    machine.copy_from_machine("/var/tmp/isq318-reviews", "native-preparation")
+    retain_reviews("native-preparation")
     # Native project files are prepared explicitly; other transferred targets
     # are absent. The read-only collector must handle this fresh-home case.
     before = user("${pkgs.python3}/bin/python3 ${snapshot}")
     user("DOTFILES_TEST_PACKAGED_APP=path:${fixtureFacade}#dotfiles DOTFILES_TEST_PROFILE=first DOTFILES_TEST_PLAN=/var/tmp/isq318-reviews/fresh.json DOTFILES_TEST_PROFILES=${fixtureProfiles}/profiles.json DOTFILES_TEST_PROFILE_SOURCE=${fixtureSource} ${pkgs.python3}/bin/python3 -B -m unittest discover -s ${source}/nix/tests -p test_entrypoint.py -k PackagedEntrypointTests")
     assert before == user("${pkgs.python3}/bin/python3 ${snapshot}"), "preview changed prepared home"
     print("Fresh prepared home read-only SHA256:", before.strip())
-    fresh = json.loads(user("cat /var/tmp/isq318-reviews/fresh.json"))
-    assert not fresh["conflicts"], {"conflicts": fresh["conflicts"], "native": fresh["nativePrerequisites"]}
+    fresh = plan_fields("fresh", "conflicts")
+    assert not fresh["conflicts"], fresh["conflicts"]
     user("test ! -e /home/migrator/.config/ghostty/config.ghostty")
     user("${seedLegacy}")
     machine.wait_until_succeeds("su -l migrator -c " + shlex.quote("${legacyReady}"), timeout=120)
@@ -386,7 +463,7 @@ in pkgs.testers.runNixOSTest {
     assert before == user("${pkgs.python3}/bin/python3 ${snapshot}"), "preview changed legacy home"
     print("Legacy prepared home read-only SHA256:", before.strip())
     user("${pkgs.python3}/bin/python3 -c \"import json; p=json.load(open('/var/tmp/isq318-reviews/first.json')); assert not p['conflicts'],p['conflicts']\"")
-    first_plan = json.loads(user("cat /var/tmp/isq318-reviews/first.json"))
+    first_plan = plan_fields("first", "providers")
     nvim_before = next(item for item in first_plan["providers"] if item["command"] == "nvim")
     assert nvim_before["selectedExecutable"] is None, nvim_before
     assert nvim_before["executable"] == "${pkgs.neovim}/bin/nvim", nvim_before
@@ -411,8 +488,8 @@ in pkgs.testers.runNixOSTest {
     user("${pkgs.python3}/bin/python3 ${profileEvidence} second-active second")
     app("rollback --generation ${first.activationPackage}")
     user("${pkgs.python3}/bin/python3 ${profileEvidence} rolled-back first")
-    transaction = json.loads(user("cat /var/tmp/isq318-reviews/first.json"))["transactionId"]
-    second_transaction = json.loads(user("cat /var/tmp/isq318-reviews/second.json"))["transactionId"]
+    transaction = plan_fields("first", "transactionId")["transactionId"]
+    second_transaction = plan_fields("second", "transactionId")["transactionId"]
     user("${pkgs.python3}/bin/python3 -c \"from pathlib import Path; p=Path('/home/migrator/.config/ghostty/config.ghostty'); content=p.read_text(); p.unlink(); p.write_text(content+'\\n# fixture postmigration edit\\n'); Path('/home/migrator/.config/nvim/lazy-lock.json').write_text('{}\\n')\"")
     assert retain_transaction("before-reversal", second_transaction)["owner"]["phase"] == "home-manager"
     app("restore-legacy --transaction " + transaction)
@@ -436,7 +513,7 @@ in pkgs.testers.runNixOSTest {
     assert stopped in ["3 inactive", "3 failed"], stopped
     user("printf '%s\\n' " + shlex.quote(json.dumps({"applyExit": status, "stopped": stopped})) + " > /var/tmp/isq318-reviews/partial-result.json")
     user("rm /home/migrator/.local/state/fixture/fail-after-stop")
-    partial = json.loads(user("cat /var/tmp/isq318-reviews/partial.json"))["transactionId"]
+    partial = plan_fields("partial", "transactionId")["transactionId"]
     partial_state = retain_transaction("partial-before-recovery", partial)
     assert partial_state["owner"]["phase"] == "transferring" and partial_state["steps"]["stop-services"] == "intent", partial_state
     assert not any(name.startswith("archive-") or name == "activate" for name in partial_state["steps"]), partial_state
@@ -444,7 +521,7 @@ in pkgs.testers.runNixOSTest {
     partial_restored = retain_transaction("partial-restored", partial)
     assert partial_restored["owner"] is None and partial_restored["phase"] == "restored", partial_restored
     app("plan --profile second --output /var/tmp/isq318-reviews/interruption.json")
-    interrupted = json.loads(user("cat /var/tmp/isq318-reviews/interruption.json"))["transactionId"]
+    interrupted = plan_fields("interruption", "transactionId")["transactionId"]
     launch = "set +e; ${command} apply --plan /var/tmp/isq318-reviews/interruption.json & child=$!; echo $child > /var/tmp/isq318-reviews/interruption.pid; wait $child; status=$?; printf '%s\\n' \"$status\" > /var/tmp/isq318-reviews/interruption.exit"
     user("(" + launch + ") > /var/tmp/isq318-reviews/interruption.log 2>&1 &")
     machine.wait_until_succeeds("test -L /home/migrator/.config/ghostty/config.ghostty")
@@ -462,9 +539,14 @@ in pkgs.testers.runNixOSTest {
     interrupted_restored = retain_transaction("interrupted-restored", interrupted)
     assert interrupted_restored["owner"] is None and interrupted_restored["phase"] == "restored", interrupted_restored
     user("${pkgs.systemd}/bin/systemctl --user is-active tmux-workspace.service")
+    try:
+        user("${releaseCommand} > /var/tmp/isq318-reviews/release-update.log 2>&1")
+    finally:
+        retain_reviews("release-attempt")
+    print("Release transition evidence:", user("cat /var/tmp/isq318-reviews/release-update/summary.json"))
     print("Fixture source and lock hashes:", user("${pkgs.coreutils}/bin/sha256sum ${fixtureSource}/flake.nix ${fixtureSource}/flake.lock ${fixtureFacade}/flake.nix ${fixtureFacade}/flake.lock"))
     print("Reviewed generations: ${first.activationPackage} ${second.activationPackage}")
-    machine.copy_from_machine("/var/tmp/isq318-reviews", "completed-reviews")
+    retain_reviews("completed-reviews")
     print("Retained journal hashes:", user("${pkgs.coreutils}/bin/sha256sum /home/migrator/.local/state/dotfiles-ownership/transactions/*/journal.json"))
   '';
 }

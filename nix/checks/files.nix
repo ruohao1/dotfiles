@@ -23,6 +23,30 @@ let
         } ];
       };
     in (builtins.tryEval (builtins.deepSeq generated.deploymentManifest true)).success;
+  deploymentIdentity = {
+    schema = 1;
+    release = {
+      repository = "ruohao1/dotfiles";
+      releaseId = 123;
+      version = "v1.2.3";
+      commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    };
+    consumerSource = toString (builtins.path { path = ../templates/host; name = "identity-consumer-fixture"; });
+    profile = "identity-fixture";
+  };
+  withIdentity = value: mkHome {
+    inherit (home.deploymentManifest) profile system username homeDirectory;
+    deploymentIdentity = value;
+  };
+  identified = withIdentity deploymentIdentity;
+  nextIdentity = deploymentIdentity // {
+    release = deploymentIdentity.release // { releaseId = 124; version = "v1.2.4"; };
+  };
+  next = withIdentity nextIdentity;
+  targets = value: map (file: file.target) value.deploymentManifest.files;
+  rejectsIdentity = value:
+    !(builtins.tryEval (builtins.deepSeq (withIdentity value).deploymentManifest true)).success;
+  identityExpected = pkgs.writeText "expected-identity.json" (builtins.toJSON deploymentIdentity);
   manifest = pkgs.writeText "dotfiles-deployment-manifest.json" (builtins.toJSON home.deploymentManifest);
   activation = home.config.home.activation;
   activationNodes = pkgs.writeText "dotfiles-activation-nodes.json" (builtins.toJSON (builtins.attrNames activation));
@@ -35,6 +59,13 @@ in
 assert rejectsDirectory false;
 assert rejectsDirectory true;
 assert acceptsGeneratedText;
+assert identified.activationPackage != next.activationPackage;
+assert targets identified == targets home && targets next == targets home;
+assert identified.deploymentManifest.deploymentIdentity == deploymentIdentity;
+assert !(home.deploymentManifest ? deploymentIdentity);
+assert rejectsIdentity (deploymentIdentity // { schema = 2; });
+assert rejectsIdentity (deploymentIdentity // { consumerSource = "/tmp/mutable-consumer"; });
+assert rejectsIdentity (deploymentIdentity // { release = nextIdentity.release // { version = "v01.2.3"; }; });
 assert !(activation ? copyApps);
 assert !(activation ? checkAppManagementPermission);
 pkgs.runCommand "dotfiles-file-check" {
@@ -46,6 +77,7 @@ pkgs.runCommand "dotfiles-file-check" {
     --manifest ${manifest} --activation-nodes ${activationNodes} --seed-script ${seedScript} \
     --seed-after ${pkgs.lib.escapeShellArgs seed.after} \
     --fixture-root "$TMPDIR/file-tests"
+  cmp ${identityExpected} ${builtins.head identified.config.home.extraDependencies}
   mkdir -p "$out"
   cp ${manifest} "$out/deployment-manifest.json"
 ''

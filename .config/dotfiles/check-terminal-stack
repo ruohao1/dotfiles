@@ -1639,9 +1639,12 @@ tmux_status_jobs_are_exact() {
       ;;
   esac
 
-  # shellcheck disable=SC2016  # This is the exact literal native job key.
-  TMUX_EXPECTED_STATUS_JOB='#($HOME/.config/dotfiles/git-summary --tmux-pane #{pane_id} --profile #{?#{e|>=:#{client_width},120},wide,#{?#{e|>=:#{client_width},100},medium,compact}})'
-  export TMUX_EXPECTED_STATUS_JOB
+  # Encode only the known literal through the same version-specific print transport.
+  # shellcheck disable=SC2016  # l: prevents expansion or execution of the exact job key.
+  TMUX_EXPECTED_STATUS_JOB=$(tmux -S "$tmux_audit_socket" display-message -p \
+    '#{l:#($HOME/.config/dotfiles/git-summary --tmux-pane #{pane_id} --profile #{?#{e|>=:#{client_width},120},wide,#{?#{e|>=:#{client_width},100},medium,compact}})}') || return 1
+  TMUX_EXPECTED_UPDATE_JOB='#(command -v dotfiles-update >/dev/null 2>&1 && exec dotfiles-update status --tmux 2>/dev/null)'
+  export TMUX_EXPECTED_STATUS_JOB TMUX_EXPECTED_UPDATE_JOB
 
   printf '%s\034%s\034%s\034%s\034%s\034' \
     "$tmux_audit_left" "$tmux_audit_right" \
@@ -1650,6 +1653,7 @@ tmux_status_jobs_are_exact() {
       BEGIN {
         RS = sprintf("%c", 28)
         expected = ENVIRON["TMUX_EXPECTED_STATUS_JOB"]
+        update = ENVIRON["TMUX_EXPECTED_UPDATE_JOB"]
       }
       {
         text = $0
@@ -1690,7 +1694,7 @@ tmux_status_jobs_are_exact() {
           job = substr(text, start, cursor - start)
           references++
           keys[job] = 1
-          if (job != expected) {
+          if (job != expected && job != update) {
             print "altered executable tmux status job: " job
             invalid = 1
           }
@@ -1698,16 +1702,17 @@ tmux_status_jobs_are_exact() {
       }
       END {
         for (job in keys) unique++
-        if (references < 1) print "missing executable tmux status job"
-        if (unique != 1) print "tmux status contains " unique " unique executable job keys"
+        if (references < 2) print "missing executable tmux status job"
+        if (unique != 2) print "tmux status contains " unique " unique executable job keys"
         if (!(expected in keys)) print "tmux status does not contain the exact Git helper job key"
-        if (invalid || references < 1 || unique != 1 || !(expected in keys))
+        if (!(update in keys)) print "tmux status does not contain the exact updater job key"
+        if (invalid || references < 2 || unique != 2 || !(expected in keys) || !(update in keys))
           exit 1
       }
     '
   tmux_audit_status=$?
 
-  unset TMUX_EXPECTED_STATUS_JOB
+  unset TMUX_EXPECTED_STATUS_JOB TMUX_EXPECTED_UPDATE_JOB
   return "$tmux_audit_status"
 }
 
@@ -10497,7 +10502,7 @@ if [ "$tmux_started" = true ]; then
   if tmux_status_jobs_are_exact \
     "$check_socket" terminal-stack-check \
     > "$check_tmp/tmux-status-job-canonical.txt" 2>&1; then
-    pass "tmux effective status permits only the exact Git helper job key"
+    pass "tmux effective status permits only the exact Git and updater helper job keys"
   else
     sed 's/^/      /' "$check_tmp/tmux-status-job-canonical.txt" >&2
     fail "tmux effective status contains a missing, altered, or additional job key"

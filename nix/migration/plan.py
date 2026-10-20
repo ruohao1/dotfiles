@@ -62,6 +62,33 @@ def normalized_files(manifest):
     return list(entries.values())
 
 
+def owned_provider_transition(manifest, home, prior, previous, requirement, selected):
+    """Allow an old provider only through this home's proven owned profile."""
+    from .transaction import Runtime, check_package_selection
+    profile = home / '.nix-profile'
+    command = requirement['command']
+    old = next((item for item in previous.get('commandRequirements', [])
+                if item['command'] == command and 'provider' in item), None)
+    if (old is None or selected != str(profile / 'bin' / command)
+            or str(profile) not in manifest['profilePaths']
+            or str(profile) not in prior.data['profilesBefore'] or prior.data['phase'] != 'active'
+            or prior.data.get('rollback', {}).get('state') == 'intent'):
+        raise Conflict('provider is not selected through the owned package profile')
+    before = str((Path(old['provider']) / 'bin' / command).resolve(strict=True))
+    after = str((Path(requirement['provider']) / 'bin' / command).resolve(strict=True))
+    if Path(selected).resolve(strict=True) != Path(before):
+        raise Conflict('caller does not select the exact previous provider')
+    runtime = Runtime(home)
+    generation = str(Path(previous['activationPackage']).resolve())
+    if runtime.selected_generation(previous) != generation:
+        raise Conflict('selected generation differs from the owned previous generation')
+    check_package_selection(runtime.profile_packages(profile), prior.data['nativePackagesBefore'],
+                            {str((Path(generation) / 'home-path').resolve())})
+    return dict(command=command, profile=str(profile), fromGeneration=previous['activationPackage'],
+                toGeneration=manifest['activationPackage'], fromExecutable=before, toExecutable=after,
+                fromState=fingerprint(before), toState=fingerprint(after))
+
+
 def inspect(manifest, home, *, transaction_id=None):
     """Return a JSON plan including *all* observed conflicts, without writing home.
 
@@ -86,7 +113,7 @@ def inspect(manifest, home, *, transaction_id=None):
             'system': manifest['system'], 'profile': manifest.get('profile'),
             'manifestFingerprint': manifest_fingerprint(manifest),
             'selectedGeneration': manifest['activationPackage'],
-            'files': [], 'mutableSeeds': [], 'providers': [], 'packageProfiles': [],
+            'files': [], 'mutableSeeds': [], 'providers': [], 'providerTransitions': [], 'packageProfiles': [],
             'services': [], 'serviceManagerEffects': manifest['serviceManagerEffects'],
             'nativePrerequisites': [], 'legacyTaplo': [], 'conflicts': [], 'evidence': {}, 'queries': []}
 
@@ -120,6 +147,7 @@ def inspect(manifest, home, *, transaction_id=None):
     if manifest['system'] != current_system():
         conflict('system-mismatch', home, f"Manifest targets {manifest['system']}; host is {current_system()}")
     previous_files = {}
+    prior_journal = previous = None
     managed = False
     observe(home)
     generation = observe(manifest['activationPackage'])
@@ -135,13 +163,13 @@ def inspect(manifest, home, *, transaction_id=None):
         if owner is not None:
             if owner['phase'] == 'home-manager':
                 from .transaction import Journal
-                prior = Journal(home, owner['transactionId'])
-                previous = prior.data['generations'][owner['selectedGeneration']]
+                prior_journal = Journal(home, owner['transactionId'])
+                previous = prior_journal.data['generations'][owner['selectedGeneration']]
                 previous_files = {item['target']: item for item in normalized_files(previous)}
                 managed = True
                 if set(previous_files) != {item['target'] for item in normalized_files(manifest)}:
                     conflict('changed-managed-targets', home, 'Changing the owned target set requires explicit reversal before migration')
-                observe(prior.path)
+                observe(prior_journal.path)
             else:
                 conflict('existing-ownership', root / 'owner.json', f"Home ownership phase: {owner['phase']}")
         if lock_state['type'] != 'absent':
@@ -232,8 +260,19 @@ def inspect(manifest, home, *, transaction_id=None):
         # The packaged application supplies the pinned runtime PATH. Explicit
         # fixture providers may be absent from ambient PATH without becoming a
         # production bypass; activation will use this recorded exact path.
-        if selected and Path(selected).resolve() != Path(executable).resolve():
-            conflict('provider-shadowed', selected, f'Expected pinned provider {executable}')
+        owned_profile = managed and selected == str(home / '.nix-profile/bin' / command)
+        generation_change = managed and previous['activationPackage'] != manifest['activationPackage']
+        if selected and (Path(selected).resolve() != Path(executable).resolve() or (owned_profile and generation_change)):
+            try:
+                if not managed:
+                    raise Conflict('caller has no owned previous generation')
+                transition = owned_provider_transition(manifest, home, prior_journal, previous, requirement, selected)
+                plan['providerTransitions'].append(transition)
+                observe(transition['fromExecutable'])
+                observe(transition['toExecutable'])
+            except (Conflict, OSError, RuntimeError):
+                conflict('provider-shadowed', selected,
+                         f'Expected pinned provider {executable}; start a shell using the current canonical Nix profile')
 
     effects = {effect['manager']: effect for effect in manifest['serviceManagerEffects']}
     for service in manifest['services']:

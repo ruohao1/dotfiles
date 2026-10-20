@@ -1,6 +1,7 @@
 { pkgs }:
 let
   tmux = pkgs.callPackage ./pkgs/tmux.nix { };
+  updater = pkgs.callPackage ./update/package.nix { };
   luaLanguageServer = pkgs.callPackage ./pkgs/lua-language-server.nix { };
   herdr = pkgs.callPackage ./pkgs/herdr.nix { };
   # On Linux libiconv is a headers-only compatibility marker, not the CLI.
@@ -23,8 +24,9 @@ in {
     imagemagick uv nodejs taplo npmServers
     iconv coreutils perl bash curl gawk gnused gnugrep findutils
     diffutils gnutar gzip unzip xz stdenv.cc
-  ] ++ [ herdr tmux luaLanguageServer ];
+  ] ++ [ herdr tmux luaLanguageServer updater ];
   commandRequirements = [
+    (command "dotfiles-update" updater { })
     (command "git" pkgs.git { minimum = "2.34.0"; })
     (command "python3" pkgs.python3 { minimum = "3.10.0"; maximumExclusive = "3.15.0"; })
     (command "nvim" pkgs.neovim { minimum = "0.12.0"; capability = [ "--headless" "-u" "NONE" "-i" "NONE" "+lua assert(vim.version().minor >= 12)" "+qa!" ]; })

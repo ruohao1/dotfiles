@@ -162,7 +162,7 @@ preview/platform validation; listing them here does not make them optional.
 ## Verification
 
 The [Nix source tests workflow](../.github/workflows/nix-source-tests.yml) runs
-the package-checker self-test, entrypoint, ownership, clipboard checker and migration source suites
+the package-checker self-test, entrypoint, ownership, clipboard checker, migration and updater source suites
 on Ubuntu pull requests and pushes to `main`. It uses private fixture homes,
 reports test results and skips, and needs no Nix installation. These checks substitute
 activation and service managers; a passing CI job does not establish Nix builds
@@ -391,9 +391,22 @@ with fixture-only host declarations, exercised the public migration wrapper on
 an offline Ubuntu 24.04.5 x86_64 VM. Preview, apply, repeat, generation rollback
 and legacy restoration passed across two VM runs with a guarded continuation.
 Native prerequisites were prepared separately, including a scoped Bubblewrap
-AppArmor policy. The fixture kept the same package inventory; actual package
-upgrades, preservation of a nonempty native Nix package profile and full desktop
-workflows remain untested. See the [wrapper validation record](validation/2026-10-17-ubuntu-wrapper.md).
+AppArmor policy. That fixture kept the same package inventory and did not test
+actual package upgrades, preservation of a nonempty native Nix package profile
+or full desktop workflows. See the [wrapper validation record](validation/2026-10-17-ubuntu-wrapper.md).
+
+On 2026-10-19, production source `95e3bb9f3bf381ed417a64664200d94b7713f460`
+with this branch's fixture additions passed the release updater's offline
+x86_64 NixOS VM scenario: real uv
+0.11.21 → 0.11.22 → 0.11.21, installed release A → B → A, interrupted
+update recovery from the exact retained plan, and repeated apply. The original
+consumer checkout, native package profile and seven native runtime observations
+were preserved. A separate bounded run of the same snapshot passed the legacy
+migration lifecycle, edited-file restoration, service-stop failure recovery and
+interrupted-activation recovery. Discovery and candidate preparation use
+prebuilt offline projections in this VM; separate real Git/Nix fixtures verify preparation.
+This does not verify public release transport, full desktop workflows or other
+platforms. See the [release implementation evidence](../.config/docs/superpowers/plans/2026-10-19-release-updates.md).
 
 On 2026-10-17, source `6fd61bc335e5342b0c83811b658b6d526eb443cf` with the unchanged
 lock evaluated all six non-VM check derivations on each of the four systems.
@@ -421,3 +434,126 @@ pending; unsupported arbitration fails closed. Each future native record must
 include exact OS/architecture, source commit, lock, command/status, generation,
 account/manager assignment and remaining workflow preparation. Keep this route
 experimental until every gate for an advertised default subset actually passes.
+
+## Confirmed release updates
+
+`dotfiles-update` manages published stable `ruohao1/dotfiles` releases. Native
+bootstrap remains the default installer and remains available. The updater does
+not install Nix, update native applications, or change `home.stateVersion`.
+
+Keep personal identity and modules in a separate consumer repository. To adopt
+it, initialize the [host template](templates/host/flake.nix) from a reviewed
+dotfiles checkout:
+
+```sh
+mkdir -m 700 my-dotfiles-host
+cd my-dotfiles-host
+nix flake init -t path:/absolute/path/to/dotfiles#host
+git init
+```
+
+Set the actual system, username, HOME and profile name in `flake.nix`; put personal
+options in `host.nix`. Replace **every placeholder** in `dotfiles-release.json`
+with a reviewed published release's repository, numeric release ID, stable tag and
+full commit. Verify the release ID/tag/commit against GitHub; the template's
+placeholder receipt intentionally cannot activate. Initial adoption is manual;
+an older installation without provenance is shown as `unversioned`.
+
+```sh
+git add flake.nix host.nix dotfiles-release.json
+nix flake lock --override-input dotfiles github:ruohao1/dotfiles/FULL_COMMIT
+git add flake.lock
+git commit -m 'Declare personal dotfiles host and reviewed release'
+# Use a private review directory outside HOME; replace PROFILE with your name.
+/path/to/dotfiles/.config/dotfiles/bootstrap-nix --source-root "$PWD" -- \
+  plan --profile PROFILE --output /private/review/adoption.json
+# Inspect the JSON and resolve every conflict/native prerequisite before apply.
+/path/to/dotfiles/.config/dotfiles/bootstrap-nix --source-root "$PWD" -- \
+  apply --plan /private/review/adoption.json
+dotfiles-update configure --source-root "$PWD" --profile PROFILE
+```
+
+The consumer has one external input, `dotfiles`. Submodules, additional consumer
+inputs and transitive dependency overrides are refused by v1. `configure`
+validates the clean committed checkout and the actual home/user/system/profile;
+it performs no activation. It is also available before installation through
+`nix run path:/absolute/path/to/dotfiles#dotfiles-update -- configure ...`.
+
+```sh
+dotfiles-update status
+dotfiles-update check
+dotfiles-update install
+dotfiles-update rollback --generation /nix/store/RETAINED_GENERATION
+```
+
+`status` is local: it compares ownership/journal evidence with the actual selected
+Home Manager generation. It lists release identity and retained rollback targets,
+cached availability and pending recovery. Missing or inconsistent evidence never
+claims a new release is installed. `check` performs a bounded metadata refresh.
+Only strict `vMAJOR.MINOR.PATCH` releases are eligible; equal versions and implicit
+downgrades are not offered.
+
+`install` clones the registered committed consumer into a retained private
+candidate, updates only its dotfiles closure and receipt, and builds an immutable
+executor. The original checkout and personal files remain unchanged. It shows the
+release change, notes link, prior generation and migration preview, then asks
+`Apply this update? [y/N]`. Builds may populate the Nix store before confirmation.
+Decline, EOF or interruption before apply leaves deployment unchanged; install
+and rollback require a terminal. The reviewed release ID/tag/commit is checked
+again immediately before apply; a newer Latest never replaces that selection.
+
+An attached tmux client shows a cached notice while its asynchronous job checks
+when due. Background attempts run at most daily, with a 20-second overall metadata
+budget, a 1 MiB response cap and server backoff. No configured versioned Nix home
+means no background request. There is no shell hook, scheduled service or check
+while tmux is closed. Explicit checks bypass the daily interval but respect server
+backoff; transient failures retain the last valid cached result.
+
+State is fixed at `$HOME/.local/state/dotfiles-update`, independent of XDG
+overrides. Configuration, cache and a process lock live there; candidates retain
+their source, executor GC root, reviewed plan and transaction association. State
+is created before preview. Cache changes inside that existing directory preserve
+preview evidence; creating the directory after a separate preview invalidates it.
+
+Rollback is offline and requires confirmation. It uses the retained executor for
+the active transaction and only a journal-retained generation. Native packages,
+desktop preferences and external uv environments stay outside Nix rollback.
+For an interrupted apply or rollback, run `status` and inspect its exact retained
+recovery commands. A pending rollback names its recorded target. `restore-legacy`
+cancels an unpublished update or reverses a published handoff; it is not an update
+retry. Do not regenerate a new preview to resume an interrupted transaction.
+A missing executor root or changed retained plan stops recovery instead of
+selecting different source code.
+
+Keep candidate roots, journals and backups until you have separately reviewed
+their retention. The updater performs no cleanup. Start updates from a shell
+using the current canonical `$HOME/.nix-profile/bin`: an old direct store PATH or
+foreign shadow is still refused. Releases that change the managed target set
+require explicit legacy restoration/re-adoption; v1 does not automate that change.
+
+## Manual release runbook
+
+Publication is a separate authorized task; none of these actions happen during
+update checks or feature validation.
+
+1. Select an exact tested `main` commit. Record the source checks, Linux runtime
+   evidence and remaining platform gaps in the notes; do not label evaluation as
+   native macOS/ARM runtime verification.
+2. Before the first publication, enable GitHub immutable releases for the
+   repository. Verify the setting and the chosen stable `vMAJOR.MINOR.PATCH` tag
+   points to that exact commit. Never move a previously observed release tag.
+3. Prepare reviewed release notes and create a draft using the existing tag:
+
+   ```sh
+   gh release create vMAJOR.MINOR.PATCH --repo ruohao1/dotfiles \
+     --verify-tag --draft --title vMAJOR.MINOR.PATCH --notes-file release-notes.md
+   ```
+
+4. Review the draft, its tag/commit and any assets. Publish and deliberately mark
+   Latest only under the release task's authorization. Record the resulting
+   numeric release ID and resolved commit for consumer adoption.
+
+The feature's [design](../.config/docs/superpowers/specs/2026-10-19-release-updates-design.md)
+and [implementation evidence](../.config/docs/superpowers/plans/2026-10-19-release-updates.md)
+travel with its implementation branch. No release workflow or unattended
+activation is installed.

@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import runpy
+from unittest.mock import patch
 from contextlib import redirect_stdout
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -67,6 +69,18 @@ class EntrypointTests(unittest.TestCase):
         for word in ['Nix', '--source-root', 'plan', 'apply', 'https://nixos.org/download/',
                      'non-shallow', 'git fetch --unshallow']:
             self.assertIn(word, result.stdout)
+
+    def test_source_validation_can_be_reused_without_running_nix(self):
+        namespace = runpy.run_path(str(ENTRY))
+        validate = namespace.get('validate_source')
+        self.assertTrue(callable(validate), 'source validation must be reusable by the updater')
+        with patch.dict(os.environ, {**self.env, 'GIT_INDEX_FILE': '/foreign'}, clear=True):
+            root, revision, environment = validate(self.repo)
+        self.assertEqual(root, self.repo.resolve())
+        self.assertEqual(revision, self.git('rev-parse', 'HEAD'))
+        self.assertNotIn('GIT_INDEX_FILE', environment)
+        self.assertEqual(environment['GIT_CONFIG_GLOBAL'], os.devnull)
+        self.assertFalse(self.log.exists())
 
     def test_missing_nix_never_installs(self):
         (self.bin / 'nix').unlink()
