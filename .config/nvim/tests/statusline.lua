@@ -1648,6 +1648,27 @@ do
   assert(ok, failure)
 end
 
+do
+  statusline.shutdown()
+  local saved_system, saved_root = vim.system, vim.env.DOTFILES_NVIM_ROOT
+  local root = vim.fn.tempname() .. "-standalone"
+  vim.fn.mkdir(root, "p")
+  vim.env.DOTFILES_NVIM_ROOT = root
+  local calls = 0
+  vim.system = function(...)
+    calls = calls + 1
+    return saved_system(...)
+  end
+  local controller = statusline.setup({ inside_tmux = false })
+  eq(controller:debug_state().has_cache, false, "absent optional helper creates no Git cache")
+  eq(vim.o.laststatus, 3, "standalone retains native row without rich Git")
+  assert(controller:render() ~= "", "standalone native renderer remains usable")
+  eq(calls, 0, "absent helper launches no doomed subprocess")
+  statusline.shutdown()
+  vim.system, vim.env.DOTFILES_NVIM_ROOT = saved_system, saved_root
+  vim.fn.delete(root, "rf")
+end
+
 local final_exports = vim.tbl_keys(test)
 table.sort(final_exports)
 eq(final_exports, {

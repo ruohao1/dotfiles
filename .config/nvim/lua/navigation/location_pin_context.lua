@@ -1,40 +1,24 @@
 local M = {}
+local platform = require("config.platform")
 
 -- TMUX's final field is the editor's originating session. Use it explicitly:
 -- a pane can be linked into several sessions, so a pane-only target is ambiguous.
 function M.resolve()
-  local socket, pid, number = tostring(vim.env.TMUX or ""):match("^(.*),(%d+),(%d+)$")
-  local pane = vim.env.TMUX_PANE
-  if not socket or socket:sub(1, 1) ~= "/" or not pane or not pane:match("^%%%d+$") then
+  local origin = platform.tmux_origin(vim.env)
+  if not origin then
     return nil, "Line pins require an editor inside a tmux session"
   end
-  local session = "$" .. number
-  local ok, process = pcall(vim.system, {
-    "tmux",
-    "-u",
-    "-S",
-    socket,
-    "list-panes",
-    "-s",
-    "-t",
-    session,
-    "-F",
-    "#{pid}\t#{session_id}\t#{pane_id}",
-  }, { text = true })
+  local ok, process = pcall(vim.system, platform.tmux_probe_argv(origin), { text = true })
   if not ok then
     return nil, "Could not query tmux: " .. tostring(process)
   end
-  local result = process:wait(5000)
-  if result.code ~= 0 then
-    return nil, "The editor's tmux session is no longer available"
+  local availability, err = platform.parse_tmux_probe(origin, process:wait(1000))
+  if not availability then
+    return nil, err
   end
-  for line in (result.stdout or ""):gmatch("[^\n]+") do
-    local actual_pid, actual_session, actual_pane = line:match("^(%d+)\t(%$%d+)\t(%%%d+)$")
-    if actual_pid == pid and actual_session == session and actual_pane == pane then
-      return { socket = socket, pid = pid, session = session, pane = pane }
-    end
-  end
-  return nil, "The tmux context changed; reopen the editor in its current session"
+  origin.configured = availability.configured
+  origin.status_enabled = availability.status_enabled
+  return origin
 end
 
 function M.validate(expected)

@@ -616,8 +616,10 @@ local function new_git_cache(deps)
 end
 
 local function make_production_git_cache(runtime_deps)
-  local helper =
-    vim.fs.joinpath(vim.fs.dirname(vim.fn.stdpath("config")), "dotfiles", "git-summary")
+  local helper = require("config.platform").dotfiles_helper("git_summary")
+  if not helper then
+    return nil
+  end
 
   return new_git_cache({
     helper = helper,
@@ -882,7 +884,9 @@ local function new_runtime(deps)
     deps.install_render()
     state.render_installed = true
     state.cache = deps.make_git_cache()
-    state.cache:update(state.snapshot.root, state.profile, "setup")
+    if state.cache then
+      state.cache:update(state.snapshot.root, state.profile, "setup")
+    end
   end
 
   state.group = deps.create_augroup("dotfiles-statusline", { clear = true })

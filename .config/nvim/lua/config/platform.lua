@@ -4,6 +4,68 @@ local function is_executable(name)
   return vim.fn.executable(name) == 1
 end
 
+function M.tmux_origin(environment)
+  local socket, pid, number = tostring(environment.TMUX or ""):match("^(.*),(%d+),(%d+)$")
+  local pane = environment.TMUX_PANE
+  if
+    not socket
+    or socket:sub(1, 1) ~= "/"
+    or socket:find("[%c]")
+    or type(pane) ~= "string"
+    or not pane:match("^%%%d+$")
+  then
+    return nil, "A valid originating tmux session is required"
+  end
+  return { socket = socket, pid = pid, session = "$" .. number, pane = pane }
+end
+
+function M.tmux_probe_argv(origin)
+  return {
+    "tmux",
+    "-u",
+    "-S",
+    origin.socket,
+    "list-panes",
+    "-s",
+    "-t",
+    origin.session,
+    "-F",
+    "#{pid}\t#{session_id}\t#{pane_id}\t#{@dotfiles_foundation_loaded}\t#{status}",
+  }
+end
+
+function M.parse_tmux_probe(origin, result)
+  if not result or result.code ~= 0 then
+    return nil, "The editor's tmux session is no longer available"
+  end
+  for line in (result.stdout or ""):gmatch("[^\n]+") do
+    local pid, session, pane, marker, status =
+      line:match("^(%d+)\t(%$%d+)\t(%%%d+)\t([^\t]*)\t([^\t]+)$")
+    if pid == origin.pid and session == origin.session and pane == origin.pane then
+      if status ~= "off" and status ~= "on" and not status:match("^[2-5]$") then
+        return nil, "Unexpected tmux status setting"
+      end
+      return { configured = marker == "1", status_enabled = status ~= "off" }
+    end
+  end
+  return nil, "The tmux context changed; reopen the editor in its current session"
+end
+
+function M.dotfiles_helper(name, nvim_root)
+  local paths =
+    { git_summary = "dotfiles/git-summary", location_pins = "tmux/scripts/location-pins" }
+  local relative = paths[name]
+  if not relative then
+    return nil, "Unknown dotfiles helper"
+  end
+  local root = nvim_root or vim.env.DOTFILES_NVIM_ROOT or vim.fn.stdpath("config")
+  local helper = vim.fs.normalize(vim.fn.fnamemodify(root, ":p") .. "/../" .. relative)
+  if not is_executable(helper) then
+    return nil, "The optional " .. name .. " helper is unavailable"
+  end
+  return helper
+end
+
 function M.detect()
   local sysname = vim.uv.os_uname().sysname
 
