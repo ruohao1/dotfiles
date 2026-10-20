@@ -31,6 +31,16 @@ function M.validate(expected)
       return nil, "The tmux context changed; reopen the line-pin action"
     end
   end
+  if vim.g.dotfiles_tmux_integration == false then
+    return nil, "Line pins are disabled by dotfiles_tmux_integration"
+  end
+  if not current.configured then
+    return nil, "Line pins require configured dotfiles tmux"
+  end
+  local helper, helper_error = platform.dotfiles_helper("location_pins")
+  if not helper then
+    return nil, helper_error
+  end
   return true
 end
 

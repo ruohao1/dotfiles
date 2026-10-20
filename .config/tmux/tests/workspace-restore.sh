@@ -171,7 +171,10 @@ summarize() {
 }
 
 mkdir -p "$test_root/home" "$test_root/projects/alpha" "$test_root/projects/beta"
-"$real_tmux" -f "$script_dir/../conf/options.conf" -S "$socket" \
+# These editor fixtures model the configured stack, including restored servers.
+cat "$script_dir/../conf/options.conf" >"$test_root/home/.tmux.conf"
+printf '%s\n' 'set-option -g @dotfiles_foundation_loaded 1' >>"$test_root/home/.tmux.conf"
+"$real_tmux" -f "$test_root/home/.tmux.conf" -S "$socket" \
   new-session -d -s alpha -c "$test_root/projects/alpha" -n editor
 private_tmux split-window -d -t '=alpha:1' -c "$test_root/projects/beta"
 private_tmux select-layout -t '=alpha:1' even-horizontal
@@ -219,9 +222,10 @@ probe_pin_context() {
   probe_command=$(jq -nr \
     --arg home "$test_root/home" \
     --arg nvim_root "$(CDPATH='' cd "$script_dir/../../nvim" && pwd -P)" \
+    --arg runtime "${XDG_RUNTIME_DIR:-$runtime}" \
     --arg output "$probe_output" --arg script "$test_root/pin-context.lua" '
       ["env", "HOME="+$home, "XDG_STATE_HOME="+$home+"/state",
-       "XDG_CACHE_HOME="+$home+"/cache", "XDG_RUNTIME_DIR="+$home+"/runtime",
+       "XDG_CACHE_HOME="+$home+"/cache", "XDG_RUNTIME_DIR="+$runtime,
        "DOTFILES_NVIM_ROOT="+$nvim_root, "PIN_CONTEXT_OUTPUT="+$output,
        "nvim", "--clean", "--headless", "-u", "NONE", "-i", "NONE", "-l", $script] | @sh')
   private_tmux send-keys -t "$probe_target" -l "$probe_command"
@@ -400,7 +404,7 @@ assert_equal "$generation" \
   "fallback generation marker"
 
 stop_private_server
-"$real_tmux" -f "$script_dir/../conf/options.conf" -S "$socket" \
+"$real_tmux" -f "$test_root/home/.tmux.conf" -S "$socket" \
   new-session -d -s local-only
 private_tmux rename-window -t '=local-only:1' local
 private_tmux set-option -w -t '=local-only:1' automatic-rename off
@@ -730,7 +734,7 @@ PATH=$shim_directory:$PATH
 CODEX_TEST_LOG_DIRECTORY=$codex_log_directory
 export PATH CODEX_TEST_LOG_DIRECTORY
 
-"$real_tmux" -f "$script_dir/../conf/options.conf" -S "$socket" \
+"$real_tmux" -f "$test_root/home/.tmux.conf" -S "$socket" \
   new-session -d -s codex-work -c "$test_root/projects/alpha" \
   -n conversations 'exec codex 300'
 private_tmux split-window -d -t '=codex-work:1' \
@@ -873,11 +877,12 @@ NVIM_TEST_REAL=$real_nvim
 NVIM_TEST_CONFIG=$script_dir/../../nvim
 NVIM_TEST_FIRST=$nvim_project/first.lua
 NVIM_TEST_SECOND=$nvim_project/second.lua
-export NVIM_TEST_REAL NVIM_TEST_CONFIG NVIM_TEST_FIRST NVIM_TEST_SECOND
+NVIM_TEST_SOCKET=$socket.nvim
+export NVIM_TEST_REAL NVIM_TEST_CONFIG NVIM_TEST_FIRST NVIM_TEST_SECOND NVIM_TEST_SOCKET
 cat >"$shim_directory/nvim-source" <<'SHIM'
 #!/bin/sh
 set -eu
-exec "$NVIM_TEST_REAL" -i NONE -u NONE \
+exec "$NVIM_TEST_REAL" --listen "$NVIM_TEST_SOCKET" -i NONE -u NONE \
   --cmd "set runtimepath^=$NVIM_TEST_CONFIG" \
   --cmd "lua require('integrations.tmux_persistence').setup()" \
   -c "edit $NVIM_TEST_FIRST" \
@@ -885,7 +890,7 @@ exec "$NVIM_TEST_REAL" -i NONE -u NONE \
 SHIM
 chmod 0755 "$shim_directory/nvim-source"
 HOME=$test_root/home XDG_STATE_HOME=$state XDG_RUNTIME_DIR=$runtime \
-  PATH=$PATH "$real_tmux" -f "$script_dir/../conf/options.conf" -S "$socket" \
+  PATH=$PATH "$real_tmux" -f "$test_root/home/.tmux.conf" -S "$socket" \
   new-session -d -s nvim-work -c "$nvim_project" -n editor 'exec nvim-source'
 nvim_pane=$(private_tmux display-message -p -t '=nvim-work:1.1' '#{pane_id}')
 wait_attempt=0

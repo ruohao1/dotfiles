@@ -7,7 +7,7 @@ end
 local context = require("navigation.location_pin_context")
 local store = require("navigation.location_pin_store")
 local pins = require("navigation.location_pins")
-local root = vim.fn.tempname() .. "-line-pins"
+local root = vim.env.XDG_RUNTIME_DIR .. "/p"
 assert(vim.fn.mkdir(root, "p", 448) == 1)
 local socket = root .. "/tmux.sock"
 local previous = {
@@ -36,14 +36,127 @@ local ok, err = xpcall(function()
   vim.env.TMUX, vim.env.TMUX_PANE = nil, nil
   local outside, reason = context.resolve()
   assert(outside == nil and reason:find("tmux", 1, true), "outside tmux is an informative no-op")
-  pins.add()
-  assert(#notifications > 0, "actions explain the missing context")
+  pins.setup()
+  for _, action in ipairs({ pins.add, pins.find, pins.delete_current, pins.clear }) do
+    local before = #notifications
+    action()
+    assert(#notifications > before, "actions explain the missing context")
+  end
   tmux("-f", "/dev/null", "new-session", "-d", "-s", "pins")
   tmux("new-session", "-d", "-s", "other")
   local pid = tmux("display-message", "-p", "-t", "=pins:", "#{pid}")
   local pane = tmux("display-message", "-p", "-t", "=pins:", "#{pane_id}")
   vim.env.TMUX, vim.env.TMUX_PANE = socket .. "," .. pid .. ",0", pane
   local ctx = assert(context.resolve())
+  local function unavailable(label)
+    pins.setup()
+    eq(
+      tmux("show-options", "-pqv", "-t", pane, "@dotfiles_line_pin_session"),
+      "",
+      label .. " setup never associates the pane"
+    )
+    for _, action in ipairs({ pins.add, pins.find, pins.delete_current, pins.clear }) do
+      local before = #notifications
+      action()
+      assert(#notifications > before, label .. " explains unavailable actions")
+    end
+    eq(
+      tmux("show-options", "-pqv", "-t", pane, "@dotfiles_line_pin_session"),
+      "",
+      label .. " never associates the pane"
+    )
+    assert(not pins.open(ctx, string.rep("a", 64)), label .. " refuses captured selections")
+    assert(not context.remember(ctx), label .. " rejects explicit association")
+    for _, action in ipairs({ store.list, store.add, store.delete, store.clear }) do
+      local result, err = action(ctx, {})
+      assert(not result and type(err) == "string", label .. " refuses helper actions")
+    end
+  end
+  unavailable("ordinary tmux")
+  tmux("set-option", "-g", "@dotfiles_foundation_loaded", "1")
+  tmux("set-option", "-t", "$0", "status", "off")
+  ctx = assert(context.resolve())
+  eq(ctx.status_enabled, false, "status disabled does not disable configured origin")
+  vim.g.dotfiles_tmux_integration = false
+  unavailable("opt-out")
+  vim.g.dotfiles_tmux_integration = nil
+  local helper_root = vim.env.DOTFILES_NVIM_ROOT
+  vim.env.DOTFILES_NVIM_ROOT = root .. "/no-helpers/nvim"
+  unavailable("missing pin helper")
+  local persistence = require("integrations.tmux_persistence")
+  local literal_server = root .. "/editor '$(touch NEVER);.sock"
+  local registration = assert(
+    persistence.setup({ server = literal_server }),
+    "missing pin helper leaves persistence enabled with status off"
+  )
+  eq(
+    tmux("show-options", "-pqv", "-t", pane, "@dotfiles_nvim_server"),
+    literal_server,
+    "persistence retains the literal RPC path"
+  )
+  registration:stop()
+  eq(
+    tmux("show-options", "-pqv", "-t", pane, "@dotfiles_nvim_server"),
+    "",
+    "successful stop removes its own RPC registration"
+  )
+  local system = vim.system
+  vim.system = function(argv, options)
+    local process = system(argv, options)
+    if argv[5] ~= "list-panes" then
+      return {
+        wait = function(_, timeout)
+          local result = process:wait(timeout)
+          result.stdout = ""
+          return result
+        end,
+      }
+    end
+    return process
+  end
+  assert(not persistence.setup({ server = literal_server }), "unacknowledged registration fails")
+  vim.system = system
+  eq(
+    tmux("show-options", "-pqv", "-t", pane, "@dotfiles_nvim_server"),
+    "",
+    "failed registration withdraws its own partially written fields"
+  )
+  registration = assert(persistence.setup({ server = literal_server }))
+  tmux("set-option", "-p", "-t", pane, "@dotfiles_nvim_persistence_owner", "999_999")
+  registration:stop()
+  eq(
+    tmux("show-options", "-pqv", "-t", pane, "@dotfiles_nvim_server"),
+    literal_server,
+    "cleanup preserves a replacement editor's registration"
+  )
+  system = vim.system
+  vim.system = function(argv, ...)
+    if argv[5] ~= "list-panes" then
+      vim.system = system
+      tmux("set-option", "-g", "@dotfiles_foundation_loaded", "0")
+    end
+    return system(argv, ...)
+  end
+  local stale_registration = persistence.setup({ server = root .. "/stale.sock" })
+  vim.system = system
+  assert(not stale_registration, "marker removal between probe and write refuses registration")
+  eq(
+    tmux("show-options", "-pqv", "-t", pane, "@dotfiles_nvim_server"),
+    literal_server,
+    "guarded registration cannot overwrite an editor after capability changes"
+  )
+  tmux("set-option", "-g", "@dotfiles_foundation_loaded", "1")
+  vim.env.DOTFILES_NVIM_ROOT = helper_root
+  vim.env.TMUX = socket .. ",1,0"
+  unavailable("replaced origin")
+  vim.env.TMUX = "malformed"
+  unavailable("invalid origin")
+  vim.env.TMUX = socket .. "," .. pid .. ",0"
+  if vim.env.DOTFILES_EDITOR_STANDALONE == "1" then
+    -- The copied editor tree has no sibling helper, even with configured tmux.
+    unavailable("standalone editor")
+    return
+  end
   eq(ctx.session, "$0", "resolves the editor session")
   -- A linked pane still belongs to the explicit originating session in TMUX.
   tmux("link-window", "-s", "$0:0", "-t", "$1:1")
