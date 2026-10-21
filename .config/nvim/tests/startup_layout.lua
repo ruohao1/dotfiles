@@ -61,22 +61,36 @@ local repository = {
   counts = { total = 0 },
   history = { { graph = "*", oid = "abcdef1", subject = "First commit" } },
 }
-local _, wide = compose(repository, 100, 30)
+local _, wide = compose(repository, 116, 30)
 local wide_text = table.concat(wide, "\n")
 assert(wide_text:find("Working tree clean", 1, true), "clean state missing")
 assert(wide_text:find("origin/main", 1, true), "upstream missing")
 assert(wide_text:find("+2", 1, true) and wide_text:find("-1", 1, true), "divergence missing")
-local narrow_result, narrow = compose(repository, 80, 30)
-local menu_rows = {}
-for row, line in ipairs(narrow_result) do
-  for _, unit in ipairs(line) do
-    if unit.type == "item" then
-      menu_rows[#menu_rows + 1] = row
+for _, width in ipairs({ 80, 92, 96, 100, 111, 112, 115, 116 }) do
+  local result, output = compose(repository, width, 30)
+  local menu_rows, repository_row = {}, nil
+  for row, line in ipairs(result) do
+    for _, unit in ipairs(line) do
+      if unit.type == "item" then
+        menu_rows[#menu_rows + 1] = row
+      elseif unit.string == repository.name then
+        repository_row = row
+      end
     end
   end
+  assert(repository_row, "repository missing at " .. width)
+  if width < 116 then
+    eq(menu_rows[1], menu_rows[3], "narrow menu shares a row at " .. width)
+    assert(repository_row > menu_rows[3], "Git panel stacks below the menu at " .. width)
+    assert(
+      output[repository_row]:match("^  project"),
+      "narrow Git panel keeps two columns of padding"
+    )
+  else
+    assert(menu_rows[1] < menu_rows[3], "wide menu uses separate rows")
+    eq(repository_row, menu_rows[1], "wide Git panel sits beside the menu")
+  end
 end
-eq(menu_rows[1], menu_rows[3], "narrow menu should share a row when it fits")
-assert(table.concat(narrow, "\n"):find("project", 1, true), "narrow repository missing")
 
 local dense = vim.deepcopy(repository)
 dense.history = {
@@ -268,6 +282,32 @@ for _, line in ipairs(long_lines) do
 end
 
 local original_ambiwidth = vim.o.ambiwidth
+for _, ambiwidth in ipairs({ "single", "double" }) do
+  vim.o.ambiwidth = ambiwidth
+  for _, size in ipairs({
+    { 22, 0 },
+    { 23, 0 },
+    { 24, 1 },
+    { 25, 1 },
+    { 26, 2 },
+    { 44, 2 },
+    { 96, 2 },
+    { 115, 2 },
+    { 116, 2 },
+    { 180, 34 },
+  }) do
+    local width, margin = unpack(size)
+    for _, view in ipairs({ unusual, { kind = "loading" }, { kind = "non_repository" } }) do
+      local _, output = compose(view, width, 40)
+      for _, line in ipairs(output) do
+        if line:find("%S") then
+          assert(line:sub(1, margin) == string.rep(" ", margin), "left padding lost at " .. width)
+          assert(vim.fn.strdisplaywidth(line) <= width - margin, "right padding lost at " .. width)
+        end
+      end
+    end
+  end
+end
 vim.o.ambiwidth = "double"
 for _, width in ipairs({ 22, 23, 44, 92, 112 }) do
   local result, output = compose(unusual, width, 40)

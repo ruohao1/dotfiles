@@ -35,11 +35,12 @@ behavior.
 | --- | --- |
 | `p` | Pick a project discovered from recent files |
 | `r` | Pick a recent file |
-| `q` | Quit with normal `:quit` behavior |
+| `q` / Ctrl+C | Quit with normal `:quit` behavior; unsaved changes stay protected |
 | `j` / `k`, down / up | Cycle through the three actions |
 | Enter | Run the selected action |
 
 Projects is selected initially. A pointer and highlight identify the selection.
+Ctrl+C is mapped only in the starter buffer; editing buffers keep their usual behavior.
 Project selection validates that the directory still exists before changing into
 it and opening its file picker.
 
@@ -68,7 +69,9 @@ Git clean/process filters, including through user-wide configuration, or track
 submodules use the menu-only fallback. Git status can run commands from those
 configurations, so automatic collection declines them before inspecting changes.
 
-At 92 columns or wider, the menu sits beside the Git summary. Narrower windows
-stack them and use a horizontal menu when it fits. Optional detail is reduced
-first in short windows. In very small windows, all actions and the essential
-repository summary remain available as scrollable content.
+The layout keeps at least two columns of padding on each side, reducing that
+margin below 26 columns to preserve the compact view. At 116 columns or wider,
+the menu sits beside the Git summary in a centered 112-column content area.
+Narrower windows stack them, using a horizontal menu when it fits. Optional
+detail is reduced first in short windows. In very small windows, all actions
+and the essential repository summary remain available as scrollable content.
