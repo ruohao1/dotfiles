@@ -141,6 +141,7 @@ local function new_controller_harness(context)
     augroup_calls = {},
     autocmds = {},
     mappings = {},
+    removed_mappings = {},
     status_calls = {},
     picker_calls = {},
     notifications = {},
@@ -319,6 +320,9 @@ local function new_controller_harness(context)
         callback = callback,
         description = description,
       })
+    end,
+    delete_mapping = function(bufnr, lhs)
+      table.insert(harness.removed_mappings, { bufnr, lhs })
     end,
     create_augroup = function(name, options)
       table.insert(harness.augroup_calls, {
@@ -538,7 +542,11 @@ harness:invoke("User")
 eq(harness.status_calls, {
   { phase = "status", visible = true },
 }, "MiniStarterOpened suppresses the statusline")
-eq(#harness.mappings, 11, "MiniStarterOpened action and native navigation mappings")
+eq(harness.removed_mappings, {
+  { harness.current_buffer, "<M-j>" },
+  { harness.current_buffer, "<M-k>" },
+}, "MiniStarterOpened releases native Alt mappings for split navigation")
+eq(#harness.mappings, 9, "MiniStarterOpened action and native navigation mappings")
 eq(
   vim.tbl_map(function(mapping)
     return { mapping.bufnr, mapping.lhs, mapping.description }
@@ -550,11 +558,9 @@ eq(
     { harness.current_buffer, "j", "Next startup item" },
     { harness.current_buffer, "<Down>", "Next startup item" },
     { harness.current_buffer, "<C-n>", "Next startup item" },
-    { harness.current_buffer, "<M-j>", "Next startup item" },
     { harness.current_buffer, "k", "Previous startup item" },
     { harness.current_buffer, "<Up>", "Previous startup item" },
     { harness.current_buffer, "<C-p>", "Previous startup item" },
-    { harness.current_buffer, "<M-k>", "Previous startup item" },
   },
   "exact buffer-local startup mappings"
 )
@@ -662,7 +668,7 @@ eq(lifecycle.selected, 2, "j selects Recent files natively")
 lifecycle.mappings[4].callback()
 lifecycle.mappings[4].callback()
 eq(lifecycle.selected, 1, "j cycles back to Projects")
-lifecycle.mappings[8].callback()
+lifecycle.mappings[7].callback()
 eq(lifecycle.selected, 3, "k cycles backward to Quit")
 lifecycle.requests[1].callback({ kind = "repository", name = "fixture" })
 lifecycle:flush()
@@ -740,7 +746,7 @@ restore_navigation:invoke("User")
 restore_navigation:flush()
 restore_navigation.mappings[4].callback()
 restore_navigation:invoke("VimResized")
-restore_navigation.mappings[8].callback()
+restore_navigation.mappings[7].callback()
 restore_navigation.requests[1].callback({ kind = "non_repository" })
 restore_navigation:flush()
 eq(
@@ -1560,6 +1566,30 @@ local live_ok, live_error = xpcall(function()
   with_child({ name = "bare" }, function(child)
     wait_for_starter(child, "bare startup")
     assert_bare_starter(inspect_starter(child), "bare launch")
+
+    child_lua(
+      child,
+      [[
+      vim.cmd('belowright split')
+      _G.navigation_bottom = vim.api.nvim_get_current_win()
+      vim.cmd('wincmd k')
+      _G.navigation_top = vim.api.nvim_get_current_win()
+      assert(_G.navigation_top ~= _G.navigation_bottom, 'starter split fixture')
+    ]]
+    )
+    child_input(child, "<M-j>")
+    wait_child_lua(
+      child,
+      [[return vim.api.nvim_get_current_win() == _G.navigation_bottom]],
+      "Alt-j moves down between starter windows"
+    )
+    child_input(child, "<M-k>")
+    wait_child_lua(
+      child,
+      [[return vim.api.nvim_get_current_win() == _G.navigation_top]],
+      "Alt-k moves up between starter windows"
+    )
+    child_lua(child, [[vim.cmd('only')]])
 
     child_lua(
       child,

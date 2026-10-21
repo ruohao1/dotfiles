@@ -412,14 +412,17 @@ local function new(dependencies)
       desc = "Install MiniStarter action mappings",
       callback = function()
         local bufnr = dependencies.current_buffer()
+        -- MiniStarter's native Alt bindings shadow global split navigation.
+        dependencies.delete_mapping(bufnr, "<M-j>")
+        dependencies.delete_mapping(bufnr, "<M-k>")
         dependencies.set_startup_visible(true)
         dependencies.set_mapping(bufnr, "p", actions.projects, "Open projects")
         dependencies.set_mapping(bufnr, "r", actions.recent, "Open recent files")
         dependencies.set_mapping(bufnr, "q", actions.quit, "Quit")
         local entry = ensure_buffer(bufnr)
         for _, direction in ipairs({
-          { "next", "Next startup item", { "j", "<Down>", "<C-n>", "<M-j>" } },
-          { "prev", "Previous startup item", { "k", "<Up>", "<C-p>", "<M-k>" } },
+          { "next", "Next startup item", { "j", "<Down>", "<C-n>" } },
+          { "prev", "Previous startup item", { "k", "<Up>", "<C-p>" } },
         }) do
           for _, key in ipairs(direction[3]) do
             dependencies.set_mapping(bufnr, key, function()
@@ -634,6 +637,9 @@ local runtime = new({
       nowait = true,
       silent = true,
     })
+  end,
+  delete_mapping = function(bufnr, lhs)
+    vim.keymap.del("n", lhs, { buffer = bufnr })
   end,
   create_augroup = vim.api.nvim_create_augroup,
   create_autocmd = vim.api.nvim_create_autocmd,
