@@ -1855,8 +1855,9 @@ local live_ok, live_error = xpcall(function()
         [[
         local starter = require("mini.starter")
         local cursor = vim.api.nvim_win_get_cursor(0)
-        local selected, pointers, active = nil, 0, nil
+        local selected, pointers, active, menu_rows = nil, 0, nil, {}
         for _, item in ipairs(starter.content_to_items()) do
+          menu_rows[#menu_rows + 1] = item._cursorpos[1]
           if vim.deep_equal(item._cursorpos, cursor) then selected = item.name end
         end
         for row, line in ipairs(starter.get_content()) do
@@ -1871,7 +1872,7 @@ local live_ok, live_error = xpcall(function()
         end
         return { name = selected, pointers = pointers, matches = vim.deep_equal(cursor, active) and active ~= nil
             and vim.api.nvim_buf_get_lines(0, active[1] - 1, active[1], false)[1]:sub(active[2] - 1, active[2]) == "> ",
-          requests = #_G.startup_requests, recent = _G.startup_recent }
+          requests = #_G.startup_requests, recent = _G.startup_recent, menu_rows = menu_rows }
       ]]
       )
     end
@@ -1905,12 +1906,15 @@ local live_ok, live_error = xpcall(function()
     ]]
     )
     assert_selection("r  Recent files", "async completion")
-    child_lua(child, [[vim.o.columns = 70; vim.api.nvim_exec_autocmds("VimResized", {})]])
-    assert_selection("r  Recent files", "narrow resize")
+    child_lua(child, [[vim.o.columns = 111; vim.api.nvim_exec_autocmds("VimResized", {})]])
+    local narrow_rows = assert_selection("r  Recent files", "narrow resize").menu_rows
+    eq(narrow_rows[1], narrow_rows[3], "111-column menu stays on a shared row")
     child_input(child, "<Down>")
     assert_selection("q  Quit", "shared-row Quit")
-    child_lua(child, [[vim.o.columns = 120; vim.api.nvim_exec_autocmds("VimResized", {})]])
-    eq(assert_selection("q  Quit", "wide resize").requests, 1, "resize never recollects Git")
+    child_lua(child, [[vim.o.columns = 112; vim.api.nvim_exec_autocmds("VimResized", {})]])
+    local wide_state = assert_selection("q  Quit", "wide resize")
+    eq(wide_state.requests, 1, "resize never recollects Git")
+    assert(wide_state.menu_rows[1] < wide_state.menu_rows[3], "112-column menu uses separate rows")
     child_lua(
       child,
       [[

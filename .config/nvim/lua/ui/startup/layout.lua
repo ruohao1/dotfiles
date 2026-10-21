@@ -234,7 +234,7 @@ function M.compose(content, view, options)
     end
   end
   local has_panel = view.kind == "repository" or view.kind == "loading"
-  local wide = has_panel and width >= 92
+  local wide = has_panel and width >= 112
   local block_width = math.min(width, 112)
   local horizontal = menu_lines(items, true)
   local menu = menu_lines(

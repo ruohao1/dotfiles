@@ -68,7 +68,7 @@ Git clean/process filters, including through user-wide configuration, or track
 submodules use the menu-only fallback. Git status can run commands from those
 configurations, so automatic collection declines them before inspecting changes.
 
-At 92 columns or wider, the menu sits beside the Git summary. Narrower windows
-stack them and use a horizontal menu when it fits. Optional detail is reduced
-first in short windows. In very small windows, all actions and the essential
+At 112 columns or wider, the menu sits beside the Git summary. Narrower windows
+stack them so Git gets the full width, using a horizontal menu when it fits.
+Optional detail is reduced first in short windows. In very small windows, all actions and the essential
 repository summary remain available as scrollable content.
