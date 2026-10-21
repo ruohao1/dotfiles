@@ -546,7 +546,7 @@ eq(harness.removed_mappings, {
   { harness.current_buffer, "<M-j>" },
   { harness.current_buffer, "<M-k>" },
 }, "MiniStarterOpened releases native Alt mappings for split navigation")
-eq(#harness.mappings, 9, "MiniStarterOpened action and native navigation mappings")
+eq(#harness.mappings, 10, "MiniStarterOpened action and native navigation mappings")
 eq(
   vim.tbl_map(function(mapping)
     return { mapping.bufnr, mapping.lhs, mapping.description }
@@ -555,6 +555,7 @@ eq(
     { harness.current_buffer, "p", "Open projects" },
     { harness.current_buffer, "r", "Open recent files" },
     { harness.current_buffer, "q", "Quit" },
+    { harness.current_buffer, "<C-c>", "Quit" },
     { harness.current_buffer, "j", "Next startup item" },
     { harness.current_buffer, "<Down>", "Next startup item" },
     { harness.current_buffer, "<C-n>", "Next startup item" },
@@ -566,6 +567,7 @@ eq(
 )
 assert(harness.mappings[1].callback == options.items[1].action, "project action identity changed")
 assert(harness.mappings[2].callback == options.items[2].action, "recent action identity changed")
+assert(harness.mappings[4].callback == options.items[3].action, "Ctrl-C must share the Quit action")
 
 harness.status_calls = {}
 harness.filetypes[harness.current_buffer] = "ministarter"
@@ -663,12 +665,12 @@ lifecycle:invoke("User")
 eq(#lifecycle.requests, 1, "opening starts one asynchronous request")
 eq(lifecycle.requests[1].directory, "/workspace", "request captures the buffer directory")
 lifecycle:flush()
-lifecycle.mappings[4].callback()
+lifecycle.mappings[5].callback()
 eq(lifecycle.selected, 2, "j selects Recent files natively")
-lifecycle.mappings[4].callback()
-lifecycle.mappings[4].callback()
+lifecycle.mappings[5].callback()
+lifecycle.mappings[5].callback()
 eq(lifecycle.selected, 1, "j cycles back to Projects")
-lifecycle.mappings[7].callback()
+lifecycle.mappings[8].callback()
 eq(lifecycle.selected, 3, "k cycles backward to Quit")
 lifecycle.requests[1].callback({ kind = "repository", name = "fixture" })
 lifecycle:flush()
@@ -744,9 +746,9 @@ local restore_navigation = new_controller_harness()
 test.new(restore_navigation.dependencies):setup()
 restore_navigation:invoke("User")
 restore_navigation:flush()
-restore_navigation.mappings[4].callback()
+restore_navigation.mappings[5].callback()
 restore_navigation:invoke("VimResized")
-restore_navigation.mappings[7].callback()
+restore_navigation.mappings[8].callback()
 restore_navigation.requests[1].callback({ kind = "non_repository" })
 restore_navigation:flush()
 eq(
@@ -1479,6 +1481,7 @@ local function inspect_starter(child)
     local p = vim.fn.maparg("p", "n", false, true)
     local r = vim.fn.maparg("r", "n", false, true)
     local q = vim.fn.maparg("q", "n", false, true)
+    local ctrl_c = vim.fn.maparg("<C-c>", "n", false, true)
     return {
       filetype = vim.bo.filetype,
       visible = visible,
@@ -1488,6 +1491,7 @@ local function inspect_starter(child)
       p_buffer = p.buffer,
       r_buffer = r.buffer,
       q_buffer = q.buffer,
+      ctrl_c_buffer = ctrl_c.buffer,
     }
   ]]
   )
@@ -1543,6 +1547,7 @@ local function assert_bare_starter(state, label)
   eq(state.p_buffer, 1, label .. " p mapping is buffer-local")
   eq(state.r_buffer, 1, label .. " r mapping is buffer-local")
   eq(state.q_buffer, 1, label .. " q mapping is buffer-local")
+  eq(state.ctrl_c_buffer, 1, label .. " Ctrl-C mapping is buffer-local")
 end
 
 local function edit_and_inspect(child, path)
@@ -1612,6 +1617,11 @@ local live_ok, live_error = xpcall(function()
     eq(restored.laststatus, 3, "standalone status restored after starter")
     assert(restored.filetype ~= "ministarter", "regular file retained starter filetype")
     eq(restored.name, vim.fs.normalize(regular), "regular file becomes current")
+    eq(
+      child_lua(child, [[return vim.fn.maparg("<C-c>", "n")]]),
+      "",
+      "regular file keeps native Ctrl-C"
+    )
   end)
 
   with_child({
@@ -1812,16 +1822,64 @@ local live_ok, live_error = xpcall(function()
     end)
   end
 
-  with_child({ name = "quit-enter" }, function(child)
-    wait_for_starter(child, "normal Enter Quit startup")
-    child_input(child, "k<CR>")
-    assert(
-      vim.wait(5000, function()
-        return child.process:is_closing()
-      end, 20),
-      "native Enter Quit did not exit"
+  for _, case in ipairs({
+    { name = "quit-enter", keys = "k<CR>" },
+    { name = "quit-ctrl-c", keys = "<C-c>" },
+  }) do
+    with_child({ name = case.name }, function(child)
+      wait_for_starter(child, case.name .. " startup")
+      child_input(child, case.keys)
+      assert(
+        vim.wait(5000, function()
+          return child.process:is_closing()
+        end, 20),
+        case.name .. " did not exit"
+      )
+      eq(child.process:wait(5000).code, 0, case.name .. " exits normally")
+    end)
+  end
+
+  with_child({ name = "ctrl-c-unsaved" }, function(child)
+    wait_for_starter(child, "Ctrl-C unsaved startup")
+    child_lua(
+      child,
+      [[
+      vim.o.hidden, vim.o.confirm = true, false
+      vim.o.autowrite, vim.o.autowriteall = false, false
+      vim.cmd.enew()
+      _G.startup_unsaved = vim.api.nvim_get_current_buf()
+      vim.api.nvim_buf_set_name(0, vim.fn.getcwd() .. "/unsaved.txt")
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, { "keep this unsaved edit" })
+      vim.cmd.enew()
+      require("mini.starter").open()
+      vim.v.errmsg = ""
+    ]]
     )
-    eq(child.process:wait(5000).code, 0, "native Enter Quit exits normally")
+    wait_for_starter(child, "starter with hidden unsaved buffer")
+    child_input(child, "<C-c>")
+    wait_child_lua(child, [[return vim.v.errmsg ~= ""]], "Ctrl-C reports unsafe quit")
+    eq(
+      child_lua(
+        child,
+        [[return {
+        modified = vim.bo[_G.startup_unsaved].modified,
+        lines = vim.api.nvim_buf_get_lines(_G.startup_unsaved, 0, -1, false),
+      }]]
+      ),
+      { modified = true, lines = { "keep this unsaved edit" } },
+      "Ctrl-C preserves unsaved hidden buffer and running editor"
+    )
+  end)
+
+  with_child({ name = "ctrl-c-split" }, function(child)
+    wait_for_starter(child, "Ctrl-C split startup")
+    child_lua(child, [[vim.cmd.split()]])
+    child_input(child, "<C-c>")
+    eq(
+      wait_child_lua(child, [[return #vim.api.nvim_list_wins() == 1]], "Ctrl-C closes one split"),
+      true,
+      "Ctrl-C preserves normal quit behavior with multiple windows"
+    )
   end)
 
   with_child({ name = "native-mechanics" }, function(child)

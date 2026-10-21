@@ -419,6 +419,7 @@ local function new(dependencies)
         dependencies.set_mapping(bufnr, "p", actions.projects, "Open projects")
         dependencies.set_mapping(bufnr, "r", actions.recent, "Open recent files")
         dependencies.set_mapping(bufnr, "q", actions.quit, "Quit")
+        dependencies.set_mapping(bufnr, "<C-c>", actions.quit, "Quit")
         local entry = ensure_buffer(bufnr)
         for _, direction in ipairs({
           { "next", "Next startup item", { "j", "<Down>", "<C-n>" } },

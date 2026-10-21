@@ -35,11 +35,12 @@ behavior.
 | --- | --- |
 | `p` | Pick a project discovered from recent files |
 | `r` | Pick a recent file |
-| `q` | Quit with normal `:quit` behavior |
+| `q` / Ctrl+C | Quit with normal `:quit` behavior; unsaved changes stay protected |
 | `j` / `k`, down / up | Cycle through the three actions |
 | Enter | Run the selected action |
 
 Projects is selected initially. A pointer and highlight identify the selection.
+Ctrl+C is mapped only in the starter buffer; editing buffers keep their usual behavior.
 Project selection validates that the directory still exists before changing into
 it and opening its file picker.
 
