@@ -1,5 +1,32 @@
 # Startup screen
 
+The configuration supports Neovim 0.12 or newer on Linux and macOS. Its core
+editor and startup screen work from the Neovim directory alone with the configured
+plugins installed. Plugin preparation remains a separate first-install step.
+
+Native editor status stays visible in ordinary tmux. The dotfiles tmux stack can
+take over status only after a successful publication to the editor's originating
+session; failures or a disabled session status row restore native status. The
+starter hides the row while its screen is visible in either environment.
+
+The native statusline's rich Git segment requires the optional sibling
+`dotfiles/git-summary` executable. Without it, mode, path, diagnostics and cursor
+information remain available, with no Git polling. The startup screen's direct
+Git summary below does not require that helper.
+
+Set `vim.g.dotfiles_tmux_integration = false` before integration setup to disable
+dotfiles status, workspace registration and pins. Standard tmux clipboard and
+split navigation still work. The configured stack opts in through
+`@dotfiles_foundation_loaded=1`; if replacing its `status-left`, `status-right` or
+`status-format` manually, clear that marker or use the opt-out. Workspace
+registration is checked at startup; enabling the stack later requires restarting
+Neovim. Status handoff can recover while the editor stays open.
+
+With the dotfiles tmux bindings, `Alt+h/j/k/l` moves through Neovim splits
+and into tmux panes at editor edges. Shell panes and tmux copy mode use those
+keys for direct tmux navigation. The eagerly loaded `smart-splits` plugin marks
+the editor pane and clears its mark when Neovim exits or suspends.
+
 A bare `nvim` launch opens a single MiniStarter buffer. Opening a file, reading
 stdin, restoring a session, or using a remote invocation keeps the usual startup
 behavior.

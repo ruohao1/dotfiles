@@ -2,6 +2,12 @@
 
 Save a file location for later while working inside tmux. Neovim panes that originate in the same tmux session share their pins. Different sessions and servers keep separate lists; renaming a session preserves its pins. A pane linked into several sessions keeps its originating session as its scope. If that session disappears or the pane moves out of it, reopen Neovim in the intended session.
 
+Pins require the configured dotfiles tmux stack and executable sibling
+`tmux/scripts/location-pins` helper. Ordinary tmux, a missing helper, or
+`vim.g.dotfiles_tmux_integration = false` leaves commands available to explain
+the missing integration, without writing a pane association. Disabling the
+session's status row alone does not disable pins or workspace persistence.
+
 | Key | Command | Action |
 | --- | --- | --- |
 | `<leader>ha` | `:LinePinAdd` | Pin the current file, line, and column |

@@ -635,10 +635,37 @@ local bridge_option_names = {
 }
 
 local function publisher_harness()
-  local calls, deferred, notices = {}, {}, {}
+  local calls, deferred, notices, timers, availability = {}, {}, {}, {}, {}
   local deps = {
     pane = "%12",
+    origin = { socket = "/private/tmux.sock", pid = "99", session = "$0", pane = "%12" },
     owner = "101_202",
+    on_available = function(value)
+      table.insert(availability, value)
+    end,
+    new_timer = function()
+      local timer = { closed = false, active = false }
+      function timer:start(delay, interval, callback)
+        self.delay, self.interval, self.callback, self.active = delay, interval, callback, true
+      end
+      function timer:stop()
+        assert(not self.closed, "timer stopped after close")
+        self.active = false
+      end
+      function timer:is_closing()
+        return self.closed
+      end
+      function timer:close()
+        self.closed, self.active = true, false
+      end
+      function timer:fire()
+        if self.active then
+          self.callback()
+        end
+      end
+      table.insert(timers, timer)
+      return timer
+    end,
     warn_level = "warn",
     schedule = function(callback)
       callback()
@@ -668,7 +695,14 @@ local function publisher_harness()
       return call
     end,
   }
-  return { deps = deps, calls = calls, deferred = deferred, notices = notices }
+  return {
+    deps = deps,
+    calls = calls,
+    deferred = deferred,
+    notices = notices,
+    timers = timers,
+    availability = availability,
+  }
 end
 
 local function bridge_snapshot(path, line)
@@ -705,18 +739,6 @@ local function assert_control_free(value, label)
   assert(not value:find("[%z\1-\31\127]"), label .. " retained a C0 or DEL control")
   assert(not value:find("\194[\128-\159]"), label .. " retained a C1 control")
 end
-
-local bridge_exports = vim.tbl_keys(bridge_test)
-table.sort(bridge_exports)
-eq(bridge_exports, {
-  "canonicalize",
-  "cleanup_argv",
-  "decimal",
-  "new",
-  "tmux_quote",
-  "update_argv",
-  "valid_pane",
-}, "exact tmux publisher test exports")
 
 for _, pane in ipairs({ "%0", "%1", "%123" }) do
   eq(bridge_test.valid_pane(pane), true, "valid pane " .. pane)
@@ -778,380 +800,225 @@ local grapheme_capped = bridge_test.canonicalize({
 eq(grapheme_capped, string.rep("a", 508), "byte cap preserves a combining sequence")
 assert(pcall(vim.str_utfindex, grapheme_capped), "combining cap split UTF-8")
 
-do
-  local h = publisher_harness()
-  local publisher = bridge_test.new(h.deps)
-  publisher:start(bridge_snapshot("first.lua", 1))
-  for index = 2, 10 do
-    publisher:request(bridge_snapshot("file" .. index .. ".lua", index))
-  end
-  eq(#h.deferred, 10, "every request gets a debounce generation")
-  for _, item in ipairs(h.deferred) do
-    eq(item.milliseconds, 75, "publisher debounce")
-    item.callback()
-  end
-
-  eq(#h.calls, 1, "debounced initial claim")
-  local claim = h.calls[1].argv
-  assert(type(claim) == "table", "publisher did not use argv")
-  eq(claim[1], "tmux", "publisher executable")
-  eq(h.calls[1].options, { text = true }, "publisher process options")
-  eq(option_value(claim, "@dotfiles_nvim_owner"), "101_202", "owner claim")
-  eq(option_value(claim, "@dotfiles_nvim_path"), "file10.lua", "claim uses newest snapshot")
-
-  local claim_names = {}
-  for index, value in ipairs(claim) do
-    if value == "set-option" then
-      eq(claim[index + 1], "-pt", "claim pane scope")
-      eq(claim[index + 2], "%12", "claim pane target")
-      table.insert(claim_names, claim[index + 3])
+local function flush_bridge(h)
+  for index = #h.deferred, 1, -1 do
+    if h.deferred[index].milliseconds == 75 then
+      h.deferred[index].callback()
+      return
     end
   end
-  eq(claim_names, {
-    "@dotfiles_nvim_owner",
-    "@dotfiles_nvim_active",
-    "@dotfiles_nvim_mode",
-    "@dotfiles_nvim_root",
-    "@dotfiles_nvim_path",
-    "@dotfiles_nvim_errors",
-    "@dotfiles_nvim_warnings",
-    "@dotfiles_nvim_line",
-    "@dotfiles_nvim_column",
-    "@dotfiles_nvim_active",
-  }, "initial claim option order")
-  eq(claim[#claim], "1", "claim sets active last")
-
-  local joined_claim = table.concat(claim, "\0")
-  assert(not joined_claim:find("sh\0-c", 1, true), "publisher used sh -c")
-  assert(not joined_claim:find("refresh-client", 1, true), "publisher forced status refresh")
+  error("missing publication debounce")
+end
+local function complete_bridge(h, result)
+  local call = h.calls[#h.calls]
+  local stdout = call.argv[5] == "list-panes" and "99\t$0\t%12\t1\ton\n"
+    or "dotfiles-nvim-status:101_202\n"
+  bridge_finish(h, #h.calls, vim.tbl_extend("force", { stdout = stdout }, result or {}))
+end
+local function ready_bridge(h, publisher)
+  publisher:start(bridge_snapshot())
+  flush_bridge(h)
+  eq(h.calls[#h.calls].argv[5], "list-panes", "first publication probes the origin")
+  complete_bridge(h)
+  eq(h.calls[#h.calls].argv[5], "if-shell", "configured capability permits a guarded claim")
+  complete_bridge(h)
+  eq(h.availability[#h.availability], true, "only the exact claim acknowledgment enables handoff")
 end
 
-for _, case in ipairs({
-  { input = ";", expected = "\\;", label = "lone semicolon" },
-  { input = "foo;", expected = "foo\\;", label = "trailing semicolon" },
-  { input = "foo;;", expected = "foo;\\;", label = "two trailing semicolons" },
-  { input = "back\\;", expected = "back\\\\;", label = "backslash and trailing semicolon" },
-  { input = "middle;value", expected = "middle;value", label = "middle semicolon" },
-  {
-    input = [[quotes'" $HOME ${HOME} #]],
-    expected = [[quotes'" $HOME ${HOME} #]],
-    label = "quotes dollar hash",
-  },
+for _, output in ipairs({
+  "",
+  "99\t$0\t%12\t0\ton\n",
+  "99\t$0\t%12\t1\toff\n",
+  "98\t$0\t%12\t1\ton\n",
 }) do
   local h = publisher_harness()
   local publisher = bridge_test.new(h.deps)
-  publisher:start(bridge_snapshot(case.input, 1))
-  h.deferred[1].callback()
+  publisher:start(bridge_snapshot())
+  flush_bridge(h)
+  eq(h.calls[1].argv[5], "list-panes", "ordinary tmux is probed before any write")
+  complete_bridge(h, { stdout = output })
+  eq(#h.calls, 1, "unavailable tmux never receives a claim or cleanup write")
+  assert(h.availability[#h.availability] ~= true, "unavailable capability hid native status")
+  publisher:stop()
+  eq(#h.calls, 1, "unavailable shutdown does not write pane options")
+end
+
+for _, result in ipairs({
+  { stdout = "" },
+  { stdout = "unexpected\n" },
+  { stdout = "dotfiles-nvim-status:other\n" },
+  { stdout = "dotfiles-nvim-status:101_202\n", signal = 9 },
+}) do
+  local h = publisher_harness()
+  local publisher = bridge_test.new(h.deps)
+  publisher:start(bridge_snapshot())
+  flush_bridge(h)
+  complete_bridge(h)
+  complete_bridge(h, result)
+  assert(h.availability[#h.availability] ~= true, "exit zero without exact ack hid the native row")
+  eq(publisher:debug_state().published, nil, "unacknowledged publication never advances dedup")
+  publisher:stop()
+end
+
+do
+  local h = publisher_harness()
+  local publisher = bridge_test.new(h.deps)
+  ready_bridge(h, publisher)
+  local count = #h.calls
+  publisher:request(bridge_snapshot())
+  flush_bridge(h)
+  eq(#h.calls, count, "acknowledged snapshot deduplicated")
+  publisher:request(bridge_snapshot("running", 2))
+  flush_bridge(h)
+  publisher:request(bridge_snapshot("older", 3))
+  flush_bridge(h)
+  publisher:request(bridge_snapshot("newest", 4))
+  flush_bridge(h)
+  eq(#h.calls, count + 1, "one publication in flight")
+  complete_bridge(h)
+  eq(#h.calls, count + 2, "only newest pending snapshot follows completion")
+  contains(table.concat(h.calls[#h.calls].argv, " "), "newest", "latest state wins")
+  complete_bridge(h)
+  publisher:stop()
+end
+
+do
+  local h = publisher_harness()
+  local publisher = bridge_test.new(h.deps)
+  ready_bridge(h, publisher)
+  publisher:request(bridge_snapshot("changed", 2))
+  flush_bridge(h)
+  complete_bridge(h, { stdout = "dotfiles-nvim-owner-mismatch\n" })
+  eq(h.availability[#h.availability], false, "replacement owner restores native status")
+  local count = #h.calls
+  publisher:refresh()
+  publisher:request(bridge_snapshot("ignored", 3))
+  flush_bridge(h)
+  eq(#h.calls, count, "replacement owner cannot trigger automatic reclaim")
+  publisher:stop()
+end
+
+do
+  local h = publisher_harness()
+  local publisher = bridge_test.new(h.deps)
+  ready_bridge(h, publisher)
+  publisher:request(bridge_snapshot("before-focus", 2))
+  flush_bridge(h)
+  publisher:set_focused(false)
+  publisher:set_focused(true)
+  complete_bridge(h)
   eq(
-    option_value(h.calls[1].argv, "@dotfiles_nvim_path"),
-    case.expected,
-    "claim preserves " .. case.label
+    h.availability[#h.availability],
+    false,
+    "old in-flight success cannot bypass focus revalidation"
   )
-  bridge_finish(h, 1)
+  eq(h.calls[#h.calls].argv[5], "list-panes", "focus revalidation follows the old child")
+  complete_bridge(h)
+  complete_bridge(h)
+  eq(h.availability[#h.availability], true, "fresh acknowledgment restores handoff")
+  publisher:stop()
 end
 
 do
   local h = publisher_harness()
   local publisher = bridge_test.new(h.deps)
-  local first = bridge_snapshot("first.lua", 1)
-  local running = bridge_snapshot("running.lua", 20)
-  local older = bridge_snapshot("older.lua", 21)
-  local newest = bridge_snapshot("newest.lua", 22)
-
-  publisher:start(first)
-  h.deferred[#h.deferred].callback()
-  bridge_finish(h, 1)
-
-  publisher:request(running)
-  h.deferred[#h.deferred].callback()
-  eq(#h.calls, 2, "first guarded update")
-  publisher:request(older)
-  h.deferred[#h.deferred].callback()
-  publisher:request(newest)
-  h.deferred[#h.deferred].callback()
-  eq(#h.calls, 2, "one publisher child")
-  bridge_finish(h, 2)
-  eq(#h.calls, 3, "newest pending publisher snapshot")
-  contains(h.calls[3].argv[7], "newest.lua", "pending replacement")
-  eq(h.calls[3].argv[2], "if-shell", "update uses a tmux conditional")
-  eq(h.calls[3].argv[3], "-F", "owner condition is a format")
-  eq(h.calls[3].argv[4], "-t", "owner condition has an explicit target")
-  eq(h.calls[3].argv[5], "%12", "owner condition pane")
-  eq(h.calls[3].argv[6], "#{==:#{@dotfiles_nvim_owner},101_202}", "owner-guarded update")
-  eq(#h.calls[3].argv, 8, "guarded update argv shape")
-  bridge_finish(h, 3)
-
-  publisher:request(newest)
-  h.deferred[#h.deferred].callback()
-  eq(#h.calls, 3, "successful snapshot deduplicated")
-end
-
-do
-  local h = publisher_harness()
-  local publisher = bridge_test.new(h.deps)
-  local published_a = bridge_snapshot("a.lua", 1)
-  local in_flight_b = bridge_snapshot("b.lua", 2)
-
-  publisher:start(published_a)
-  h.deferred[#h.deferred].callback()
-  bridge_finish(h, 1)
-  publisher:request(in_flight_b)
-  h.deferred[#h.deferred].callback()
-  publisher:request(published_a)
-  h.deferred[#h.deferred].callback()
-  eq(#h.calls, 2, "published snapshot waits while a different update runs")
-  bridge_finish(h, 2)
-  eq(#h.calls, 3, "newest pending snapshot is compared after child success")
-  contains(h.calls[3].argv[7], "a.lua", "published A is restored after B")
-end
-
-do
-  local h = publisher_harness()
-  local publisher = bridge_test.new(h.deps)
-  local retry = bridge_snapshot("retry.lua", 30)
-
-  publisher:start(retry)
-  h.deferred[#h.deferred].callback()
-  bridge_finish(h, 1, { code = 1, stderr = "initial failed" })
-  eq(#h.notices, 1, "initial failure warning")
-  eq(publisher:debug_state().claimed, false, "failed claim does not claim ownership")
-  eq(publisher:debug_state().published, nil, "failed claim does not advance dedup")
-
-  publisher:request(retry)
-  h.deferred[#h.deferred].callback()
-  eq(#h.calls, 2, "failed initial snapshot retries")
-  eq(h.calls[2].argv[2], "set-option", "initial failure retries the claim queue")
-  bridge_finish(h, 2, { code = 0, signal = 15 })
-  eq(#h.notices, 1, "signaled failure shares the warning gate")
-  eq(publisher:debug_state().published, nil, "signaled code-zero result is not published")
-
-  publisher:request(retry)
-  h.deferred[#h.deferred].callback()
-  eq(#h.calls, 3, "signaled snapshot retries")
-  bridge_finish(h, 3)
-  eq(publisher:debug_state().warned, false, "success resets warning state")
-
-  local failure = bridge_snapshot("failure.lua", 31)
-  publisher:request(failure)
-  h.deferred[#h.deferred].callback()
-  bridge_finish(h, 4, { code = 1, stderr = "failed" })
-  eq(#h.notices, 2, "failure after success warns again")
-  publisher:request(failure)
-  h.deferred[#h.deferred].callback()
-  bridge_finish(h, 5, { code = 1, stderr = "failed again" })
-  eq(#h.notices, 2, "repeated failure warning deduplicated")
-  publisher:request(failure)
-  h.deferred[#h.deferred].callback()
-  bridge_finish(h, 6)
-
-  publisher:request(bridge_snapshot("failure-again.lua", 32))
-  h.deferred[#h.deferred].callback()
-  bridge_finish(h, 7, { code = 1, stderr = "failed after recovery" })
-  eq(#h.notices, 3, "later success resets failure warning gate")
-  eq(h.notices[3].level, "warn", "warning level")
-end
-
-do
-  local h = publisher_harness()
-  local real_system = h.deps.system
-  local attempts = 0
-  h.deps.system = function(...)
-    attempts = attempts + 1
-    if attempts == 1 then
-      error("spawn failed")
-    end
-    return real_system(...)
-  end
-
-  local publisher = bridge_test.new(h.deps)
-  publisher:start(bridge_snapshot("spawn.lua", 1))
-  h.deferred[#h.deferred].callback()
-  eq(#h.notices, 1, "thrown spawn warns")
-  contains(h.notices[1].message, "spawn failed", "thrown spawn detail")
-  eq(publisher:debug_state().in_flight, false, "thrown spawn clears the child slot")
-  publisher:request(bridge_snapshot("spawn.lua", 1))
-  h.deferred[#h.deferred].callback()
-  eq(#h.calls, 1, "thrown spawn snapshot retries")
-  bridge_finish(h, 1)
-end
-
-do
-  local h = publisher_harness()
-  local publisher = bridge_test.new(h.deps)
-  publisher:start(bridge_snapshot("initial.lua", 1))
-  h.deferred[1].callback()
-  bridge_finish(h, 1)
-
-  local hostile_snapshot = {
-    mode = "INSERT",
-    root = [[/repo/space ; ' " \ % # $HOME ${HOME} #{session_name} #[fg=red] #(id);]],
-    path = [[space ; ' " \ % # $HOME ${HOME} #{session_name} #[fg=red] #(id)]]
-      .. "\n\27\0"
-      .. c1_csi_bridge
-      .. "tail;",
-    errors = "0002",
-    warnings = -1,
-    line = "0007",
-    column = 11,
-  }
-  local hostile_canonical = bridge_test.canonicalize(hostile_snapshot)
-  publisher:request(hostile_snapshot)
-  h.deferred[2].callback()
-
-  local hostile = h.calls[2].argv
-  eq(hostile[1], "tmux", "hostile update executable")
-  eq(hostile[2], "if-shell", "hostile update remains guarded")
-  eq(hostile[6], "#{==:#{@dotfiles_nvim_owner},101_202}", "hostile owner condition")
-  eq(#hostile, 8, "hostile update cannot append a tmux command")
-  eq(hostile[8], "", "guarded update false branch")
-  contains(hostile[7], "$HOME", "dollar remains literal in quoted command")
-  contains(hostile[7], "#{session_name}", "format-looking value stays in the command argument")
-  contains(hostile[7], "#(id)", "job-looking value stays in the command argument")
-  contains(
-    hostile[7],
-    "@dotfiles_nvim_path " .. bridge_test.tmux_quote(hostile_canonical.path),
-    "hostile path is tmux-quoted"
-  )
-  contains(hostile[7], "@dotfiles_nvim_errors '2'", "decimal canonicalization")
-  for _, name in ipairs(bridge_option_names) do
-    contains(hostile[7], "set-option -pt %12 " .. name .. " ", "hostile update includes " .. name)
-  end
-  for index, value in ipairs(hostile) do
-    assert_control_free(value, "hostile argv " .. index)
-  end
-  assert(
-    not table.concat(hostile, "\0"):find("refresh-client", 1, true),
-    "hostile update forced refresh"
-  )
-end
-
-do
-  local h = publisher_harness()
-  local publisher = bridge_test.new(h.deps)
-  local control_path = "a\0b\n\27c\127d" .. c1_first_bridge .. "e" .. c1_last_bridge
-  publisher:start(bridge_snapshot(control_path, 1))
-  h.deferred[1].callback()
+  ready_bridge(h, publisher)
+  publisher:set_focused(true)
   eq(
-    option_value(h.calls[1].argv, "@dotfiles_nvim_path"),
-    "abcde",
-    "claim strips every control class"
+    h.availability[#h.availability],
+    false,
+    "focus gain without prior loss still withdraws native handoff"
   )
-  for index, value in ipairs(h.calls[1].argv) do
-    assert_control_free(value, "claim argv " .. index)
+  eq(h.calls[#h.calls].argv[5], "list-panes", "repeated focus gain revalidates immediately")
+  publisher:stop()
+end
+
+do
+  local h = publisher_harness()
+  local publisher = bridge_test.new(h.deps)
+  ready_bridge(h, publisher)
+  publisher:set_focused(false)
+  eq(h.timers[1].active, false, "focus loss pauses capability polling")
+  publisher:set_focused(true)
+  eq(h.availability[#h.availability], false, "focus gain restores native while revalidating")
+  eq(h.calls[#h.calls].argv[5], "list-panes", "focus gain probes immediately")
+  complete_bridge(h, { stdout = "99\t$0\t%12\t1\toff\n" })
+  if h.calls[#h.calls].argv[5] == "if-shell" then
+    complete_bridge(h, { stdout = "" })
+  end
+  eq(h.availability[#h.availability], false, "status disabled retains native ownership")
+  publisher:refresh()
+  complete_bridge(h)
+  complete_bridge(h)
+  eq(h.availability[#h.availability], true, "capability recovery allows acknowledged handoff")
+  publisher:stop()
+end
+
+do
+  local h = publisher_harness()
+  local publisher = bridge_test.new(h.deps)
+  ready_bridge(h, publisher)
+  publisher:request(bridge_snapshot("hung", 2))
+  flush_bridge(h)
+  local call = h.calls[#h.calls]
+  local deadline = h.timers[#h.timers]
+  eq(deadline.delay, 1000, "publication deadline")
+  deadline:fire()
+  eq(h.availability[#h.availability], false, "deadline falls back without an exit callback")
+  eq(call.killed, 9, "deadline force-terminates the owned client")
+  local count = #h.calls
+  publisher:refresh()
+  eq(#h.calls, count, "deadline retains occupied slot until reap")
+  call.callback({ code = 0, signal = 0, stdout = "dotfiles-nvim-status:101_202\n", stderr = "" })
+  eq(h.availability[#h.availability], false, "late timed-out success cannot reclaim native row")
+  publisher:stop()
+  for _, timer in ipairs(h.timers) do
+    assert(timer.closed, "shutdown leaked a timer")
   end
 end
 
 do
   local h = publisher_harness()
   local publisher = bridge_test.new(h.deps)
-  publisher:start(bridge_snapshot("exit.lua", 1))
-  h.deferred[#h.deferred].callback()
-  publisher:request(bridge_snapshot("pending.lua", 2))
-  h.deferred[#h.deferred].callback()
-  publisher:stop()
-
-  eq(h.calls[1].killed, 15, "exit terminates publisher child")
-  eq(h.calls[1].waited, 150, "exit bounded-waits publisher child")
-  eq(#h.calls, 2, "exit launches one cleanup queue")
-  eq(h.calls[2].waited, 200, "exit bounded-waits cleanup")
-  local cleanup = h.calls[2].argv
-  eq(cleanup[1], "tmux", "cleanup executable")
-  eq(cleanup[2], "if-shell", "cleanup uses a conditional")
-  eq(cleanup[6], "#{==:#{@dotfiles_nvim_owner},101_202}", "cleanup owner guard")
-  eq(cleanup[8], "", "cleanup false command")
-
-  local expected_cleanup_names = { "@dotfiles_nvim_active" }
-  vim.list_extend(expected_cleanup_names, bridge_option_names)
-  table.insert(expected_cleanup_names, "@dotfiles_nvim_owner")
-  local previous = 0
-  for _, name in ipairs(expected_cleanup_names) do
-    local position = assert(cleanup[7]:find(name, previous + 1, true), "cleanup lacks " .. name)
-    assert(position > previous, "cleanup option order for " .. name)
-    previous = position
+  publisher:start(bridge_snapshot())
+  flush_bridge(h)
+  complete_bridge(h)
+  local first = h.calls[#h.calls]
+  complete_bridge(h, { code = 1, stderr = "failed" })
+  if h.calls[#h.calls] ~= first then
+    complete_bridge(h, { stdout = "" })
   end
-
-  local stopped = publisher:debug_state()
-  bridge_finish(h, 1)
-  eq(#h.calls, 2, "late publisher callback is inert")
-  eq(publisher:debug_state(), stopped, "late publisher callback cannot mutate stopped state")
+  publisher:refresh()
+  complete_bridge(h)
+  local retry = table.concat(h.calls[#h.calls].argv, " ")
+  contains(retry, "@dotfiles_nvim_owner", "uncertain claim retry retains owner validation")
+  contains(retry, "dotfiles-nvim-owner-mismatch", "uncertain retry refuses another owner")
+  publisher:stop()
+  local count = #h.calls
+  first.callback({ code = 0, signal = 0, stdout = "dotfiles-nvim-status:101_202\n" })
+  publisher:refresh()
+  publisher:request(bridge_snapshot())
+  eq(#h.calls, count, "stopped callbacks and requests are inert")
 end
 
 do
   local h = publisher_harness()
   local publisher = bridge_test.new(h.deps)
-  publisher:start(bridge_snapshot("delayed.lua", 1))
-  local delayed = h.deferred[1].callback
+  ready_bridge(h, publisher)
+  local hostile = bridge_snapshot([[a; ' " $HOME #{session_name} #(id)\tail;]], 2)
+  publisher:request(hostile)
+  flush_bridge(h)
+  local argv = h.calls[#h.calls].argv
+  eq(argv[4], "/private/tmux.sock", "publisher targets explicit socket")
+  eq(argv[8], "$0:%12", "publisher targets originating session and pane")
+  local commands = table.concat(argv, "\0")
+  contains(commands, "$HOME #{session_name} #(id)", "hostile expansion syntax remains command data")
+  contains(commands, "#{pid}", "write rechecks server identity")
+  contains(commands, "#{session_id}", "write rechecks originating session")
+  contains(commands, "#{@dotfiles_foundation_loaded}", "write rechecks configured marker")
+  contains(commands, "#{status}", "write rechecks effective status")
+  assert(not commands:find("refresh-client", 1, true), "publication forced a status refresh")
   publisher:stop()
-  eq(#h.calls, 1, "stop before debounce launches cleanup only")
-  local stopped = publisher:debug_state()
-  delayed()
-  publisher:request(bridge_snapshot("ignored.lua", 2))
-  eq(#h.calls, 1, "delayed callback after stop starts no publisher")
-  eq(#h.deferred, 1, "request after stop schedules nothing")
-  eq(publisher:debug_state(), stopped, "delayed callback after stop is inert")
-end
-
-do
-  local h = publisher_harness()
-  local publisher = bridge_test.new(h.deps)
-  publisher:start(bridge_snapshot("published.lua", 1))
-  h.deferred[#h.deferred].callback()
-  bridge_finish(h, 1)
-  publisher:request(bridge_snapshot("running.lua", 2))
-  h.deferred[#h.deferred].callback()
-  publisher:request(bridge_snapshot("pending.lua", 3))
-  h.deferred[#h.deferred].callback()
-
-  local exposed = publisher:debug_state()
-  exposed.desired.path = "mutated desired"
-  exposed.published.path = "mutated published"
-  exposed.pending.path = "mutated pending"
-  local current = publisher:debug_state()
-  eq(current.desired.path, "pending.lua", "debug desired is isolated")
-  eq(current.published.path, "published.lua", "debug published is isolated")
-  eq(current.pending.path, "pending.lua", "debug pending is isolated")
-  publisher:stop()
-end
-
-do
-  local saved_tmux = vim.env.TMUX
-  local saved_tmux_pane = vim.env.TMUX_PANE
-  local saved_executable = vim.fn.executable
-  local executable_calls = 0
-  local executable_result = 1
-  vim.fn.executable = function(name)
-    eq(name, "tmux", "setup executable name")
-    executable_calls = executable_calls + 1
-    return executable_result
-  end
-
-  vim.env.TMUX = nil
-  vim.env.TMUX_PANE = "%12"
-  eq(tmux_status.setup(), nil, "outside tmux setup is disabled")
-  eq(executable_calls, 0, "outside tmux skips executable lookup")
-
-  vim.env.TMUX = "/tmp/tmux/private,1,0"
-  vim.env.TMUX_PANE = "%bad"
-  eq(tmux_status.setup(), nil, "invalid pane setup is disabled")
-  eq(executable_calls, 0, "invalid pane skips executable lookup")
-
-  vim.env.TMUX_PANE = "%12"
-  executable_result = 0
-  eq(tmux_status.setup(), nil, "missing tmux executable disables setup")
-  eq(executable_calls, 1, "missing executable checked once")
-
-  executable_result = 1
-  local publisher = tmux_status.setup()
-  assert(publisher ~= nil, "valid tmux setup returned nil")
-  eq(publisher:debug_state().stopped, false, "valid setup creates a publisher")
-  eq(executable_calls, 2, "valid executable checked once")
-
-  eq(tmux_status.setup({ pane = "%invalid" }), nil, "invalid explicit pane is rejected")
-  eq(executable_calls, 2, "invalid explicit pane skips executable lookup")
-
-  vim.fn.executable = saved_executable
-  vim.env.TMUX = saved_tmux
-  vim.env.TMUX_PANE = saved_tmux_pane
 end
 
 print("statusline tmux publisher: ok")
@@ -1208,6 +1075,12 @@ local function ownership_harness(options)
   local publisher = { setup_snapshots = {}, requests = {}, stop_calls = 0 }
   function publisher:request(snapshot)
     table.insert(self.requests, vim.deepcopy(snapshot))
+  end
+  function publisher:refresh()
+    self.refreshes = (self.refreshes or 0) + 1
+  end
+  function publisher:set_focused(value)
+    self.focused = value
   end
   function publisher:stop()
     self.stop_calls = self.stop_calls + 1
@@ -1274,6 +1147,7 @@ local function ownership_harness(options)
     end,
     publisher_setup = function(publisher_options)
       state.publisher_setup_calls = state.publisher_setup_calls + 1
+      publisher.on_available = publisher_options.on_available
       table.insert(publisher.setup_snapshots, vim.deepcopy(publisher_options.snapshot))
       eq(publisher_options.pane, options.pane, "publisher pane")
       return publisher
@@ -1339,14 +1213,22 @@ end
 
 do
   local h = ownership_harness({ inside_tmux = true, pane = "%12" })
-  with_runtime(h, function()
-    eq(h.options.laststatus, 0, "tmux owns the only row")
-    eq(h.options.cmdheight, 0, "tmux cmdheight")
-    eq(h.options.showmode, false, "tmux showmode")
-    eq(h.options.statusline, "", "tmux clears native expression")
-    eq(h.cache_factory_calls, 0, "tmux starts no Git cache")
-    eq(h.publisher_setup_calls, 1, "valid pane starts publisher")
-    eq(h.publisher.setup_snapshots[1].root, "/repo/a", "initial publication")
+  with_runtime(h, function(controller)
+    eq(h.options.laststatus, 3, "tmux starts with a native row until acknowledgment")
+    eq(h.install_calls, 1, "tmux retains a native renderer for fallback")
+    eq(h.publisher_setup_calls, 1, "valid pane starts capability discovery")
+    assert(type(h.publisher.on_available) == "function", "publisher ownership callback missing")
+    h.publisher.on_available(true)
+    eq(h.options.laststatus, 0, "acknowledged remote ownership hides native row")
+    eq(h.cache.stop_calls, 1, "remote ownership stops native Git polling")
+    h.publisher.on_available(false)
+    eq(h.options.laststatus, 3, "lost remote ownership restores native row")
+    controller:set_startup_visible(true)
+    h.publisher.on_available(true)
+    h.publisher.on_available(false)
+    eq(h.options.laststatus, 0, "handoff cannot reveal a starter status row")
+    controller:set_startup_visible(false)
+    eq(h.options.laststatus, 3, "native row returns after starter")
   end)
 end
 
@@ -1368,6 +1250,7 @@ end
 do
   local h = ownership_harness({ inside_tmux = true, pane = "%12" })
   with_runtime(h, function(controller)
+    h.publisher.on_available(true)
     controller:set_startup_visible(true)
     eq(h.options.laststatus, 0, "tmux starter keeps native row hidden")
     controller:set_startup_visible(false)
@@ -1385,9 +1268,9 @@ for _, case in ipairs({
     tmux_executable = case.executable,
   })
   with_runtime(h, function()
-    eq(h.options.laststatus, 0, case.label .. " keeps tmux ownership")
-    eq(h.install_calls, 0, case.label .. " installs no native row")
-    eq(h.cache_factory_calls, 0, case.label .. " starts no cache")
+    eq(h.options.laststatus, 3, case.label .. " retains native ownership")
+    eq(h.install_calls, 1, case.label .. " installs native row")
+    eq(h.cache_factory_calls, 1, case.label .. " retains native Git cache")
     eq(h.publisher_setup_calls, 0, case.label .. " starts no process")
     eq(
       h.executable_calls,
@@ -1404,7 +1287,7 @@ do
   local second = statusline.setup(h.deps)
   assert(first == second, "setup did not return the existing controller")
   eq(h.augroup_calls, 1, "outside setup creates one augroup")
-  eq(#h.autocmds, 7, "outside setup creates the exact event routes")
+  eq(#h.autocmds, 8, "outside setup creates the exact event routes")
   eq(h.cache_factory_calls, 1, "outside setup creates one timer/cache")
   h.options.statusline = "%!v:lua.user_statusline()"
   statusline.shutdown()
@@ -1432,11 +1315,30 @@ do
   local second = statusline.setup(h.deps)
   assert(first == second, "tmux setup did not return existing controller")
   eq(h.augroup_calls, 1, "tmux setup creates one augroup")
-  eq(#h.autocmds, 7, "tmux setup creates the exact event routes")
+  eq(#h.autocmds, 8, "tmux setup creates the exact event routes")
   eq(h.publisher_setup_calls, 1, "tmux setup creates one publisher")
   statusline.shutdown()
   statusline.shutdown()
   eq(h.publisher.stop_calls, 1, "shutdown stops publisher once")
+end
+
+do
+  local h = ownership_harness({ inside_tmux = true, pane = "%12" })
+  with_runtime(h, function(controller)
+    h.publisher.on_available(true)
+    h.fire("FocusLost")
+    eq(h.publisher.focused, false, "focus loss pauses publisher")
+    h.fire("FocusGained")
+    eq(h.publisher.focused, true, "focus gain revalidates publisher")
+    controller:refresh()
+    eq(h.publisher.refreshes, 1, "manual refresh rechecks capability")
+    h.fire("VimSuspend")
+    eq(h.publisher.stop_calls, 1, "suspend withdraws publication")
+    eq(h.options.laststatus, 3, "suspend returns native ownership")
+    h.fire("VimResume")
+    eq(h.publisher_setup_calls, 2, "resume starts a fresh publisher")
+    eq(h.options.laststatus, 3, "resume awaits new acknowledgment")
+  end)
 end
 
 statusline.shutdown()
@@ -1648,6 +1550,27 @@ do
   assert(ok, failure)
 end
 
+do
+  statusline.shutdown()
+  local saved_system, saved_root = vim.system, vim.env.DOTFILES_NVIM_ROOT
+  local root = vim.fn.tempname() .. "-standalone"
+  vim.fn.mkdir(root, "p")
+  vim.env.DOTFILES_NVIM_ROOT = root
+  local calls = 0
+  vim.system = function(...)
+    calls = calls + 1
+    return saved_system(...)
+  end
+  local controller = statusline.setup({ inside_tmux = false })
+  eq(controller:debug_state().has_cache, false, "absent optional helper creates no Git cache")
+  eq(vim.o.laststatus, 3, "standalone retains native row without rich Git")
+  assert(controller:render() ~= "", "standalone native renderer remains usable")
+  eq(calls, 0, "absent helper launches no doomed subprocess")
+  statusline.shutdown()
+  vim.system, vim.env.DOTFILES_NVIM_ROOT = saved_system, saved_root
+  vim.fn.delete(root, "rf")
+end
+
 local final_exports = vim.tbl_keys(test)
 table.sort(final_exports)
 eq(final_exports, {
@@ -1668,3 +1591,176 @@ eq(final_exports, {
 }, "exact statusline test exports")
 
 print("statusline ownership and event wiring: ok")
+
+if vim.env.DOTFILES_STATUS_LIVE == "1" then
+  local root = assert(vim.env.DOTFILES_STATUS_ROOT, "private status root required")
+  local socket = vim.fs.joinpath(root, "s.sock")
+  local previous =
+    { tmux = vim.env.TMUX, pane = vim.env.TMUX_PANE, disabled = vim.g.dotfiles_tmux_integration }
+  local publisher
+  local function tmux(...)
+    local argv = { "tmux", "-S", socket }
+    vim.list_extend(argv, { ... })
+    local result = vim
+      .system(argv, { text = true, env = { TMUX = false, TMUX_PANE = false, SHELL = "/bin/sh" } })
+      :wait(2000)
+    assert(result.code == 0 and result.signal == 0, result.stderr)
+    return (result.stdout:gsub("\n$", ""))
+  end
+  local function until_true(condition, label)
+    assert(vim.wait(3000, condition, 10), label)
+  end
+  local ok, failure = xpcall(function()
+    tmux("-f", "/dev/null", "new-session", "-d", "-s", "first")
+    local pane = tmux("display-message", "-p", "-t", "first:", "#{pane_id}")
+    local session = tmux("display-message", "-p", "-t", "first:", "#{session_id}")
+    local pid = tmux("display-message", "-p", "-t", "first:", "#{pid}")
+    tmux("new-session", "-d", "-s", "second")
+    tmux("link-window", "-s", "first:0", "-t", "second:1")
+    tmux("set-option", "-t", "second", "status", "off")
+    vim.env.TMUX, vim.env.TMUX_PANE = socket .. "," .. pid .. "," .. session:sub(2), pane
+    local remote = false
+    publisher = assert(tmux_status.setup({
+      snapshot = bridge_snapshot(),
+      on_available = function(value)
+        remote = value
+      end,
+    }))
+    until_true(function()
+      return not publisher:debug_state().in_flight and publisher:debug_state().desired ~= nil
+    end, "generic discovery")
+    vim.wait(150, function()
+      return false
+    end, 10)
+    eq(remote, false, "generic real tmux remains native")
+    eq(
+      tmux("show-options", "-pqv", "-t", pane, "@dotfiles_nvim_owner"),
+      "",
+      "generic real tmux receives no owner"
+    )
+    tmux("set-option", "-g", "@dotfiles_foundation_loaded", "1")
+    publisher:refresh()
+    until_true(function()
+      return remote
+    end, "configured real tmux acknowledges originating session")
+    local hostile =
+      bridge_snapshot([[quote' " $HOME ${HOME} #{session_name} #(touch NEVER) \ tail;]], 17)
+    publisher:request(hostile)
+    until_true(function()
+      return publisher:debug_state().published and publisher:debug_state().published.line == "17"
+    end, "literal hostile publication")
+    eq(
+      tmux("show-options", "-pqv", "-t", pane, "@dotfiles_nvim_path"),
+      hostile.path,
+      "real tmux stores hostile path literally"
+    )
+    eq(vim.uv.fs_stat(vim.fs.joinpath(root, "NEVER")), nil, "hostile status value executes nothing")
+    tmux("set-option", "-t", "first", "status", "off")
+    publisher:refresh()
+    until_true(function()
+      return not remote
+    end, "effective session status off restores native")
+    until_true(function()
+      return not publisher:debug_state().in_flight
+    end, "withdrawal reaped")
+    eq(
+      tmux("show-options", "-pqv", "-t", pane, "@dotfiles_nvim_active"),
+      "",
+      "status off withdraws own options"
+    )
+    tmux("set-option", "-t", "first", "status", "on")
+    publisher:refresh()
+    until_true(function()
+      return remote
+    end, "effective session status recovery")
+    tmux("set-option", "-g", "@dotfiles_foundation_loaded", "0")
+    publisher:refresh()
+    until_true(function()
+      return not remote
+    end, "marker loss restores native")
+    until_true(function()
+      return not publisher:debug_state().in_flight
+    end, "marker cleanup reaped")
+    tmux("set-option", "-g", "@dotfiles_foundation_loaded", "1")
+    publisher:refresh()
+    until_true(function()
+      return remote
+    end, "marker recovery acknowledges")
+    tmux("set-option", "-pt", pane, "@dotfiles_nvim_owner", "replacement")
+    publisher:request(bridge_snapshot("replaced", 18))
+    until_true(function()
+      return publisher:debug_state().blocked
+    end, "owner replacement is detected")
+    eq(remote, false, "owner replacement restores native")
+    publisher:refresh()
+    publisher:stop()
+    publisher = nil
+    eq(
+      tmux("show-options", "-pqv", "-t", pane, "@dotfiles_nvim_owner"),
+      "replacement",
+      "old publisher leaves replacement owner intact"
+    )
+    local hang, hung_pid = false, nil
+    local origin = assert(require("config.platform").tmux_origin(vim.env))
+    publisher = bridge_test.new({
+      origin = origin,
+      owner = "303_404",
+      schedule = vim.schedule,
+      defer = vim.defer_fn,
+      new_timer = function()
+        return assert(vim.uv.new_timer())
+      end,
+      notify = function() end,
+      warn_level = vim.log.levels.WARN,
+      on_available = function(value)
+        remote = value
+      end,
+      system = function(argv, options, callback)
+        if hang then
+          hang = false
+          local handle = vim.system({
+            "python3",
+            "-c",
+            "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)",
+          }, options, callback)
+          hung_pid = handle.pid
+          return handle
+        end
+        return vim.system(argv, options, callback)
+      end,
+    })
+    remote = false
+    publisher:start(bridge_snapshot())
+    until_true(function()
+      return remote
+    end, "deadline fixture claims")
+    hang = true
+    publisher:request(bridge_snapshot("deadline", 19))
+    until_true(function()
+      return hung_pid ~= nil
+    end, "owned slow client started")
+    until_true(function()
+      return not remote
+    end, "real deadline restores native despite ignored graceful signal")
+    until_true(function()
+      return not publisher:debug_state().in_flight
+    end, "force-killed client and cleanup reaped")
+    assert(not vim.uv.kill(hung_pid, 0), "deadline left an owned process running")
+    publisher:stop()
+    publisher = nil
+    vim.g.dotfiles_tmux_integration = false
+    eq(
+      tmux_status.setup({ snapshot = bridge_snapshot() }),
+      nil,
+      "explicit opt-out creates no publisher"
+    )
+  end, debug.traceback)
+  if publisher then
+    publisher:stop()
+  end
+  pcall(tmux, "kill-server")
+  vim.env.TMUX, vim.env.TMUX_PANE, vim.g.dotfiles_tmux_integration =
+    previous.tmux, previous.pane, previous.disabled
+  assert(ok, failure)
+  print("statusline private tmux integration: ok")
+end

@@ -6,9 +6,10 @@ local function call(ctx, action, input)
   if not valid then
     return nil, context_error
   end
-  local nvim_root = vim.env.DOTFILES_NVIM_ROOT or vim.fn.stdpath("config")
-  local helper =
-    vim.fs.normalize(vim.fs.joinpath(nvim_root, "..", "tmux", "scripts", "location-pins"))
+  local helper, helper_error = require("config.platform").dotfiles_helper("location_pins")
+  if not helper then
+    return nil, helper_error
+  end
   local ok, process = pcall(vim.system, {
     helper,
     action,

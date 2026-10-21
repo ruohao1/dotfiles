@@ -616,8 +616,10 @@ local function new_git_cache(deps)
 end
 
 local function make_production_git_cache(runtime_deps)
-  local helper =
-    vim.fs.joinpath(vim.fs.dirname(vim.fn.stdpath("config")), "dotfiles", "git-summary")
+  local helper = require("config.platform").dotfiles_helper("git_summary")
+  if not helper then
+    return nil
+  end
 
   return new_git_cache({
     helper = helper,
@@ -716,20 +718,21 @@ local function new_runtime(deps)
     publisher = nil,
     group = nil,
     render_installed = false,
+    remote_available = false,
+    focused = true,
+    publisher_generation = 0,
   }
   local controller = {}
+  local start_publisher, set_remote_available
 
   local function apply_status_ownership()
-    local laststatus = (deps.inside_tmux or state.startup_visible) and 0 or 3
+    local laststatus = (state.remote_available or state.startup_visible) and 0 or 3
     deps.set_option("laststatus", laststatus)
   end
 
   deps.set_option("cmdheight", 0)
   deps.set_option("showmode", false)
   apply_status_ownership()
-  if deps.inside_tmux then
-    deps.set_option("statusline", "")
-  end
   deps.apply_highlights()
 
   local initial = deps.live_snapshot()
@@ -786,13 +789,41 @@ local function new_runtime(deps)
       deps.redraw()
       return
     end
+    if reason == "VimSuspend" then
+      state.focused = false
+      if state.publisher then
+        state.publisher:stop()
+        state.publisher = nil
+      end
+      set_remote_available(false)
+      if state.cache then
+        state.cache:set_focused(false)
+      end
+      return
+    end
+    if reason == "VimResume" then
+      state.focused = true
+      start_publisher()
+      reason = "FocusGained"
+    end
+    if reason == "manual" and state.publisher then
+      state.publisher:refresh()
+    end
     if reason == "FocusLost" then
+      state.focused = false
+      if state.publisher then
+        state.publisher:set_focused(false)
+      end
       if state.cache then
         state.cache:set_focused(false)
       end
       return
     end
     if reason == "FocusGained" then
+      state.focused = true
+      if state.publisher then
+        state.publisher:set_focused(true)
+      end
       local fresh = deps.live_snapshot()
       state.snapshot = canonical_semantic(fresh)
       state.profile = profile_for_width(fresh.width ~= nil and fresh.width or deps.width()).name
@@ -871,19 +902,51 @@ local function new_runtime(deps)
     }
   end
 
-  if deps.inside_tmux then
-    if valid_tmux_pane(deps.pane) and deps.executable("tmux") == 1 then
-      state.publisher = deps.publisher_setup({
-        pane = deps.pane,
-        snapshot = copy_semantic(state.snapshot),
-      })
+  deps.install_render()
+  state.render_installed = true
+  set_remote_available = function(value)
+    if state.stopped or state.remote_available == value then
+      return
     end
-  else
-    deps.install_render()
-    state.render_installed = true
-    state.cache = deps.make_git_cache()
+    state.remote_available = value
+    if value then
+      if state.cache then
+        state.cache:stop()
+        state.cache = nil
+      end
+    elseif not state.cache then
+      state.cache = deps.make_git_cache()
+      if state.cache then
+        state.cache:set_focused(state.focused)
+        if state.focused then
+          state.cache:update(state.snapshot.root, state.profile, "fallback")
+        end
+      end
+    end
+    apply_status_ownership()
+    deps.redraw()
+  end
+  state.cache = deps.make_git_cache()
+  if state.cache then
     state.cache:update(state.snapshot.root, state.profile, "setup")
   end
+  start_publisher = function()
+    if not deps.inside_tmux or not valid_tmux_pane(deps.pane) or deps.executable("tmux") ~= 1 then
+      return
+    end
+    state.publisher_generation = state.publisher_generation + 1
+    local generation = state.publisher_generation
+    state.publisher = deps.publisher_setup({
+      pane = deps.pane,
+      snapshot = copy_semantic(state.snapshot),
+      on_available = function(value)
+        if generation == state.publisher_generation then
+          set_remote_available(value)
+        end
+      end,
+    })
+  end
+  start_publisher()
 
   state.group = deps.create_augroup("dotfiles-statusline", { clear = true })
   local function register_scheduled(events, description)
@@ -915,6 +978,7 @@ local function new_runtime(deps)
   }, "Refresh status semantic state")
   register_scheduled("FocusLost", "Pause standalone status Git refresh")
   register_scheduled("FocusGained", "Resume standalone status Git refresh")
+  register_scheduled({ "VimSuspend", "VimResume" }, "Withdraw and revalidate tmux status ownership")
   register_scheduled({ "VimResized", "WinResized" }, "Refresh responsive status profile")
   register_scheduled("ColorScheme", "Reapply owned status highlights")
   deps.create_autocmd("VimLeavePre", {

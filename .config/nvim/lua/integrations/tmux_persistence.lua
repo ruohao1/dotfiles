@@ -1,4 +1,6 @@
 local M = {}
+local platform = require("config.platform")
+local active_controller
 
 local session_options = {
   "blank",
@@ -79,24 +81,40 @@ function M.checkpoint(path)
   return "ok"
 end
 
-local function registration_argv(pane, owner, server)
-  return {
-    "tmux",
-    "set-option",
-    "-pt",
-    pane,
+local function registration_argv(origin, owner, server)
+  local guard = string.format(
+    "#{&&:#{==:#{pid},%s},#{&&:#{==:#{session_id},%s},#{&&:#{==:#{pane_id},%s},#{==:#{@dotfiles_foundation_loaded},1}}}}",
+    origin.pid,
+    origin.session,
+    origin.pane
+  )
+  local command = table.concat({
+    "set-option -pt",
+    origin.pane,
     "@dotfiles_nvim_persistence_owner",
     owner,
-    ";",
-    "set-option",
-    "-pt",
-    pane,
+    "; set-option -pt",
+    origin.pane,
     "@dotfiles_nvim_server",
-    server,
+    "'" .. server:gsub("'", "'\\''") .. "'",
+    "; display-message -p dotfiles-nvim-persistence:" .. owner,
+  }, " ")
+  return {
+    "tmux",
+    "-u",
+    "-S",
+    origin.socket,
+    "if-shell",
+    "-F",
+    "-t",
+    origin.session .. ":" .. origin.pane,
+    guard,
+    command,
+    "",
   }
 end
 
-local function cleanup_argv(pane, owner)
+local function cleanup_argv(socket, pane, owner)
   local clear = table.concat({
     "set-option -pu -t",
     pane,
@@ -107,6 +125,9 @@ local function cleanup_argv(pane, owner)
   }, " ")
   return {
     "tmux",
+    "-u",
+    "-S",
+    socket,
     "if-shell",
     "-F",
     "-t",
@@ -117,13 +138,17 @@ local function cleanup_argv(pane, owner)
   }
 end
 
-local function run(deps, argv)
+local function run(deps, argv, acknowledgment)
   local ok, handle = pcall(deps.system, argv, { text = true })
   if not ok or not handle then
     return false
   end
-  local waited, result = pcall(handle.wait, handle)
-  return waited and result and result.code == 0 and result.signal == 0
+  local waited, result = pcall(handle.wait, handle, 1000)
+  return waited
+    and result
+    and result.code == 0
+    and result.signal == 0
+    and (not acknowledgment or vim.trim(result.stdout or "") == acknowledgment)
 end
 
 local function new(deps)
@@ -139,7 +164,14 @@ local function new(deps)
     if stopped or started then
       return started
     end
-    started = run(deps, registration_argv(deps.pane, deps.owner, deps.server))
+    started = run(
+      deps,
+      registration_argv(deps.origin, deps.owner, deps.server),
+      "dotfiles-nvim-persistence:" .. deps.owner
+    )
+    if not started then
+      run(deps, cleanup_argv(deps.socket, deps.pane, deps.owner))
+    end
     return started
   end
 
@@ -149,7 +181,7 @@ local function new(deps)
     end
     stopped = true
     if started then
-      run(deps, cleanup_argv(deps.pane, deps.owner))
+      run(deps, cleanup_argv(deps.socket, deps.pane, deps.owner))
     end
     started = false
   end
@@ -158,20 +190,40 @@ local function new(deps)
 end
 
 function M.setup(options)
+  if active_controller then
+    active_controller:stop()
+    active_controller = nil
+  end
   options = options or {}
-  local pane = options.pane or vim.env.TMUX_PANE
-  local server = options.server or vim.v.servername
-  if not (type(vim.env.TMUX) == "string" and vim.env.TMUX ~= "") then
+  if vim.g.dotfiles_tmux_integration == false then
     return nil
   end
-  if not valid_pane(pane) or vim.fn.executable("tmux") ~= 1 then
+  local origin = platform.tmux_origin(vim.env)
+  if not origin then
+    return nil
+  end
+  local pane = options.pane or origin.pane
+  local server = options.server or vim.v.servername
+  if pane ~= origin.pane or not valid_pane(pane) or vim.fn.executable("tmux") ~= 1 then
     return nil
   end
   if type(server) ~= "string" or server == "" then
     return nil
   end
 
+  local ok, process = pcall(vim.system, platform.tmux_probe_argv(origin), { text = true })
+  if not ok or not process then
+    return nil
+  end
+  local waited, result = pcall(process.wait, process, 1000)
+  local availability = waited and platform.parse_tmux_probe(origin, result)
+  if not availability or not availability.configured then
+    return nil
+  end
+
   local controller = new({
+    socket = origin.socket,
+    origin = origin,
     pane = pane,
     owner = string.format("%d_%d", vim.fn.getpid(), vim.uv.hrtime()),
     server = server,
@@ -182,6 +234,7 @@ function M.setup(options)
     return nil
   end
 
+  active_controller = controller
   local group = vim.api.nvim_create_augroup("DotfilesTmuxPersistence", { clear = true })
   vim.api.nvim_create_autocmd("VimLeavePre", {
     group = group,
