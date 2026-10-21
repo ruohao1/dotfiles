@@ -234,8 +234,10 @@ function M.compose(content, view, options)
     end
   end
   local has_panel = view.kind == "repository" or view.kind == "loading"
-  local wide = has_panel and width >= 112
-  local block_width = math.min(width, 112)
+  -- Preserve the compact 22-column view when full margins would crowd it.
+  local margin = math.min(2, math.max(0, math.floor((width - 22) / 2)))
+  local block_width = math.min(width - 2 * margin, 112)
+  local wide = has_panel and block_width >= 112
   local horizontal = menu_lines(items, true)
   local menu = menu_lines(
     items,

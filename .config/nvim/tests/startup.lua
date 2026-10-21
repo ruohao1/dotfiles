@@ -1906,15 +1906,15 @@ local live_ok, live_error = xpcall(function()
     ]]
     )
     assert_selection("r  Recent files", "async completion")
-    child_lua(child, [[vim.o.columns = 111; vim.api.nvim_exec_autocmds("VimResized", {})]])
+    child_lua(child, [[vim.o.columns = 115; vim.api.nvim_exec_autocmds("VimResized", {})]])
     local narrow_rows = assert_selection("r  Recent files", "narrow resize").menu_rows
-    eq(narrow_rows[1], narrow_rows[3], "111-column menu stays on a shared row")
+    eq(narrow_rows[1], narrow_rows[3], "115-column menu stays on a shared row")
     child_input(child, "<Down>")
     assert_selection("q  Quit", "shared-row Quit")
-    child_lua(child, [[vim.o.columns = 112; vim.api.nvim_exec_autocmds("VimResized", {})]])
+    child_lua(child, [[vim.o.columns = 116; vim.api.nvim_exec_autocmds("VimResized", {})]])
     local wide_state = assert_selection("q  Quit", "wide resize")
     eq(wide_state.requests, 1, "resize never recollects Git")
-    assert(wide_state.menu_rows[1] < wide_state.menu_rows[3], "112-column menu uses separate rows")
+    assert(wide_state.menu_rows[1] < wide_state.menu_rows[3], "116-column menu uses separate rows")
     child_lua(
       child,
       [[
