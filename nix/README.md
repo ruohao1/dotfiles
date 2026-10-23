@@ -424,7 +424,7 @@ migration lifecycle, edited-file restoration, service-stop failure recovery and
 interrupted-activation recovery. Discovery and candidate preparation use
 prebuilt offline projections in this VM; separate real Git/Nix fixtures verify preparation.
 This does not verify public release transport, full desktop workflows or other
-platforms. See the [release implementation evidence](../.config/docs/superpowers/plans/2026-10-19-release-updates.md).
+platforms.
 
 On 2026-10-17, source `6fd61bc335e5342b0c83811b658b6d526eb443cf` with the unchanged
 lock evaluated all six non-VM check derivations on each of the four systems.
@@ -441,8 +441,7 @@ Home Manager activation of generation A, a synthetic generation B, repeated B
 activation, and rollback to A. An edited writable `lazy-lock.json` and an
 unmanaged file survived. This did not exercise the public migration wrapper,
 native prerequisites, full GUI/editor workflows, other Linux distributions, or
-macOS. See the [validation record](validation/2026-10-16-ubuntu-smoke.md) and
-[implementation plan](../.config/docs/superpowers/plans/2026-10-02-nix-dotfiles-migration.md).
+macOS. See the [validation record](validation/2026-10-16-ubuntu-smoke.md).
 
 The retained NixOS integration covers actual two-generation migration, repeat,
 rollback, reversal, partial-service and interrupted-activation recovery with real
@@ -571,7 +570,4 @@ update checks or feature validation.
    Latest only under the release task's authorization. Record the resulting
    numeric release ID and resolved commit for consumer adoption.
 
-The feature's [design](../.config/docs/superpowers/specs/2026-10-19-release-updates-design.md)
-and [implementation evidence](../.config/docs/superpowers/plans/2026-10-19-release-updates.md)
-travel with its implementation branch. No release workflow or unattended
-activation is installed.
+No release workflow or unattended activation is installed.

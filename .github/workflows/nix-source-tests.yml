@@ -20,6 +20,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install terminal test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends tmux fzf
       - name: Run isolated source suites
         shell: bash
         run: |
@@ -34,11 +38,14 @@ jobs:
             DOTFILES_ENTRYPOINT_TEST_ROOT="$fixture/entrypoint" \
             DOTFILES_MIGRATION_TEST_ROOT="$fixture/migration" \
             /bin/bash --noprofile --norc -euo pipefail -c '
-              command -v python3 git cc >/dev/null
+              for required_command in python3 git cc tmux fzf; do
+                command -v "$required_command" >/dev/null
+              done
               python3 -B nix/tests/check-packages.py --self-test
               python3 -B -m unittest discover -v -s nix/tests -p test_entrypoint.py
               python3 -B -m unittest discover -v -s nix/tests -p test_ownership.py
               python3 -B -m unittest discover -v -s nix/tests -p test_checker_clipboard.py
+              python3 -B -m unittest discover -v -s nix/tests -p "test_session_navigator*.py"
               python3 -B -m unittest discover -v -s nix/tests -p "test_migration_*.py"
               python3 -B -m unittest discover -v -s nix/tests -p "test_update_*.py"
             '

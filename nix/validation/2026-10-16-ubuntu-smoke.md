@@ -2,8 +2,7 @@
 
 This record describes the completed focused smoke test. It is not full native
 migration acceptance, and the Nix route remains experimental. No live dotfiles
-were activated. The original implementation plan is retained
-[with the implementation](../../.config/docs/superpowers/plans/2026-10-02-nix-dotfiles-migration.md).
+were activated.
 
 ## Source and delivery provenance
 
