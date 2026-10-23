@@ -88,6 +88,18 @@ class TerminalTests(unittest.TestCase):
                                 env=environment, cwd=self.home, capture_output=True, text=True, timeout=90)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_session_navigator_with_private_attached_clients(self):
+        for command in ['tmux', 'fzf']:
+            self.assertIsNotNone(shutil.which(command, path=self.env['PATH']), command + ' is required')
+        config = self.home / '.config' if ARGS.generation else ARGS.source_root / '.config'
+        environment = dict(self.env,
+                           DOTFILES_SESSION_NAVIGATOR_HELPER=str(config / 'tmux/scripts/session-navigator'),
+                           DOTFILES_SESSION_NAVIGATOR_KEYS=str(config / 'tmux/conf/keys.conf'))
+        result = subprocess.run([sys.executable, '-B', '-m', 'unittest', 'discover', '-v',
+                                 '-s', str(ARGS.source_root / 'nix/tests'), '-p', 'test_session_navigator*.py'],
+                                env=environment, cwd=self.home, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_navigation_routes_to_editor_or_tmux_in_all_directions(self):
         self.env["TERM"] = "xterm-256color"
         receiver = self.root / "receiver.py"

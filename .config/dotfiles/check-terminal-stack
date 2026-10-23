@@ -490,6 +490,7 @@ tmux_pristine_binding_delta_is_exact() {
   TMUX_EXPECTED_SWAP_UP_COMMAND=$tmux_swap_up_command \
   TMUX_EXPECTED_SWAP_RIGHT_COMMAND=$tmux_swap_right_command \
   TMUX_EXPECTED_MOVE_COMMAND=$tmux_move_command \
+  TMUX_EXPECTED_SESSION_NAVIGATOR_COMMAND=$tmux_session_navigator_command \
   TMUX_EXPECTED_PERSISTENCE_SAVE_COMMAND=$tmux_persistence_save_command \
   TMUX_EXPECTED_URL_ENABLED=$tmux_url_enabled \
   TMUX_EXPECTED_URL_DOWN_COMMAND=$tmux_url_down_command \
@@ -532,7 +533,7 @@ tmux_pristine_binding_delta_is_exact() {
         approve("prefix", "?", "list-keys")
         approve("prefix", "R", ENVIRON["TMUX_EXPECTED_RELOAD_COMMAND"])
         approve("prefix", "Q", "detach-client")
-        approve("prefix", "f", "choose-tree -Zw")
+        approve("prefix", "f", ENVIRON["TMUX_EXPECTED_SESSION_NAVIGATOR_COMMAND"])
         approve("prefix", "r", "switch-client -T resize")
         approve("prefix", "v", "copy-mode")
         approve("prefix", "H", ENVIRON["TMUX_EXPECTED_SWAP_LEFT_COMMAND"])
@@ -1874,6 +1875,7 @@ tmux_copy_pipe_and_run_shell_payloads_are_safe() {
   TMUX_EXPECTED_SWAP_UP_COMMAND=$tmux_swap_up_command \
   TMUX_EXPECTED_SWAP_RIGHT_COMMAND=$tmux_swap_right_command \
   TMUX_EXPECTED_MOVE_COMMAND=$tmux_move_command \
+  TMUX_EXPECTED_SESSION_NAVIGATOR_COMMAND=$tmux_session_navigator_command \
   TMUX_EXPECTED_PERSISTENCE_SAVE_COMMAND=$tmux_persistence_save_command \
   TMUX_EXPECTED_URL_UP_COMMAND=$tmux_url_up_command \
     awk '
@@ -2119,6 +2121,7 @@ tmux_copy_pipe_and_run_shell_payloads_are_safe() {
       canonical_swap_command["K"] = ENVIRON["TMUX_EXPECTED_SWAP_UP_COMMAND"]
       canonical_swap_command["L"] = ENVIRON["TMUX_EXPECTED_SWAP_RIGHT_COMMAND"]
       canonical_move_command = ENVIRON["TMUX_EXPECTED_MOVE_COMMAND"]
+      canonical_session_navigator_command = ENVIRON["TMUX_EXPECTED_SESSION_NAVIGATOR_COMMAND"]
       canonical_persistence_save_command = ENVIRON["TMUX_EXPECTED_PERSISTENCE_SAVE_COMMAND"]
       canonical_url_up_command = ENVIRON["TMUX_EXPECTED_URL_UP_COMMAND"]
     }
@@ -2145,6 +2148,9 @@ tmux_copy_pipe_and_run_shell_payloads_are_safe() {
       if (parsed_table == "prefix" \
         && parsed_key == "m" \
         && remaining == canonical_move_command) next
+      if (parsed_table == "prefix" \
+        && parsed_key == "f" \
+        && remaining == canonical_session_navigator_command) next
       if (parsed_table == "prefix" \
         && (parsed_key in canonical_swap_command) \
         && remaining == canonical_swap_command[parsed_key]) next
@@ -9535,6 +9541,11 @@ require_file "$tmux_root/conf/status.conf" || true
 require_file "$tmux_root/conf/platform/linux.conf" || true
 require_file "$tmux_root/conf/platform/macos.conf" || true
 require_file "$tmux_fresh_start_test" || true
+if [ -x "$tmux_root/scripts/session-navigator" ]; then
+  pass "tmux session navigator helper is executable"
+else
+  fail "tmux session navigator helper is not executable"
+fi
 
 tmux_entry="$tmux_root/tmux.conf"
 tmux_options="$tmux_root/conf/options.conf"
@@ -10837,6 +10848,7 @@ TASK6_APPLICATION_CASES
   tmux -S "$check_socket" list-keys > "$check_tmp/tmux-all-keys.txt" 2>&1 || true
 
   tmux_reload_command="source-file $tmux_root/tmux.conf \\; display-message \"Reloaded tmux foundation\""
+  tmux_session_navigator_command='run-shell -b "exec \"\$HOME/.config/tmux/scripts/session-navigator\" --popup #{q:socket_path} #{q:client_name}"'
   serialized_backslash_key="M-\\\\"
   tmux_url_down_command='send-keys -M'
   tmux_url_up_command='send-keys -M \; run-shell -b -t = "\~/.config/tmux/scripts/open-url --pane #{mouse_pane} --x #{mouse_x} --y #{mouse_y} --hyperlink #{?mouse_hyperlink,1,0} || :"'
@@ -10866,7 +10878,7 @@ TASK6_APPLICATION_CASES
   require_tmux_binding "$check_tmp/tmux-prefix-keys.txt" prefix '?' 'list-keys' "tmux prefix+? opens help" || true
   require_tmux_binding "$check_tmp/tmux-prefix-keys.txt" prefix R "$tmux_reload_command" "tmux prefix+Shift-r reloads exactly the foundation" || true
   require_tmux_binding "$check_tmp/tmux-prefix-keys.txt" prefix Q 'detach-client' "tmux prefix+Shift-q detaches" || true
-  require_tmux_binding "$check_tmp/tmux-prefix-keys.txt" prefix f 'choose-tree -Zw' "tmux prefix+f opens broad picker" || true
+  require_tmux_binding "$check_tmp/tmux-prefix-keys.txt" prefix f "$tmux_session_navigator_command" "tmux prefix+f opens the fuzzy session navigator" || true
   require_tmux_binding "$check_tmp/tmux-prefix-keys.txt" prefix r 'switch-client -T resize' "tmux prefix+r enters resize mode" || true
   require_tmux_binding "$check_tmp/tmux-prefix-keys.txt" prefix v 'copy-mode' "tmux prefix+v enters copy mode" || true
   require_tmux_binding "$check_tmp/tmux-prefix-keys.txt" prefix H "$tmux_swap_left_command" "tmux prefix+Shift-h swaps left without wrapping" || true
@@ -15358,7 +15370,7 @@ run_interactive_matrix() {
   ask "Herdr prefix+v entered copy mode"
   ask "Herdr prefix+Tab completely hid and restored the sidebar"
   ask "Meta-Space opened the tmux prefix and Meta-Space Meta-Space reached the pane"
-  ask "tmux prefix+? showed help, prefix+Shift-r reloaded, and prefix+f opened choose-tree"
+  ask "tmux prefix+? showed help, prefix+Shift-r reloaded, and prefix+f opened the fuzzy session navigator"
   ask "tmux Meta-n created a window and Meta-1 through 9 selected windows"
   ask "tmux Meta-r renamed a window and Meta-Shift-q closed a disposable window"
   ask "tmux Meta-backslash split right and Meta-pipe split down"

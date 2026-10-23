@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Choose an existing session for one explicitly targeted tmux client."""
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+
+def navigate(socket, client, popup=False):
+    def tmux(*args, timeout=5):
+        return subprocess.run(
+            ["tmux", "-u", "-S", socket, *args], check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+        ).stdout.decode("utf-8", errors="replace").removesuffix("\n")
+
+    def origin():
+        for identity in tmux("list-clients", "-F", "#{pid}\t#{client_pid}\t#{client_name}").splitlines():
+            fields = identity.split("\t", 2)
+            if len(fields) == 3 and fields[2] == client and all(s.isdigit() for s in fields[:2]):
+                return identity
+        raise RuntimeError("the invoking client is no longer available")
+
+    try:
+        identity = origin()
+        if popup:
+            # display-popup does not expand formats in its shell command.
+            command = shlex.join([sys.executable, os.path.abspath(__file__), socket, client])
+            tmux("display-popup", "-c", client, "-E", "-w", "80%", "-h", "60%", command, timeout=None)
+            return 0
+        if not shutil.which("fzf"):
+            raise RuntimeError("fzf is not available")
+        choices = {}
+        for session in tmux("list-sessions", "-F", "#{session_id}").splitlines():
+            if not re.fullmatch(r"\$[0-9]+", session):
+                raise RuntimeError("invalid session identity")
+            try:
+                label = tmux("display-message", "-p", "-t", session + ":",
+                             "#{session_name}  #{session_path}")
+            except subprocess.CalledProcessError:
+                continue  # A session may close while the list is being built.
+            label = "".join(char if char.isprintable() else " " for char in label)
+            choices[(session + "\t" + label).encode("utf-8") + b"\0"] = session
+        if not choices:
+            raise RuntimeError("no sessions are available")
+        env = os.environ.copy()
+        # User fzf actions may rewrite output or run commands outside this picker.
+        env.pop("FZF_DEFAULT_OPTS", None)
+        env.pop("FZF_DEFAULT_OPTS_FILE", None)
+        result = subprocess.run(
+            ["fzf", "--read0", "--print0", "--delimiter=\t", "--with-nth=2..",
+             "--no-multi", "--layout=reverse", "--prompt=Sessions> ",
+             "--header=Enter: switch session | Esc/Ctrl-C: cancel"],
+            input=b"".join(choices), stdout=subprocess.PIPE, env=env,
+        )
+        if result.returncode in (1, 130):
+            return 0
+        if result.returncode != 0:
+            raise RuntimeError("fzf failed")
+        if result.stdout not in choices:
+            raise RuntimeError("invalid selection; no session was switched")
+        if origin() != identity:
+            raise RuntimeError("the invoking client changed; open the picker again")
+        session = choices[result.stdout]
+        tmux("has-session", "-t", session)
+        tmux("switch-client", "-c", client, "-t", session)
+        return 0
+    except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+        message = str(error) if isinstance(error, RuntimeError) else "session or client unavailable"
+        message = "Session navigator: " + message
+        print(message, file=sys.stderr)
+        try:
+            tmux("display-message", "-c", client, message)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return 1
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    popup = args[:1] == ["--popup"]
+    if popup:
+        args = args[1:]
+    if len(args) != 2 or not os.path.isabs(args[0]) or not args[1]:
+        sys.exit("Usage: session-navigator SOCKET CLIENT")
+    try:
+        sys.exit(navigate(*args, popup=popup))
+    except KeyboardInterrupt:
+        sys.exit(0)

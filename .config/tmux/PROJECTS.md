@@ -37,6 +37,23 @@ If a graphical window cannot open, `t` reports the error and leaves the sessions
 available. Re-run `t --with-editor` from Ghostty to retry. Project selection still prefers an
 existing session rooted at the exact current directory before the Git root.
 
+## Switch between running sessions
+
+Press **Alt+Space, then f** to open a fuzzy session picker. Type a session name
+or part of its project path, then press Enter to switch this terminal. The list
+includes separate Neovim sessions. Escape or Ctrl+C closes the picker without
+switching. Other attached terminals keep their current sessions.
+
+The picker searches sessions on the current tmux server. It displays each
+session's starting directory, even if a shell has since changed directories.
+It requires tmux 3.2+, Python 3.9+, and fzf (included by both installation paths).
+The picker uses its own fzf options; global fzf option overrides do not apply.
+
+The helper is included automatically in fresh native and Nix installations.
+Existing Nix-managed installations need the [documented restoration/re-adoption
+procedure](../../nix/README.md#confirmed-release-updates) when adopting this new managed file; the current
+updater does not handle changes to the managed target list.
+
 ## SSH and machines without a desktop
 
 Install this configuration on the remote host. Open two local terminals, SSH to
@@ -66,6 +83,7 @@ From a complete repository checkout, run:
 ```sh
 sh .config/tmux/tests/project-session.sh
 python3 .config/tmux/tests/project-pairs.py
+python3 -B nix/tests/test_session_navigator.py
 sh .config/tmux/tests/workspace-state.sh
 sh .config/tmux/tests/workspace-restore.sh
 ```

@@ -37,7 +37,8 @@ class FileDeploymentTests(unittest.TestCase):
                        ".config/nvim/scripts/data-query-runner.py", ".config/nvim/python/pyproject.toml",
                        ".config/nvim/python/uv.lock", ".config/nvim/tests/data_query_tool.lua",
                        ".config/nvim/LINE-PINS.md", ".config/tmux/scripts/workspace",
-                       ".config/tmux/scripts/location-pins.jq", ".config/tmux/tests/workspace-state.sh",
+                       ".config/tmux/scripts/location-pins.jq", ".config/tmux/scripts/session-navigator",
+                       ".config/tmux/tests/workspace-state.sh",
                        ".config/tmux/PROJECTS.md", ".config/herdr/config.toml",
                        ".config/herdr/scripts/move-pane", ".local/bin/t",
                        ".config/dotfiles/check-terminal-stack", ".config/dotfiles/git-summary",
@@ -48,6 +49,9 @@ class FileDeploymentTests(unittest.TestCase):
         self.assertEqual(module.parents[2], runner.parents[1])
         workspace = files[".config/tmux/scripts/workspace"].resolve()
         self.assertTrue((workspace.parent / "location-pins.jq").is_file())
+        navigator = next(item for item in MANIFEST["files"]
+                         if item["target"] == ".config/tmux/scripts/session-navigator")
+        self.assertTrue(navigator["executable"], "session navigator must be directly executable")
         pairs = files[".config/tmux/tests/project-pairs.py"].resolve()
         repository = pairs.parents[3]
         self.assertTrue((repository / ".local/bin/t").is_file(), "checker tests lost canonical checkout layout")

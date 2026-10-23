@@ -34,11 +34,12 @@ jobs:
             DOTFILES_ENTRYPOINT_TEST_ROOT="$fixture/entrypoint" \
             DOTFILES_MIGRATION_TEST_ROOT="$fixture/migration" \
             /bin/bash --noprofile --norc -euo pipefail -c '
-              command -v python3 git cc >/dev/null
+              command -v python3 git cc tmux fzf >/dev/null
               python3 -B nix/tests/check-packages.py --self-test
               python3 -B -m unittest discover -v -s nix/tests -p test_entrypoint.py
               python3 -B -m unittest discover -v -s nix/tests -p test_ownership.py
               python3 -B -m unittest discover -v -s nix/tests -p test_checker_clipboard.py
+              python3 -B -m unittest discover -v -s nix/tests -p "test_session_navigator*.py"
               python3 -B -m unittest discover -v -s nix/tests -p "test_migration_*.py"
               python3 -B -m unittest discover -v -s nix/tests -p "test_update_*.py"
             '
