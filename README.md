@@ -148,6 +148,12 @@ Only the platform modifier name changes.
 
 Hyprland, i3, and AeroSpace window-manager bindings are maintained as one checked contract.
 
+With tmux 3.7+, Ctrl+click opens HTTP(S) links in shell output and tmux copy mode.
+Applications that request mouse input own their clicks, preventing duplicate opens.
+Codex 0.163.0 also opens links on ordinary clicks; it has no supported setting to
+require Ctrl while preserving its fullscreen selection behavior. For a mouse-enabled
+application without link handling, enter tmux copy mode with the prefix, then `v`.
+
 ---
 
 ## More

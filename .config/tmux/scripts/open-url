@@ -474,7 +474,15 @@ if [ "$dimensions" != "$pane_width $pane_height" ] || ! is_bounded_uint "$pane_w
 # is backing row y-scroll_position; -M alone still captures backing row y.
 mode_metadata=$("$tmux_path" display-message -p -t "$failure_pane" '#{pane_in_mode}:#{pane_mode}:#{scroll_position}' 2>/dev/null) || { report_failure; exit 1; }
 case $mode_metadata in
-  0::) mode_capture=0; scroll_offset=0 ;;
+  0::)
+    # Defer to mouse-reporting applications to avoid opening a link twice.
+    mouse_reporting=$("$tmux_path" display-message -p -t "$failure_pane" '#{mouse_any_flag}' 2>/dev/null) || { report_failure; exit 1; }
+    case $mouse_reporting in
+      0) mode_capture=0; scroll_offset=0 ;;
+      1) exit 0 ;;
+      *) report_failure; exit 1 ;;
+    esac
+    ;;
   1:copy-mode:*)
     mode_capture=1; scroll_offset=${mode_metadata##*:}
     if ! is_bounded_uint "$scroll_offset"; then report_failure; exit 1; fi
