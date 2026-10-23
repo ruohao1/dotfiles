@@ -248,7 +248,7 @@ class SessionNavigatorTests(unittest.TestCase):
         ready = self.root / 'real-fzf-ready'
         finished = self.root / 'real-fzf-finished'
         searched = self.root / 'real-fzf-searched'
-        observer = '--bind=result:execute-silent(printf %s {q} > ' + shlex.quote(str(searched)) + ')'
+        observer = '--bind=focus:execute-silent(printf %s {1} > ' + shlex.quote(str(searched)) + ')'
         self.write_fzf('import os, subprocess, sys\nfrom pathlib import Path\n'
                        + 'Path(' + repr(str(ready)) + ').write_text(str(os.getppid()))\n'
                        + 'result = subprocess.run([' + repr(FZF) + ', *sys.argv[1:], ' + repr(observer) + '])\n'
@@ -281,7 +281,7 @@ class SessionNavigatorTests(unittest.TestCase):
                 self.command('switch-client', '-c', self.invoker['name'], '-t', self.first)
                 popup()
                 os.write(self.invoker['master'], query)
-                self.wait(lambda: searched.exists() and searched.read_bytes() == query)
+                self.wait(lambda: searched.exists() and searched.read_text() == target)
                 os.write(self.invoker['master'], b'\r')
                 self.wait(closed)
                 self.assertEqual(finished.read_text(), '0')
