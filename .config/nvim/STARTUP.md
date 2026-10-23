@@ -33,16 +33,18 @@ behavior.
 
 | Key | Action |
 | --- | --- |
-| `p` | Pick a project discovered from recent files |
-| `r` | Pick a recent file |
+| `f` | Find a file in the current project |
+| `r` | Pick a recent file from the current project |
 | `q` / Ctrl+C | Quit with normal `:quit` behavior; unsaved changes stay protected |
 | `j` / `k`, down / up | Cycle through the three actions |
 | Enter | Run the selected action |
 
-Projects is selected initially. A pointer and highlight identify the selection.
+Find files is selected initially. A pointer and highlight identify the selection.
 Ctrl+C is mapped only in the starter buffer; editing buffers keep their usual behavior.
-Project selection validates that the directory still exists before changing into
-it and opening its file picker.
+Both file actions use the nearest Git/Jujutsu root from the starter window’s
+current directory, or that directory itself outside a repository. They never
+change the editor’s directory; project switching stays in tmux. The global
+recent-files shortcut remains unfiltered.
 
 Inside a conventional Git repository, the screen also shows its name, branch or
 detached HEAD, upstream divergence when available, up to five recent commits with

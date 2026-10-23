@@ -9,11 +9,9 @@ local startup = require("ui.startup")
 local test = startup._test
 
 for _, name in ipairs({
-  "discover_projects",
   "has_editing_intent",
   "is_bare_launch",
   "new",
-  "project_is_current",
 }) do
   assert(type(test[name]) == "function", "missing startup test helper " .. name)
 end
@@ -149,15 +147,10 @@ local function new_controller_harness(context)
     filetypes = { [9] = "ministarter" },
     context = vim.deepcopy(context or bare_context),
     context_calls = 0,
-    find_root_calls = 0,
-    project_available = true,
-    project_history_available = true,
-    project_file = "/home/src/project/main.lua",
+    root_calls = 0,
     project_root = "/home/src/project",
     cwd = "/workspace",
     set_current_dir_calls = {},
-    action_calls = {},
-    fail_set_current_dir = false,
     requests = {},
     scheduled = {},
     timers = {},
@@ -166,7 +159,6 @@ local function new_controller_harness(context)
     pointers = {},
     composed = {},
   }
-  harness.oldfiles = { harness.project_file }
 
   local fake_starter = {
     gen_hook = {
@@ -211,19 +203,11 @@ local function new_controller_harness(context)
   }
 
   local fake_pickers = {
-    recent = function()
-      table.insert(harness.picker_calls, { name = "recent" })
-    end,
-    projects = function(projects, on_select)
-      table.insert(harness.picker_calls, {
-        name = "projects",
-        projects = vim.deepcopy(projects),
-      })
-      harness.project_callback = on_select
+    recent = function(root)
+      table.insert(harness.picker_calls, { name = "recent", root = root })
     end,
     files = function(root)
       table.insert(harness.picker_calls, { name = "files", root = root })
-      table.insert(harness.action_calls, { name = "files", root = root })
     end,
   }
 
@@ -282,19 +266,15 @@ local function new_controller_harness(context)
     pickers = function()
       return fake_pickers
     end,
-    oldfiles = function()
-      return harness.oldfiles
+    root = function()
+      harness.root_calls = harness.root_calls + 1
+      return harness.project_root
     end,
     getcwd = function()
       return harness.cwd
     end,
     set_current_dir = function(path)
       table.insert(harness.set_current_dir_calls, path)
-      table.insert(harness.action_calls, { name = "set_current_dir", root = path })
-      if harness.fail_set_current_dir and path == harness.project_root then
-        harness.cwd = path
-        error("simulated cwd failure")
-      end
       harness.cwd = path
     end,
     notify = function(message, level, options)
@@ -344,48 +324,6 @@ local function new_controller_harness(context)
       current.stdin_seen = stdin_seen
       return current
     end,
-    project_dependencies = {
-      find_root = function(path)
-        harness.find_root_calls = harness.find_root_calls + 1
-        if path == harness.project_file and harness.project_history_available then
-          return harness.project_root
-        end
-      end,
-      home = function()
-        return "/home"
-      end,
-      lstat = function(path)
-        if path == harness.project_root and harness.project_available then
-          return { type = "directory" }
-        end
-      end,
-      normalize = function(path)
-        return path
-      end,
-      readable = function(path)
-        return path == harness.project_file and harness.project_history_available
-      end,
-      realpath = function(path)
-        if path == "/home" then
-          return path
-        end
-        if path == harness.project_root and harness.project_available then
-          return path
-        end
-      end,
-      relpath = function(base, path)
-        eq({ base, path }, { "/home", harness.project_root }, "project label paths")
-        return "src/project"
-      end,
-      stat = function(path)
-        if path == harness.project_file and harness.project_history_available then
-          return { type = "file" }
-        end
-        if path == harness.project_root and harness.project_available then
-          return { type = "directory" }
-        end
-      end,
-    },
   }
 
   function harness:flush()
@@ -421,27 +359,26 @@ local function new_controller_harness(context)
   return harness
 end
 
-local function warning(message)
-  return {
-    message = message,
-    level = vim.log.levels.WARN,
-    options = { title = "Neovim startup" },
-  }
-end
-
-local function picker_call_count(harness, name)
-  local count = 0
-  for _, call in ipairs(harness.picker_calls) do
-    if call.name == name then
-      count = count + 1
-    end
-  end
-  return count
-end
-
 local harness = new_controller_harness()
 local controller = test.new(harness.dependencies)
 assert(controller:setup() == controller, "setup must return its controller")
+local scoped = new_controller_harness()
+test.new(scoped.dependencies):setup()
+scoped.starter_setup_calls[1].items[1].action()
+scoped.starter_setup_calls[1].items[2].action()
+eq(scoped.picker_calls, {
+  { name = "files", root = "/home/src/project" },
+  { name = "recent", root = "/home/src/project" },
+}, "starter actions open files within the current project")
+eq(scoped.cwd, "/workspace", "starter actions preserve the editor directory")
+eq(scoped.set_current_dir_calls, {}, "starter actions never change directory")
+scoped.project_root = "/another directory"
+scoped.starter_setup_calls[1].items[1].action()
+eq(
+  scoped.picker_calls[3],
+  { name = "files", root = "/another directory" },
+  "actions resolve current context"
+)
 assert(controller:setup() == controller, "repeated setup must return its controller")
 eq(#harness.starter_setup_calls, 1, "MiniStarter setup once")
 eq(#harness.augroup_calls, 1, "one startup augroup")
@@ -449,7 +386,7 @@ eq(
   vim.tbl_map(function(item)
     return item.name
   end, harness.starter_setup_calls[1].items),
-  { "p  Projects", "r  Recent files", "q  Quit" },
+  { "f  Find files", "r  Recent files", "q  Quit" },
   "approved menu preserves all three actions"
 )
 eq(#harness.autocmds, 9, "startup event routes")
@@ -486,7 +423,7 @@ eq(
     return item.name
   end, options.items),
   {
-    "p  Projects",
+    "f  Find files",
     "r  Recent files",
     "q  Quit",
   },
@@ -505,7 +442,7 @@ eq(harness.composed[1].view, { kind = "loading" }, "initial content renders load
 eq(harness.status_calls, {
   { phase = "status", visible = true },
 }, "status suppression precedes composition")
-eq(harness.find_root_calls, 0, "project discovery waits for its action")
+eq(harness.root_calls, 0, "root lookup waits for an action")
 
 local stdin_harness = new_controller_harness()
 local stdin_controller = test.new(stdin_harness.dependencies)
@@ -552,7 +489,7 @@ eq(
     return { mapping.bufnr, mapping.lhs, mapping.description }
   end, harness.mappings),
   {
-    { harness.current_buffer, "p", "Open projects" },
+    { harness.current_buffer, "f", "Find files" },
     { harness.current_buffer, "r", "Open recent files" },
     { harness.current_buffer, "q", "Quit" },
     { harness.current_buffer, "<C-c>", "Quit" },
@@ -565,7 +502,7 @@ eq(
   },
   "exact buffer-local startup mappings"
 )
-assert(harness.mappings[1].callback == options.items[1].action, "project action identity changed")
+assert(harness.mappings[1].callback == options.items[1].action, "file action identity changed")
 assert(harness.mappings[2].callback == options.items[2].action, "recent action identity changed")
 assert(harness.mappings[4].callback == options.items[3].action, "Ctrl-C must share the Quit action")
 
@@ -585,76 +522,12 @@ eq(harness.status_calls, {
 
 harness.picker_calls = {}
 options.items[2].action()
-eq(harness.picker_calls, { { name = "recent" } }, "recent action calls only recent picker")
-eq(harness.find_root_calls, 0, "recent action does not discover projects")
-
-local empty_harness = new_controller_harness()
-local empty_controller = test.new(empty_harness.dependencies)
-empty_controller:setup()
-empty_harness.oldfiles = {}
-empty_harness.starter_setup_calls[1].items[1].action()
-eq(empty_harness.notifications, { warning("No recent projects found") }, "empty project warning")
-eq(empty_harness.picker_calls, {}, "empty project list opens no picker")
-
-local cancel_harness = new_controller_harness()
-local cancel_controller = test.new(cancel_harness.dependencies)
-cancel_controller:setup()
-cancel_harness.starter_setup_calls[1].items[1].action()
-eq(cancel_harness.find_root_calls, 1, "project discovery runs when the action executes")
-eq(picker_call_count(cancel_harness, "projects"), 1, "project picker opens once")
-eq(picker_call_count(cancel_harness, "files"), 0, "cancelled project picker opens no files")
-eq(cancel_harness.cwd, "/workspace", "project cancellation preserves cwd")
-assert(type(cancel_harness.project_callback) == "function", "project picker callback missing")
-
-local selected_harness = new_controller_harness()
-local selected_controller = test.new(selected_harness.dependencies)
-selected_controller:setup()
-selected_harness.starter_setup_calls[1].items[1].action()
-selected_harness.project_callback(selected_harness.project_root)
-eq(selected_harness.action_calls, {
-  { name = "set_current_dir", root = selected_harness.project_root },
-  { name = "files", root = selected_harness.project_root },
-}, "selected project changes cwd before opening files")
-eq(selected_harness.cwd, selected_harness.project_root, "selected project becomes cwd")
-eq(selected_harness.notifications, {}, "current project selection stays silent")
-
-local disappeared_harness = new_controller_harness()
-local disappeared_controller = test.new(disappeared_harness.dependencies)
-disappeared_controller:setup()
-disappeared_harness.starter_setup_calls[1].items[1].action()
-disappeared_harness.project_available = false
-disappeared_harness.project_callback(disappeared_harness.project_root)
-eq(disappeared_harness.notifications, {
-  warning("Recent project is no longer available: ~/src/project"),
-}, "disappeared project warning")
-eq(disappeared_harness.cwd, "/workspace", "disappeared project preserves cwd")
-eq(picker_call_count(disappeared_harness, "files"), 0, "disappeared project opens no files")
-
-local unknown_harness = new_controller_harness()
-local unknown_controller = test.new(unknown_harness.dependencies)
-unknown_controller:setup()
-unknown_harness.starter_setup_calls[1].items[1].action()
-unknown_harness.project_callback("/home/src/not-offered")
-eq(unknown_harness.action_calls, {}, "unknown project identity does nothing")
-eq(unknown_harness.notifications, {}, "unknown project identity stays silent")
-eq(unknown_harness.cwd, "/workspace", "unknown project identity preserves cwd")
-eq(picker_call_count(unknown_harness, "files"), 0, "unknown project opens no files")
-
-local failure_harness = new_controller_harness()
-local failure_controller = test.new(failure_harness.dependencies)
-failure_controller:setup()
-failure_harness.starter_setup_calls[1].items[1].action()
-failure_harness.fail_set_current_dir = true
-failure_harness.project_callback(failure_harness.project_root)
-eq(failure_harness.set_current_dir_calls, {
-  failure_harness.project_root,
-  "/workspace",
-}, "failed cwd change restores the previous cwd")
-eq(failure_harness.cwd, "/workspace", "failed cwd change preserves cwd")
-eq(failure_harness.notifications, {
-  warning("Recent project is no longer available: ~/src/project"),
-}, "failed cwd change warning")
-eq(picker_call_count(failure_harness, "files"), 0, "failed cwd change opens no files")
+eq(
+  harness.picker_calls,
+  { { name = "recent", root = harness.project_root } },
+  "recent action uses current project"
+)
+eq(harness.root_calls, 1, "recent action resolves the current root once")
 
 -- These checks catch stale callbacks, uncanceled work, overlapping focus requests,
 -- and losing an action when native MiniStarter repositions its items.
@@ -669,7 +542,7 @@ lifecycle.mappings[5].callback()
 eq(lifecycle.selected, 2, "j selects Recent files natively")
 lifecycle.mappings[5].callback()
 lifecycle.mappings[5].callback()
-eq(lifecycle.selected, 1, "j cycles back to Projects")
+eq(lifecycle.selected, 1, "j cycles back to Find files")
 lifecycle.mappings[8].callback()
 eq(lifecycle.selected, 3, "k cycles backward to Quit")
 lifecycle.requests[1].callback({ kind = "repository", name = "fixture" })
@@ -831,37 +704,6 @@ local function get_startup_live_paths()
   return paths
 end
 
-local function with_project_fixture(callback)
-  local live_paths = get_startup_live_paths()
-  local fixture = live_paths and vim.fs.joinpath(live_paths.test_root, "pure-project-fixture")
-    or vim.fs.normalize(vim.fn.tempname())
-  assert(type(fixture) == "string" and fixture:sub(1, 1) == "/", "fixture must be absolute")
-  assert(fixture ~= "/" and fixture ~= "/tmp", "fixture cleanup target is too broad")
-  assert(vim.uv.fs_lstat(fixture) == nil, "fixture path already exists")
-
-  local allowed_root = live_paths and live_paths.test_root or vim.env.DOTFILES_STARTUP_TEST_ROOT
-  if type(allowed_root) == "string" and allowed_root ~= "" then
-    allowed_root = vim.fs.normalize(allowed_root)
-    assert(path_is_within(fixture, allowed_root), "fixture escaped the allowed startup test root")
-  end
-
-  assert(vim.fn.mkdir(fixture, "p") == 1, "could not create startup fixture")
-  local ok, result = xpcall(function()
-    return callback(fixture)
-  end, debug.traceback)
-
-  assert(fixture ~= "/" and fixture ~= "/tmp", "fixture cleanup target changed")
-  if allowed_root then
-    assert(path_is_within(fixture, allowed_root), "fixture cleanup escaped the allowed root")
-  end
-  local cleanup_result = vim.fn.delete(fixture, "rf")
-  assert(cleanup_result == 0, "could not remove startup fixture")
-  if not ok then
-    error(result, 0)
-  end
-  return result
-end
-
 local function make_directory(path)
   vim.fn.mkdir(path, "p")
   local stat = vim.uv.fs_stat(path)
@@ -872,143 +714,6 @@ local function write_file(path, lines)
   make_directory(vim.fs.dirname(path))
   assert(vim.fn.writefile(lines or { "fixture" }, path) == 0, "could not write " .. path)
 end
-
-local symlink_result = "unsupported"
-
-with_project_fixture(function(fixture)
-  local home = vim.fs.joinpath(fixture, "home")
-  local git_project = vim.fs.joinpath(home, "src", "git-project")
-  local git_file = vim.fs.joinpath(git_project, "src", "recent.lua")
-  local unreadable_file = vim.fs.joinpath(git_project, "src", "unreadable.lua")
-  local worktree = vim.fs.joinpath(home, "src", "worktree")
-  local worktree_file = vim.fs.joinpath(worktree, "lib", "work.lua")
-  local jj_outer = vim.fs.joinpath(home, "src", "jj-outer")
-  local jj_outer_file = vim.fs.joinpath(jj_outer, "outer.lua")
-  local nested = vim.fs.joinpath(jj_outer, "nested")
-  local nested_file = vim.fs.joinpath(nested, "main.lua")
-  local outside = vim.fs.joinpath(fixture, "outside")
-  local plain_file = vim.fs.joinpath(outside, "plain.lua")
-  local missing_file = vim.fs.joinpath(fixture, "missing.lua")
-
-  make_directory(vim.fs.joinpath(git_project, ".git"))
-  write_file(git_file)
-  write_file(unreadable_file)
-  write_file(vim.fs.joinpath(worktree, ".git"), { "gitdir: ../bare/worktrees/demo" })
-  write_file(worktree_file)
-  make_directory(vim.fs.joinpath(jj_outer, ".jj"))
-  write_file(jj_outer_file)
-  make_directory(vim.fs.joinpath(nested, ".git"))
-  write_file(nested_file)
-  write_file(plain_file)
-
-  local root = require("navigation.root")
-  local inherited_fixture_root = root.find(fixture)
-  local notifications = {}
-  local dependencies = {
-    find_root = function(path)
-      local found = root.find(path)
-      if path == plain_file and found == inherited_fixture_root then
-        return nil
-      end
-      return found
-    end,
-    home = function()
-      return home
-    end,
-    lstat = vim.uv.fs_lstat,
-    normalize = vim.fs.normalize,
-    notify = function(...)
-      table.insert(notifications, { ... })
-    end,
-    readable = function(path)
-      return path ~= unreadable_file and vim.fn.filereadable(path) == 1
-    end,
-    realpath = vim.uv.fs_realpath,
-    relpath = vim.fs.relpath,
-    stat = vim.uv.fs_stat,
-  }
-
-  local canonical_nested = assert(vim.uv.fs_realpath(nested), "nested realpath missing")
-  local canonical_git = assert(vim.uv.fs_realpath(git_project), "Git realpath missing")
-  local canonical_worktree = assert(vim.uv.fs_realpath(worktree), "worktree realpath missing")
-  local canonical_jj_outer = assert(vim.uv.fs_realpath(jj_outer), "Jujutsu realpath missing")
-  local expected = {
-    { label = "~/src/jj-outer/nested", root = canonical_nested },
-    { label = "~/src/git-project", root = canonical_git },
-    { label = "~/src/worktree", root = canonical_worktree },
-    { label = "~/src/jj-outer", root = canonical_jj_outer },
-  }
-  local history = {
-    nested_file,
-    git_file,
-    nested_file,
-    worktree_file,
-    jj_outer_file,
-    plain_file,
-    missing_file,
-    "https://example.invalid/file.lua",
-    "relative.lua",
-    "",
-  }
-
-  eq(test.discover_projects(history, dependencies), expected, "ordered canonical projects")
-  eq(notifications, {}, "project discovery remains silent")
-
-  local symlink_root = vim.fs.joinpath(home, "src", "git-project-link")
-  local linked, link_error = vim.uv.fs_symlink(git_project, symlink_root, { dir = true })
-  if linked then
-    symlink_result = "supported"
-    local history_with_link = vim.deepcopy(history)
-    table.insert(history_with_link, 2, vim.fs.joinpath(symlink_root, "src", "recent.lua"))
-    eq(
-      test.discover_projects(history_with_link, dependencies),
-      expected,
-      "symlink roots canonicalize and deduplicate"
-    )
-  else
-    symlink_result = "unsupported: " .. tostring(link_error)
-  end
-
-  eq(
-    test.discover_projects({
-      unreadable_file,
-      missing_file,
-      git_project,
-      "https://example.invalid/file.lua",
-      "relative.lua",
-      plain_file,
-      "",
-    }, dependencies),
-    {},
-    "invalid history entries are skipped"
-  )
-  eq(notifications, {}, "invalid history entries emit no notification")
-end)
-
-local selected_root = "/canonical/project"
-local function revalidate(lstat_result, realpath_result)
-  return test.project_is_current(selected_root, {
-    lstat = function(path)
-      eq(path, selected_root, "revalidation lstat path")
-      return lstat_result
-    end,
-    normalize = vim.fs.normalize,
-    realpath = function(path)
-      eq(path, selected_root, "revalidation realpath path")
-      return realpath_result
-    end,
-  })
-end
-
-eq(revalidate({ type = "directory" }, selected_root), true, "current canonical project")
-eq(revalidate(nil, nil), false, "missing project is rejected")
-eq(revalidate({ type = "file" }, selected_root), false, "regular file project is rejected")
-eq(revalidate({ type = "link" }, selected_root), false, "replaced symlink project is rejected")
-eq(
-  revalidate({ type = "directory" }, "/replacement/project"),
-  false,
-  "changed canonical project is rejected"
-)
 
 local specs = require("plugins.startup")
 eq(#specs, 1, "startup plugin count")
@@ -1037,7 +742,6 @@ if vim.env.DOTFILES_REQUIRE_EDITING_PLUGINS == "1" then
   eq(vim.o.laststatus, 3, "configured -c aggregate keeps the standalone statusline")
 end
 
-print("Neovim startup symlink fixture: " .. symlink_result)
 print("Neovim startup pure assertions: ok")
 
 if vim.env.DOTFILES_STARTUP_LIVE ~= "1" then
@@ -1478,7 +1182,7 @@ local function inspect_starter(child)
         table.insert(rows, index)
       end
     end
-    local p = vim.fn.maparg("p", "n", false, true)
+    local p = vim.fn.maparg("f", "n", false, true)
     local r = vim.fn.maparg("r", "n", false, true)
     local q = vim.fn.maparg("q", "n", false, true)
     local ctrl_c = vim.fn.maparg("<C-c>", "n", false, true)
@@ -1488,7 +1192,7 @@ local function inspect_starter(child)
       rows = rows,
       height = vim.api.nvim_win_get_height(0),
       laststatus = vim.o.laststatus,
-      p_buffer = p.buffer,
+      f_buffer = p.buffer,
       r_buffer = r.buffer,
       q_buffer = q.buffer,
       ctrl_c_buffer = ctrl_c.buffer,
@@ -1536,15 +1240,15 @@ local function assert_bare_starter(state, label)
   eq(state.filetype, "ministarter", label .. " filetype")
   local menu = {}
   for _, line in ipairs(state.visible) do
-    for _, name in ipairs({ "p  Projects", "r  Recent files", "q  Quit" }) do
+    for _, name in ipairs({ "f  Find files", "r  Recent files", "q  Quit" }) do
       if line:find(name, 1, true) then
         menu[#menu + 1] = name
       end
     end
   end
-  eq(menu, { "p  Projects", "r  Recent files", "q  Quit" }, label .. " visible actions")
+  eq(menu, { "f  Find files", "r  Recent files", "q  Quit" }, label .. " visible actions")
   eq(state.laststatus, 0, label .. " status row hidden")
-  eq(state.p_buffer, 1, label .. " p mapping is buffer-local")
+  eq(state.f_buffer, 1, label .. " f mapping is buffer-local")
   eq(state.r_buffer, 1, label .. " r mapping is buffer-local")
   eq(state.q_buffer, 1, label .. " q mapping is buffer-local")
   eq(state.ctrl_c_buffer, 1, label .. " Ctrl-C mapping is buffer-local")
@@ -1571,6 +1275,68 @@ local live_ok, live_error = xpcall(function()
   with_child({ name = "bare" }, function(child)
     wait_for_starter(child, "bare startup")
     assert_bare_starter(inspect_starter(child), "bare launch")
+
+    child_lua(
+      child,
+      string.format(
+        [[
+      local fixture = %q
+      local project = fixture .. "/project space"
+      local ordinary = fixture .. "/ordinary"
+      vim.fn.mkdir(project .. "/.git", "p")
+      vim.fn.mkdir(project .. "/src", "p")
+      vim.fn.mkdir(project .. "-sibling", "p")
+      vim.fn.mkdir(ordinary, "p")
+      local inside = project .. "/src/inside.lua"
+      local outside = project .. "-sibling/outside.lua"
+      vim.fn.writefile({ "inside" }, inside)
+      vim.fn.writefile({ "outside" }, outside)
+      local previous_cwd, previous_history = vim.fn.getcwd(), vim.v.oldfiles
+      local core = require("fzf-lua.core")
+      local original_exec = core.fzf_exec
+      local calls = {}
+      core.fzf_exec = function(contents, opts)
+        local call = { cwd = opts.cwd, entries = {} }
+        calls[#calls + 1] = call
+        if type(contents) == "function" then
+          local complete = false
+          contents(function(entry, resume)
+            if entry == nil then complete = true; return end
+            call.entries[#call.entries + 1] = entry
+            vim.schedule(function() resume(nil) end)
+          end)
+          assert(vim.wait(1000, function() return complete end), "history collection timed out")
+        end
+      end
+      local ok, err = xpcall(function()
+        vim.cmd.lcd(vim.fn.fnameescape(project .. "/src"))
+        vim.v.oldfiles = { outside, inside, project .. "/missing.lua" }
+        local files = vim.fn.maparg("f", "n", false, true).callback
+        local recent = vim.fn.maparg("r", "n", false, true).callback
+        files()
+        recent()
+        assert(calls[1].cwd == project and calls[2].cwd == project,
+          "starter actions must use the repository root from a subdirectory")
+        assert(#calls[2].entries == 1 and calls[2].entries[1]:find("inside.lua", 1, true),
+          "scoped history must exclude missing files and similarly prefixed sibling projects")
+        assert(vim.fn.getcwd() == project .. "/src", "actions changed the editor directory")
+        vim.v.oldfiles = {}
+        files()
+        assert(calls[3].cwd == project, "Find files must work without history")
+        vim.cmd.lcd(vim.fn.fnameescape(ordinary))
+        recent()
+        assert(calls[4].cwd == ordinary and #calls[4].entries == 0,
+          "ordinary directories use their own empty scoped history")
+        assert(vim.fn.getcwd() == ordinary, "ordinary directory changed")
+      end, debug.traceback)
+      core.fzf_exec = original_exec
+      vim.v.oldfiles = previous_history
+      vim.cmd.lcd(vim.fn.fnameescape(previous_cwd))
+      assert(ok, err)
+    ]],
+        child.root
+      )
+    )
 
     child_lua(
       child,
@@ -1941,13 +1707,13 @@ local live_ok, live_error = xpcall(function()
       eq(state.matches, true, label .. " pointer matches row and byte column")
       return state
     end
-    assert_selection("p  Projects", "initial")
+    assert_selection("f  Find files", "initial")
     child_input(child, "k")
     wait_child_lua(child, [[return vim.api.nvim_win_get_cursor(0)[1] > 0]], "native key delivery")
     -- RPC requests run after queued input, so inspections observe native selection.
     assert_selection("q  Quit", "backward wrap")
     child_input(child, "j")
-    assert_selection("p  Projects", "forward wrap")
+    assert_selection("f  Find files", "forward wrap")
     child_input(child, "<Down>")
     assert_selection("r  Recent files", "arrow next")
     child_input(child, "<CR>")
@@ -2027,9 +1793,9 @@ local live_ok, live_error = xpcall(function()
     child_lua(child, [[vim.cmd.close()]])
     assert_selection("q  Quit", "closing one shared Starter window")
     child_lua(child, [[require("mini.starter").open()]])
-    assert_selection("p  Projects", "second buffer")
+    assert_selection("f  Find files", "second buffer")
     child_lua(child, [[_G.startup_requests[1].callback({ kind = "non_repository" })]])
-    assert_selection("p  Projects", "closed-buffer late completion")
+    assert_selection("f  Find files", "closed-buffer late completion")
     child_lua(
       child,
       [[
@@ -2044,7 +1810,7 @@ local live_ok, live_error = xpcall(function()
       "background Starter completion preserves current regular statusline"
     )
     child_lua(child, [[vim.cmd.close(); require("mini.starter").open()]])
-    assert_selection("p  Projects", "pending resize buffer")
+    assert_selection("f  Find files", "pending resize buffer")
     child_input(child, "j")
     assert_selection("r  Recent files", "before queued resize completion")
     child_lua(
@@ -2063,7 +1829,7 @@ local live_ok, live_error = xpcall(function()
     wait_child_lua(child, [[return _G.startup_resize_race_done]], "queued resize completion")
     assert_selection("r  Recent files", "completion before resize reconciliation")
     child_lua(child, [[require("mini.starter").open()]])
-    assert_selection("p  Projects", "pending quit buffer")
+    assert_selection("f  Find files", "pending quit buffer")
     child_input(child, "q")
     assert(
       vim.wait(5000, function()

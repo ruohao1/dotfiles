@@ -105,72 +105,6 @@ local function has_builtin_tui()
   return false
 end
 
-local function local_absolute(path, normalize)
-  if
-    type(path) ~= "string"
-    or path == ""
-    or path:sub(1, 1) ~= "/"
-    or path:match("^%a[%w+.-]*://")
-  then
-    return nil
-  end
-  return normalize(path)
-end
-
-local function display_root(root, home, relpath)
-  if root == home then
-    return "~"
-  end
-  local ok, relative = pcall(relpath, home, root)
-  if
-    ok
-    and type(relative) == "string"
-    and relative ~= ""
-    and relative ~= ".."
-    and not relative:match("^%.%./")
-  then
-    return "~/" .. relative
-  end
-  return root
-end
-
-local function discover_projects(oldfiles, dependencies)
-  local result = {}
-  local seen = {}
-  local raw_home = dependencies.home()
-  local home = dependencies.realpath(raw_home) or raw_home
-  home = dependencies.normalize(home)
-
-  for _, oldfile in ipairs(oldfiles or {}) do
-    local path = local_absolute(oldfile, dependencies.normalize)
-    local stat = path and dependencies.stat(path) or nil
-    if stat and stat.type == "file" and dependencies.readable(path) then
-      local root = dependencies.find_root(path)
-      local canonical = root and dependencies.realpath(root) or nil
-      canonical = canonical and dependencies.normalize(canonical) or nil
-      local root_stat = canonical and dependencies.stat(canonical) or nil
-      if root_stat and root_stat.type == "directory" and not seen[canonical] then
-        seen[canonical] = true
-        table.insert(result, {
-          label = display_root(canonical, home, dependencies.relpath),
-          root = canonical,
-        })
-      end
-    end
-  end
-
-  return result
-end
-
-local function project_is_current(root, dependencies)
-  local stat = dependencies.lstat(root)
-  if not stat or stat.type ~= "directory" then
-    return false
-  end
-  local canonical = dependencies.realpath(root)
-  return canonical ~= nil and dependencies.normalize(canonical) == root
-end
-
 local notification_title = "Neovim startup"
 
 local function new(dependencies)
@@ -190,41 +124,12 @@ local function new(dependencies)
 
   actions.quit = dependencies.quit
 
-  actions.recent = function()
-    dependencies.pickers().recent()
+  actions.files = function()
+    dependencies.pickers().files(dependencies.root())
   end
 
-  actions.projects = function()
-    local projects = discover_projects(dependencies.oldfiles(), dependencies.project_dependencies)
-    if #projects == 0 then
-      notify("No recent projects found")
-      return
-    end
-
-    local by_root = {}
-    for _, project in ipairs(projects) do
-      by_root[project.root] = project
-    end
-
-    dependencies.pickers().projects(projects, function(root)
-      local project = by_root[root]
-      if not project then
-        return
-      end
-      if not project_is_current(root, dependencies.project_dependencies) then
-        notify("Recent project is no longer available: " .. project.label)
-        return
-      end
-
-      local previous = dependencies.getcwd()
-      local changed = pcall(dependencies.set_current_dir, root)
-      if not changed then
-        pcall(dependencies.set_current_dir, previous)
-        notify("Recent project is no longer available: " .. project.label)
-        return
-      end
-      dependencies.pickers().files(root)
-    end)
+  actions.recent = function()
+    dependencies.pickers().recent(dependencies.root())
   end
 
   local function synchronize_status()
@@ -244,7 +149,7 @@ local function new(dependencies)
         directory = dependencies.getcwd(bufnr),
         generation = 0,
         view = { kind = "loading" },
-        selected = actions.projects,
+        selected = actions.files,
       }
     end
     return state.buffers[bufnr]
@@ -367,7 +272,7 @@ local function new(dependencies)
       footer = "",
       query_updaters = "",
       items = {
-        { name = "p  Projects", action = actions.projects, section = "" },
+        { name = "f  Find files", action = actions.files, section = "" },
         { name = "r  Recent files", action = actions.recent, section = "" },
         { name = "q  Quit", action = actions.quit, section = "" },
       },
@@ -416,7 +321,7 @@ local function new(dependencies)
         dependencies.delete_mapping(bufnr, "<M-j>")
         dependencies.delete_mapping(bufnr, "<M-k>")
         dependencies.set_startup_visible(true)
-        dependencies.set_mapping(bufnr, "p", actions.projects, "Open projects")
+        dependencies.set_mapping(bufnr, "f", actions.files, "Find files")
         dependencies.set_mapping(bufnr, "r", actions.recent, "Open recent files")
         dependencies.set_mapping(bufnr, "q", actions.quit, "Quit")
         dependencies.set_mapping(bufnr, "<C-c>", actions.quit, "Quit")
@@ -611,8 +516,8 @@ local runtime = new({
   pickers = function()
     return require("navigation.pickers")
   end,
-  oldfiles = function()
-    return vim.v.oldfiles
+  root = function()
+    return require("navigation.root").resolve()
   end,
   getcwd = function(bufnr)
     local window = bufnr and buffer_window(bufnr)
@@ -622,7 +527,6 @@ local runtime = new({
         end)
       or vim.fn.getcwd(0, 0)
   end,
-  set_current_dir = vim.api.nvim_set_current_dir,
   notify = vim.notify,
   current_buffer = vim.api.nvim_get_current_buf,
   buffer_filetype = function(bufnr)
@@ -645,22 +549,6 @@ local runtime = new({
   create_augroup = vim.api.nvim_create_augroup,
   create_autocmd = vim.api.nvim_create_autocmd,
   startup_context = startup_context,
-  project_dependencies = {
-    find_root = function(path)
-      return require("navigation.root").find(path)
-    end,
-    home = function()
-      return assert(vim.uv.os_homedir(), "could not resolve home directory")
-    end,
-    lstat = vim.uv.fs_lstat,
-    normalize = vim.fs.normalize,
-    readable = function(path)
-      return vim.fn.filereadable(path) == 1
-    end,
-    realpath = vim.uv.fs_realpath,
-    relpath = vim.fs.relpath,
-    stat = vim.uv.fs_stat,
-  },
 })
 
 function M.setup()
@@ -668,11 +556,9 @@ function M.setup()
 end
 
 M._test = {
-  discover_projects = discover_projects,
   has_editing_intent = has_editing_intent,
   is_bare_launch = is_bare_launch,
   new = new,
-  project_is_current = project_is_current,
 }
 
 return M
