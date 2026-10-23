@@ -79,6 +79,10 @@ case $1 in
     if [ "$2" = -p ]; then
       case $5 in
         '#{pane_in_mode}:#{pane_mode}:#{scroll_position}') printf '%s\n' "${DOTFILES_URL_CLICK_MODE_STATE-0::}" ;;
+        '#{mouse_any_flag}')
+          [ "${DOTFILES_URL_CLICK_MOUSE_STATUS-0}" = 0 ] || exit 1
+          printf '%s\n' "${DOTFILES_URL_CLICK_MOUSE_FLAG-0}"
+          ;;
         *) printf '%s\n' "$DOTFILES_URL_CLICK_DIMENSIONS" ;;
       esac
     else
@@ -130,7 +134,7 @@ run_production() {
   : >"$test_root/open.log"
   output_file=$test_root/production.out
   error_file=$test_root/production.err
-  if PATH="$test_root:$PATH" DOTFILES_URL_CLICK_TMUX_LOG="$test_root/tmux.log" DOTFILES_URL_CLICK_DIMENSIONS='80 24' DOTFILES_URL_CLICK_CAPTURE="${5-}" DOTFILES_URL_CLICK_PLATFORM="${6-linux}" DOTFILES_URL_CLICK_MODE_STATE="${7-0::}" DOTFILES_URL_CLICK_OPEN_LOG="$test_root/open.log" "$helper" --pane "$1" --x "$2" --y "$3" --hyperlink "$4" >"$output_file" 2>"$error_file"; then production_status=0; else production_status=$?; fi
+  if PATH="$test_root:$PATH" DOTFILES_URL_CLICK_TMUX_LOG="$test_root/tmux.log" DOTFILES_URL_CLICK_DIMENSIONS='80 24' DOTFILES_URL_CLICK_CAPTURE="${5-}" DOTFILES_URL_CLICK_PLATFORM="${6-linux}" DOTFILES_URL_CLICK_MODE_STATE="${7-0::}" DOTFILES_URL_CLICK_MOUSE_FLAG="${8-0}" DOTFILES_URL_CLICK_MOUSE_STATUS="${9-0}" DOTFILES_URL_CLICK_OPEN_LOG="$test_root/open.log" "$helper" --pane "$1" --x "$2" --y "$3" --hyperlink "$4" >"$output_file" 2>"$error_file"; then production_status=0; else production_status=$?; fi
   production_stdout=$(cat "$output_file")
   production_stderr=$(cat "$error_file")
 }
@@ -355,6 +359,22 @@ EOF
     assert_empty_file "$error_file" malformed-mode-context-stderr
     assert_equal 'message:Could not open URL' "$(cat "$test_root/tmux.log")" malformed-mode-context-message
     assert_empty_file "$test_root/open.log" malformed-mode-context-no-opener
+  done
+  run_production %1 10 0 0 '0 - https://native.example/a' linux '0::' 1
+  assert_equal 0 "$production_status" native-mouse-owner-status
+  assert_equal '' "$production_stdout" native-mouse-owner-stdout
+  assert_empty_file "$error_file" native-mouse-owner-stderr
+  assert_empty_file "$test_root/tmux.log" native-mouse-owner-no-capture
+  assert_empty_file "$test_root/open.log" native-mouse-owner-no-opener
+  for mouse_flag in '' 2 invalid error; do
+    mouse_status=0
+    [ "$mouse_flag" != error ] || mouse_status=1
+    run_production %1 10 0 0 '0 - https://native.example/a' linux '0::' "$mouse_flag" "$mouse_status"
+    assert_equal 1 "$production_status" invalid-mouse-owner-status
+    assert_equal '' "$production_stdout" invalid-mouse-owner-stdout
+    assert_empty_file "$error_file" invalid-mouse-owner-stderr
+    assert_equal 'message:Could not open URL' "$(cat "$test_root/tmux.log")" invalid-mouse-owner-message
+    assert_empty_file "$test_root/open.log" invalid-mouse-owner-no-opener
   done
   run_production %1 80 0 1
   assert_equal 0 "$production_status" hyperlink-outside-pane-status
@@ -758,22 +778,37 @@ OPENER
   cat >"$private_root/recorder" <<'RECORDER'
 #!/usr/bin/env python3
 import os
+import re
+import subprocess
 import sys
 import tty
 
 fixture = sys.argv[1]
+mode = sys.argv[2] if len(sys.argv) > 2 else 'shell'
 tty.setraw(0)
 with open(fixture + ".pid", "w", encoding="ascii") as pid_file:
     pid_file.write(str(os.getpid()))
 with open(fixture, "rb") as screen_file:
     screen = screen_file.read()
-os.write(1, b"\x1b[H\x1b[2J" + screen + b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")
+os.write(1, b"\x1b[H\x1b[2J" + screen)
+if mode != 'shell':
+    os.write(1, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")
+pending = b''
 with open(fixture + ".mouse", "ab", buffering=0) as mouse_file:
     while True:
         chunk = os.read(0, 4096)
         if not chunk:
             break
         mouse_file.write(chunk)
+        if mode == 'native':
+            pending += chunk
+            end = 0
+            for event in re.finditer(rb'\x1b\[<(\d+);(\d+);(\d+)([Mm])', pending):
+                end = event.end()
+                if event[1] == b'16' and event[3] == b'1' and event[4] == b'M':
+                    opener = 'open' if sys.platform == 'darwin' else 'xdg-open'
+                    subprocess.run([opener, 'https://native.example/a'], check=True)
+            pending = pending[end:]
 RECORDER
   chmod 700 "$private_root/recorder"
   # Keep the URL unbroken in the input stream; tmux supplies the soft wrap.
@@ -784,6 +819,8 @@ RECORDER
     printf '\033]8;;https:///bad\033\\https://fallback.example/a\033]8;;\033\\\r\n'
     printf '\033]8;;file:///bad\033\\https://fallback.example/b\033]8;;\033\\\r\n'
   } >"$private_root/base.screen"
+  cp "$private_root/base.screen" "$private_root/mouse.screen"
+  printf 'https://native.example/a\r\n' >"$private_root/native.screen"
   {
     printf '\347\225\214 https://plain.example/a\r\n'
     printf 'e\314\201 https://plain.example/combining\r\n'
@@ -905,15 +942,21 @@ RECORDER
     : >"$DOTFILES_URL_CLICK_OPEN_LOG"
     helper_before=$(wc -l <"$DOTFILES_URL_CLICK_HELPER_LOG")
     before=$(wc -c <"$pane_log")
+    forwards=${8-0}
     send_mouse 16 "$x" "$y" M
     expected_x=${6-$x}; expected_y=${7-$y}
     printf '\033[<16;%s;%sM' "$((expected_x + 1))" "$((expected_y + 1))" >"$private_root/down.expected"
     down_bytes=$(wc -c <"$private_root/down.expected")
-    wait_log_bytes "$((before + down_bytes))" "$pane_log"
+    [ "$forwards" = 0 ] || wait_log_bytes "$((before + down_bytes))" "$pane_log"
+    if [ "$label" = native-app-opens-once ]; then
+      printf '1\000%s\000' "$expected_url" >"$private_root/native-down.expected"
+      wait_log_bytes "$(wc -c <"$private_root/native-down.expected")" "$DOTFILES_URL_CLICK_OPEN_LOG"
+      cmp -s "$private_root/native-down.expected" "$DOTFILES_URL_CLICK_OPEN_LOG" || fail 'native app opens once on Ctrl-down'
+    fi
     send_mouse 16 "$x" "$y" m
     printf '\033[<16;%s;%sM\033[<16;%s;%sm' "$((expected_x + 1))" "$((expected_y + 1))" "$((expected_x + 1))" "$((expected_y + 1))" >"$private_root/pair.expected"
     pair_bytes=$(wc -c <"$private_root/pair.expected")
-    wait_log_bytes "$((before + pair_bytes))" "$pane_log"
+    [ "$forwards" = 0 ] || wait_log_bytes "$((before + pair_bytes))" "$pane_log"
     event_queue_barrier
     retry=0
     while [ "$(wc -l <"$DOTFILES_URL_CLICK_HELPER_LOG")" -lt "$((helper_before + 2))" ] && [ "$retry" -lt 50 ]; do
@@ -933,40 +976,57 @@ RECORDER
     else
       [ ! -s "$DOTFILES_URL_CLICK_OPEN_LOG" ] || fail "$label unexpected opener"
     fi
-    dd if="$pane_log" bs=1 skip="$before" count="$pair_bytes" 2>/dev/null >"$private_root/pair.actual"
-    cmp -s "$private_root/pair.expected" "$private_root/pair.actual" || fail "$label forwarded pair"
+    if [ "$forwards" = 1 ]; then
+      dd if="$pane_log" bs=1 skip="$before" count="$pair_bytes" 2>/dev/null >"$private_root/pair.actual"
+      cmp -s "$private_root/pair.expected" "$private_root/pair.actual" || fail "$label forwarded pair"
+    else
+      assert_equal "$before" "$(wc -c <"$pane_log")" "$label shell receives no mouse bytes"
+    fi
   }
+  "$feature_tmux" -S "$private_root/new.sock" respawn-pane -k -t "$main_pane" "$private_root/recorder $private_root/native.screen native"
+  wait_screen 'https://native.example/a' "$main_pane"
+  track_recorder "$private_root/native.screen.pid"
+  assert_equal 1 "$("$feature_tmux" -S "$private_root/new.sock" display-message -p -t "$main_pane" '#{mouse_any_flag}')" native-app-requests-mouse
+  expect_click native-app-opens-once 8 0 'https://native.example/a' "$private_root/native.screen.mouse" 8 0 1
+  "$feature_tmux" -S "$private_root/new.sock" respawn-pane -k -t "$main_pane" "$private_root/recorder $private_root/base.screen"
+  wait_screen 'non-link target' "$main_pane"
+  track_recorder "$private_root/base.screen.pid"
+  assert_equal 0 "$("$feature_tmux" -S "$private_root/new.sock" display-message -p -t "$main_pane" '#{mouse_any_flag}')" shell-does-not-request-mouse
   expect_click wrap-first 10 1 'https://plain.example/abcdefghijklmnopqrstuvwxyz?x=1#z' "$private_root/base.screen.mouse"
   expect_click wrap-second 4 2 'https://plain.example/abcdefghijklmnopqrstuvwxyz?x=1#z' "$private_root/base.screen.mouse"
   expect_click osc-precedence 10 3 'https://osc.example/a?b=1#frag' "$private_root/base.screen.mouse"
   expect_click non-link 5 4 '' "$private_root/base.screen.mouse"
   expect_click malformed-osc 10 5 '' "$private_root/base.screen.mouse"
   expect_click unsupported-osc 10 6 '' "$private_root/base.screen.mouse"
+  "$feature_tmux" -S "$private_root/new.sock" respawn-pane -k -t "$main_pane" "$private_root/recorder $private_root/mouse.screen mouse"
+  wait_screen 'plain mouse target' "$main_pane"
+  track_recorder "$private_root/mouse.screen.pid"
+  expect_click passive-app-link 10 1 '' "$private_root/mouse.screen.mouse" 10 1 1
   : >"$DOTFILES_URL_CLICK_OPEN_LOG"
   helper_before=$(wc -l <"$DOTFILES_URL_CLICK_HELPER_LOG")
-  before=$(wc -c <"$private_root/base.screen.mouse")
+  before=$(wc -c <"$private_root/mouse.screen.mouse")
   send_mouse 16 10 1 M
   send_mouse 48 12 2 M
   send_mouse 16 12 2 m
   printf '\033[<16;11;2M\033[<48;13;3M\033[<16;13;3m' >"$private_root/drag.expected"
   drag_bytes=$(wc -c <"$private_root/drag.expected")
-  wait_log_bytes "$((before + drag_bytes))" "$private_root/base.screen.mouse"
-  dd if="$private_root/base.screen.mouse" bs=1 skip="$before" count="$drag_bytes" 2>/dev/null >"$private_root/drag.actual"
+  wait_log_bytes "$((before + drag_bytes))" "$private_root/mouse.screen.mouse"
+  dd if="$private_root/mouse.screen.mouse" bs=1 skip="$before" count="$drag_bytes" 2>/dev/null >"$private_root/drag.actual"
   cmp -s "$private_root/drag.expected" "$private_root/drag.actual" || fail 'drag forwarding sequence'
   event_queue_barrier
   assert_equal "$helper_before" "$(wc -l <"$DOTFILES_URL_CLICK_HELPER_LOG")" drag-no-helper
   [ ! -s "$DOTFILES_URL_CLICK_OPEN_LOG" ] || fail 'drag opened URL'
   # A new complete click after drag must remain paired and independent.
-  expect_click post-drag 5 4 '' "$private_root/base.screen.mouse"
+  expect_click post-drag 5 4 '' "$private_root/mouse.screen.mouse" 5 4 1
   : >"$DOTFILES_URL_CLICK_OPEN_LOG"
   helper_before=$(wc -l <"$DOTFILES_URL_CLICK_HELPER_LOG")
-  before=$(wc -c <"$private_root/base.screen.mouse")
+  before=$(wc -c <"$private_root/mouse.screen.mouse")
   send_mouse 0 10 1 M
   send_mouse 0 10 1 m
   printf '\033[<0;11;2M\033[<0;11;2m' >"$private_root/ordinary.expected"
   ordinary_bytes=$(wc -c <"$private_root/ordinary.expected")
-  wait_log_bytes "$((before + ordinary_bytes))" "$private_root/base.screen.mouse"
-  dd if="$private_root/base.screen.mouse" bs=1 skip="$before" count="$ordinary_bytes" 2>/dev/null >"$private_root/ordinary.actual"
+  wait_log_bytes "$((before + ordinary_bytes))" "$private_root/mouse.screen.mouse"
+  dd if="$private_root/mouse.screen.mouse" bs=1 skip="$before" count="$ordinary_bytes" 2>/dev/null >"$private_root/ordinary.actual"
   cmp -s "$private_root/ordinary.expected" "$private_root/ordinary.actual" || fail 'ordinary forwarding sequence'
   event_queue_barrier
   assert_equal "$helper_before" "$(wc -l <"$DOTFILES_URL_CLICK_HELPER_LOG")" ordinary-no-helper
@@ -1005,7 +1065,7 @@ RECORDER
   expect_click adjacent-second-b 4 9 'https://two.example/' "$private_root/unicode.screen.mouse"
   expect_click adjacent-right 5 9 '' "$private_root/unicode.screen.mouse"
 
-  "$feature_tmux" -S "$private_root/new.sock" respawn-pane -k -t "$main_pane" "$private_root/recorder $private_root/left.screen"
+  "$feature_tmux" -S "$private_root/new.sock" respawn-pane -k -t "$main_pane" "$private_root/recorder $private_root/left.screen mouse"
   wait_screen 'https://left.test/a' "$main_pane"
   track_recorder "$private_root/left.screen.pid"
   "$feature_tmux" -S "$private_root/new.sock" split-window -h -l 24 -t "$main_pane" "$private_root/recorder $private_root/right.screen"
@@ -1015,10 +1075,15 @@ RECORDER
   right_left=$($feature_tmux -S "$private_root/new.sock" display-message -p -t "$right_pane" '#{pane_left}')
   right_top=$($feature_tmux -S "$private_root/new.sock" display-message -p -t "$right_pane" '#{pane_top}')
   [ "$right_left" -gt 0 ] || fail 'split pane is at origin'
+  "$feature_tmux" -S "$private_root/new.sock" select-pane -t "$main_pane"
+  assert_equal 1 "$("$feature_tmux" -S "$private_root/new.sock" display-message -p -t "$main_pane" '#{mouse_any_flag}')" active-app-requests-mouse
+  assert_equal 0 "$("$feature_tmux" -S "$private_root/new.sock" display-message -p -t "$right_pane" '#{mouse_any_flag}')" inactive-shell-does-not-request-mouse
   left_before=$(wc -c <"$private_root/left.screen.mouse")
   expect_click split-right "$((right_left + 8))" "$right_top" 'https://right.test/a' "$private_root/right.screen.mouse" 8 0
   expect_click split-non-link "$((right_left + 8))" "$((right_top + 1))" '' "$private_root/right.screen.mouse" 8 1
   assert_equal "$left_before" "$(wc -c <"$private_root/left.screen.mouse")" split-adjacent-pane-untouched
+  "$feature_tmux" -S "$private_root/new.sock" select-pane -t "$right_pane"
+  expect_click inactive-app-link 8 0 '' "$private_root/left.screen.mouse" 8 0 1
   "$feature_tmux" -S "$private_root/new.sock" kill-pane -t "$right_pane"
   "$feature_tmux" -S "$private_root/new.sock" resize-window -t urltest:1 -x 40 -y 10
   # A captured negative history prefix must not suppress a visible click.
@@ -1032,9 +1097,10 @@ RECORDER
   expect_click history-visible 10 "$history_y" 'https://history-visible.example/a' "$private_root/history.screen.mouse"
 
   "$feature_tmux" -S "$private_root/new.sock" clear-history -t "$main_pane"
-  "$feature_tmux" -S "$private_root/new.sock" respawn-pane -k -t "$main_pane" "$private_root/recorder $private_root/copy.screen"
+  "$feature_tmux" -S "$private_root/new.sock" respawn-pane -k -t "$main_pane" "$private_root/recorder $private_root/copy.screen mouse"
   wait_screen 'https://hidden.example/plain' "$main_pane"
   track_recorder "$private_root/copy.screen.pid"
+  assert_equal 1 "$("$feature_tmux" -S "$private_root/new.sock" display-message -p -t "$main_pane" '#{mouse_any_flag}')" copy-underlying-app-requests-mouse
   enter_copy_top() {
     "$feature_tmux" -S "$private_root/new.sock" copy-mode -t "$main_pane"
     "$feature_tmux" -S "$private_root/new.sock" send-keys -t "$main_pane" -X history-top
