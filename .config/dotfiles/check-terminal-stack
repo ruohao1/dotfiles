@@ -10848,7 +10848,7 @@ TASK6_APPLICATION_CASES
   tmux -S "$check_socket" list-keys > "$check_tmp/tmux-all-keys.txt" 2>&1 || true
 
   tmux_reload_command="source-file $tmux_root/tmux.conf \\; display-message \"Reloaded tmux foundation\""
-  tmux_session_navigator_command='run-shell -b "exec \"\$HOME/.config/tmux/scripts/session-navigator\" --popup #{q:socket_path} #{q:client_name}"'
+  tmux_session_navigator_command='run-shell -b "exec #{q:HOME}/.config/tmux/scripts/session-navigator --popup #{q:socket_path} #{q:client_name}"'
   serialized_backslash_key="M-\\\\"
   tmux_url_down_command='send-keys -M'
   tmux_url_up_command='send-keys -M \; run-shell -b -t = "\~/.config/tmux/scripts/open-url --pane #{mouse_pane} --x #{mouse_x} --y #{mouse_y} --hyperlink #{?mouse_hyperlink,1,0} || :"'

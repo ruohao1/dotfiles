@@ -10,14 +10,14 @@ import unittest
 SOURCE = Path(__file__).resolve().parents[2]
 KEYS = Path(os.environ.get('DOTFILES_SESSION_NAVIGATOR_KEYS', SOURCE / '.config/tmux/conf/keys.conf'))
 BINDING = ('bind-key f run-shell -b '
-           '\'exec "$HOME/.config/tmux/scripts/session-navigator" --popup '
+           '\'exec #{q:HOME}/.config/tmux/scripts/session-navigator --popup '
            '#{q:socket_path} #{q:client_name}\'\n')
 
 
 @unittest.skipUnless(shutil.which('tmux'), 'tmux is required for binding serialization')
 class SessionNavigatorCheckerTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix='navigator-checker-')
+        self.temporary = tempfile.TemporaryDirectory(prefix='nc-')
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.home = self.root / 'home'

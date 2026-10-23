@@ -55,14 +55,14 @@ sys.stdout.buffer.write(record + (b'' if mode == 'unterminated' else b'\0'))
 @unittest.skipUnless(TMUX, 'tmux is required for private session navigation tests')
 class SessionNavigatorTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix='session-nav-')
+        self.temporary = tempfile.TemporaryDirectory(prefix='sn-')
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.home = self.root / 'home with space'
         self.home.mkdir()
         self.bin = self.root / 'bin'
         self.bin.mkdir()
-        self.socket = self.root / "socket ' $"
+        self.socket = self.root / "s' $"
         self.env = {'HOME': str(self.home), 'PATH': str(self.bin) + ':' + os.environ.get('PATH', os.defpath),
                     'TERM': 'xterm-256color', 'LANG': 'C.UTF-8', 'SHELL': '/bin/sh',
                     'TMUX': str(self.root / 'wrong-socket') + ',0,0', 'TMUX_PANE': '%999999',
