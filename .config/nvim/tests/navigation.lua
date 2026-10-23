@@ -385,14 +385,6 @@ local function picker_harness(options)
     end
   end
 
-  api.fzf_exec = function(contents, call_options)
-    table.insert(calls, {
-      name = "fzf_exec",
-      contents = vim.deepcopy(contents),
-      options = call_options,
-    })
-  end
-
   local controller = pickers._test.new({
     executable = function(name)
       return available[name] == true
@@ -489,27 +481,13 @@ eq(
 )
 eq(explicit.counts().root, 0, "explicit file root bypasses root resolver")
 
-local project_selection
-local projects = picker_harness()
-projects.controller.projects({
-  { label = "~/src/alpha", root = "/home/test/src/alpha" },
-  { label = "/srv/alpha", root = "/srv/alpha" },
-}, function(root_path)
-  project_selection = root_path
-end)
-
-eq(projects.calls[1].name, "fzf_exec", "project picker API")
-eq(projects.calls[1].contents, { "~/src/alpha", "/srv/alpha" }, "project display order")
-eq(projects.calls[1].options.prompt, "Projects> ", "project prompt")
-eq(projects.calls[1].options.previewer, false, "project preview disabled")
-projects.calls[1].options.actions.enter({ "/srv/alpha" })
-eq(project_selection, "/srv/alpha", "project picker retains canonical root")
-
-project_selection = nil
-projects.calls[1].options.actions.enter({})
-eq(project_selection, nil, "project cancellation has no callback")
-projects.calls[1].options.actions.enter({ "not-an-entry" })
-eq(project_selection, nil, "unknown project label has no callback")
+local scoped_recent = picker_harness()
+scoped_recent.controller.recent("/current project")
+eq(scoped_recent.calls[1], {
+  name = "oldfiles",
+  options = { cwd = "/current project", cwd_only = true },
+}, "starter recent files are filtered to the explicit project")
+eq(scoped_recent.counts().root, 0, "explicit recent root is preserved")
 
 for _, version_case in ipairs({
   { version = "0.36.0", accepted = true },
@@ -657,7 +635,6 @@ local expected_public_pickers = {
   "grep",
   "buffers",
   "recent",
-  "projects",
   "line_pins",
   "clipboard_history",
   "help",

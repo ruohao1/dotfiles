@@ -4,7 +4,7 @@ end
 
 local layout = require("ui.startup.layout")
 local items = {}
-for index, name in ipairs({ "p  Projects", "r  Recent files", "q  Quit" }) do
+for index, name in ipairs({ "f  Find files", "r  Recent files", "q  Quit" }) do
   items[index] =
     { type = "item", string = name, hl = "MiniStarterItem", item = { action = function() end } }
 end
@@ -45,7 +45,7 @@ local function compose(view, width, height, display_width)
 end
 
 local _, menu = compose({ kind = "non_repository" }, 80, 20)
-assert(table.concat(menu, "\n"):find("p  Projects", 1, true), "missing menu")
+assert(table.concat(menu, "\n"):find("f  Find files", 1, true), "missing menu")
 assert(menu[1]:match("^%s*$"), "menu should be vertically centered")
 local _, error_menu = compose({ kind = "error", message = "private diagnostic" }, 80, 20)
 eq(error_menu, menu, "errors fall back to menu only")

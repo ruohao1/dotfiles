@@ -86,40 +86,11 @@ local function new(dependencies)
       end
       dependencies.fzf().buffers()
     end,
-    recent = function()
+    recent = function(cwd)
       if not check_fzf() then
         return
       end
-      dependencies.fzf().oldfiles()
-    end,
-    projects = function(projects, on_select)
-      assert(type(projects) == "table", "projects must be a table")
-      assert(type(on_select) == "function", "project callback must be a function")
-      if not check_fzf() then
-        return
-      end
-
-      local labels = {}
-      local roots = {}
-      for _, project in ipairs(projects) do
-        assert(type(project.label) == "string", "project label must be a string")
-        assert(type(project.root) == "string", "project root must be a string")
-        table.insert(labels, project.label)
-        roots[project.label] = project.root
-      end
-
-      dependencies.fzf().fzf_exec(labels, {
-        prompt = "Projects> ",
-        previewer = false,
-        actions = {
-          enter = function(selected)
-            local root_path = selected and roots[selected[1]] or nil
-            if root_path then
-              on_select(root_path)
-            end
-          end,
-        },
-      })
+      dependencies.fzf().oldfiles(cwd and { cwd = cwd, cwd_only = true } or nil)
     end,
     line_pins = function(source)
       if not check_fzf() then
@@ -207,7 +178,6 @@ M.files = runtime.files
 M.grep = runtime.grep
 M.buffers = runtime.buffers
 M.recent = runtime.recent
-M.projects = runtime.projects
 M.line_pins = runtime.line_pins
 M.clipboard_history = runtime.clipboard_history
 M.help = runtime.help
