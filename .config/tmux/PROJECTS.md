@@ -45,6 +45,10 @@ path, then press Enter. If the project has one session, this terminal switches
 directly. If it has several, a second picker lets you search their names and
 choose a session, including Neovim or any extra shell sessions.
 
+The managed editor appears as **Editor · Neovim**. Other sessions appear as
+**Terminal · name**, so extra terminals remain distinguishable. These are picker
+labels; the actual tmux session names stay unchanged.
+
 Escape or Ctrl+C at either step closes the picker without switching. Other
 attached terminals keep their current sessions.
 

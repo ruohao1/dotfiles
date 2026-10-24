@@ -2,6 +2,7 @@
 """Choose a project and session for one explicitly targeted tmux client."""
 import os
 import re
+import runpy
 import shlex
 import shutil
 import subprocess
@@ -56,6 +57,13 @@ def navigate(socket, client, popup=False):
             return 0
         if not shutil.which("fzf"):
             raise RuntimeError("fzf is not available")
+        # Reuse the launcher's name even when restoration has lost role metadata.
+        editor_name = None
+        try:
+            helper = os.path.join(os.path.dirname(os.path.realpath(__file__)), "project-session")
+            editor_name = runpy.run_path(helper).get("editor_name")
+        except FileNotFoundError:
+            pass
         projects = {}
         for session in tmux("list-sessions", "-F", "#{session_id}").splitlines():
             if not re.fullmatch(r"\$[0-9]+", session):
@@ -65,6 +73,10 @@ def navigate(socket, client, popup=False):
                 name = tmux("display-message", "-p", "-t", session + ":", "#{session_name}")
             except subprocess.CalledProcessError:
                 continue  # A session may close while the list is being built.
+            if editor_name and name == editor_name(path):
+                name = "Editor · Neovim"
+            else:
+                name = "Terminal · " + name
             projects.setdefault(path, {})[record(session, name)] = session
         if not projects:
             raise RuntimeError("no sessions are available")

@@ -8,6 +8,13 @@ picker. Select a project with one session to switch directly. If it has several
 sessions, show a second picker containing all their names. Escape or Ctrl+C at
 either step cancels without switching. Separate worktrees stay separate.
 
+The session picker labels the managed editor `Editor · Neovim` and other sessions
+`Terminal · <original name>`. Reuse the launcher's exact generated-name function,
+so restored editors are recognized without role metadata and custom `nvim-*`
+names are not shortened. Load that function from the navigator's sibling
+`project-session` in the same resolved runtime tree. If that file is missing,
+retain terminal labels and the original names. Never rename a tmux session.
+
 **Architecture:** Extend the existing Python helper and reuse fzf for both steps.
 Keep canonical session IDs as targets, validate complete offered records, and
 switch only the invoking client. No session creation, renaming, closing, new
@@ -26,6 +33,9 @@ dependencies, key-binding changes, or Git-root discovery.
   grouping rule. Keep this plan with the implementation PR.
 - [x] Run the navigator and binding checker suites, including installed fzf and
   the previously validated fzf 0.44.1 when available. Obtain an independent review.
+- [x] Add a failing private-server check for editor/terminal labels, custom names,
+  exact session selection, and missing-sibling fallback. Implement the labels,
+  rerun the navigator checks, and review the small extension before activation.
 
 **Delivery:** After review, activate only the helper with a checked preimage and
 backup, then commit and open a PR. Do not merge without a further instruction.

@@ -20,6 +20,7 @@ import unittest
 SOURCE = Path(__file__).resolve().parents[2]
 HELPER = Path(os.environ.get('DOTFILES_SESSION_NAVIGATOR_HELPER',
                              SOURCE / '.config/tmux/scripts/session-navigator'))
+PROJECT_HELPER = HELPER.resolve().with_name('project-session')
 KEYS = Path(os.environ.get('DOTFILES_SESSION_NAVIGATOR_KEYS', SOURCE / '.config/tmux/conf/keys.conf'))
 TMUX = shutil.which('tmux')
 FZF = shutil.which('fzf')
@@ -159,10 +160,16 @@ class SessionNavigatorTests(unittest.TestCase):
     def picker_calls(self):
         return [json.loads(line) for line in (self.root / 'fzf-calls').read_text().splitlines()]
 
-    def navigate(self, mode='select', target=None, project_ids=None, **extra):
+    def managed_editor_name(self, path):
+        result = subprocess.run([sys.executable, str(PROJECT_HELPER), 'editor-name', str(path)],
+                                env=self.env, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.removesuffix('\n')
+
+    def navigate(self, mode='select', target=None, project_ids=None, helper=HELPER, **extra):
         target = target or self.target
         (self.root / 'fzf-calls').unlink(missing_ok=True)
-        return subprocess.run([str(HELPER), str(self.socket), self.invoker['name']],
+        return subprocess.run([str(helper), str(self.socket), self.invoker['name']],
                               env=dict(self.env, NAV_MODES=json.dumps(mode if isinstance(mode, list) else [mode]),
                                        NAV_SELECTED=target, NAV_PROJECT_IDS=json.dumps(project_ids or [target]),
                                        NAV_CLIENT=self.invoker['name'], **extra),
@@ -209,6 +216,35 @@ class SessionNavigatorTests(unittest.TestCase):
         self.assertEqual({row.split('\t', 1)[0] for row in calls[1]['records']}, set(members))
         self.assertEqual(self.positions(), {self.invoker['name']: members[-1],
                                            self.other['name']: self.second})
+
+    def test_friendly_labels_identify_only_the_exact_managed_editor_without_renaming(self):
+        path = self.root / 'friendly-project'
+        path.mkdir()
+        names = ('my-shell', self.managed_editor_name(path), 'nvim-custom', 'extra-terminal')
+        members = [self.session(name, path) for name in names]
+        self.assertEqual(self.command('show-options', '-qv', '-t', members[1], '@dotfiles_project_role'), '')
+        before = self.command('list-sessions', '-F', '#{session_id}\t#{session_name}')
+        result = self.navigate(target=members[1], project_ids=members)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        labels = dict(row.split('\t', 1) for row in self.picker_calls()[1]['records'])
+        self.assertEqual(labels, {members[0]: 'Terminal · my-shell', members[1]: 'Editor · Neovim',
+                                  members[2]: 'Terminal · nvim-custom', members[3]: 'Terminal · extra-terminal'})
+        self.assertEqual(self.positions(), {self.invoker['name']: members[1], self.other['name']: self.second})
+        self.assertEqual(self.command('list-sessions', '-F', '#{session_id}\t#{session_name}'), before)
+
+    def test_missing_project_helper_keeps_sessions_accessible_with_terminal_labels(self):
+        standalone = self.root / 'standalone' / 'session-navigator'
+        standalone.parent.mkdir()
+        shutil.copy2(HELPER, standalone)
+        path = self.root / 'fallback-project'
+        path.mkdir()
+        editor_name = self.managed_editor_name(path)
+        members = [self.session(name, path) for name in ('shell', editor_name)]
+        result = self.navigate(target=members[1], project_ids=members, helper=standalone)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        labels = dict(row.split('\t', 1) for row in self.picker_calls()[1]['records'])
+        self.assertEqual(labels, {members[0]: 'Terminal · shell', members[1]: 'Terminal · ' + editor_name})
+        self.assertEqual(self.positions(), {self.invoker['name']: members[1], self.other['name']: self.second})
 
     def test_distinct_directories_with_the_same_basename_stay_separate(self):
         paths = [self.root / side / 'project' for side in ('left', 'right')]
@@ -343,6 +379,7 @@ class SessionNavigatorTests(unittest.TestCase):
         scripts = self.home / '.config/tmux/scripts'
         scripts.mkdir(parents=True)
         shutil.copy2(HELPER, scripts / 'session-navigator')
+        shutil.copy2(PROJECT_HELPER, scripts / 'project-session')
         installed_keys = scripts.parent / 'keys.conf'
         shutil.copy2(KEYS, installed_keys)
         self.command('source-file', str(installed_keys))
@@ -350,8 +387,8 @@ class SessionNavigatorTests(unittest.TestCase):
         self.command('set-option', '-g', 'prefix2', 'None')
         path = self.root / "path-only-search-token-λ ' quoted"
         path.mkdir()
-        target = self.session("popup-λ ' quoted", path)
-        peer = self.session('project-shell', path)
+        target = self.session(self.managed_editor_name(path), path)
+        peer = self.session('console-shell', path)
         ready = self.root / 'real-fzf-ready'
         finished = self.root / 'real-fzf-finished'
         searched = self.root / 'real-fzf-searched'
@@ -397,7 +434,7 @@ class SessionNavigatorTests(unittest.TestCase):
 
         popup()
         choose_project()
-        os.write(self.invoker['master'], b'popup')
+        os.write(self.invoker['master'], b'Neovim')
         self.wait(lambda: searched.exists() and searched.read_text() == target)
         os.write(self.invoker['master'], b'\r')
         self.wait(closed)
