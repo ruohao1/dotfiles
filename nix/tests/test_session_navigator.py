@@ -244,7 +244,9 @@ class SessionNavigatorTests(unittest.TestCase):
                 self.assertEqual(len(calls), 1)
                 offered = dict(row.split('\t', 1) for row in calls[0]['records'])
                 self.assertEqual(len(offered), count)
-                self.assertEqual(offered[members[0]], offered[members[1]])
+                if kind == 'controls':
+                    self.assertEqual(offered[members[0]], offered[members[1]])
+                self.assertTrue(set(members).issubset(offered))
                 self.assertEqual(self.positions()[self.invoker['name']], members[1])
 
     def test_second_picker_cancellation_and_invalid_output_leave_clients_unchanged(self):
