@@ -63,7 +63,8 @@ the session's starting directory. Changing directory in a pane does not change
 that label.
 The selected window has a subtle dark background and bold text.
 A zoomed window puts its index in a rounded gray badge using the configured
-Nerd Font. An unzoomed window uses plain text: `1 nvim`. `•` marks background output and `!`
+Nerd Font. Its ends use the existing spaces beside the index, so zooming keeps
+the tab width and name position fixed. `•` marks background output and `!`
 marks a terminal bell. These markers do not report task success or failure.
 Neovim shows `[+]` for unsaved changes. Narrow terminals shorten optional text
 and hide the clock while retaining mode and window navigation.

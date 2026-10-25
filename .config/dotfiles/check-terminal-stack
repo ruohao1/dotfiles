@@ -10513,8 +10513,8 @@ if [ "$tmux_started" = true ]; then
     'fg=#f7768e,bg=#1A1B26' \
     "tmux bell marker uses the exact red style" || true
 
-  task6_expected_window_status_format='#[fg=#787c99,bg=#1A1B26] #{?window_zoomed_flag,#[fg=#787c99#,bg=#1A1B26]#[fg=#1A1B26#,bg=#787c99]#{window_index}#[fg=#787c99#,bg=#1A1B26],#{window_index}} #{?#{e|>=:#{client_width},120},#{=12:#{qh:window_name}},#{?#{e|>=:#{client_width},100},#{=10:#{qh:window_name}},#{=5:#{qh:window_name}}}}#{?window_activity_flag,#[fg=#7dcfff#,bg=#1A1B26]•#[fg=#787c99#,bg=#1A1B26],}#{?window_bell_flag,#[fg=#f7768e#,bg=#1A1B26]!#[fg=#787c99#,bg=#1A1B26],} #[default]'
-  task6_expected_window_status_current_format='#[fg=#a9b1d6,bg=#2A2F41,bold] #{?window_zoomed_flag,#[fg=#787c99#,bg=#2A2F41]#[fg=#1A1B26#,bg=#787c99]#{window_index}#[fg=#787c99#,bg=#2A2F41]#[fg=#a9b1d6#,bg=#2A2F41#,bold],#{window_index}} #{?#{e|>=:#{client_width},120},#{=12:#{qh:window_name}},#{?#{e|>=:#{client_width},100},#{=10:#{qh:window_name}},#{=5:#{qh:window_name}}}}#{?window_activity_flag,#[fg=#a9b1d6#,bg=#2A2F41#,bold]•#[fg=#a9b1d6#,bg=#2A2F41#,bold],}#{?window_bell_flag,#[fg=#a9b1d6#,bg=#2A2F41#,bold]!#[fg=#a9b1d6#,bg=#2A2F41#,bold],} #[default]'
+  task6_expected_window_status_format='#[fg=#787c99,bg=#1A1B26]#{?window_zoomed_flag,#[fg=#787c99#,bg=#1A1B26]#[fg=#1A1B26#,bg=#787c99]#{window_index}#[fg=#787c99#,bg=#1A1B26], #{window_index} }#{?#{e|>=:#{client_width},120},#{=12:#{qh:window_name}},#{?#{e|>=:#{client_width},100},#{=10:#{qh:window_name}},#{=5:#{qh:window_name}}}}#{?window_activity_flag,#[fg=#7dcfff#,bg=#1A1B26]•#[fg=#787c99#,bg=#1A1B26],}#{?window_bell_flag,#[fg=#f7768e#,bg=#1A1B26]!#[fg=#787c99#,bg=#1A1B26],} #[default]'
+  task6_expected_window_status_current_format='#[fg=#a9b1d6,bg=#2A2F41,bold]#{?window_zoomed_flag,#[fg=#787c99#,bg=#2A2F41]#[fg=#1A1B26#,bg=#787c99]#{window_index}#[fg=#787c99#,bg=#2A2F41]#[fg=#a9b1d6#,bg=#2A2F41#,bold], #{window_index} }#{?#{e|>=:#{client_width},120},#{=12:#{qh:window_name}},#{?#{e|>=:#{client_width},100},#{=10:#{qh:window_name}},#{=5:#{qh:window_name}}}}#{?window_activity_flag,#[fg=#a9b1d6#,bg=#2A2F41#,bold]•#[fg=#a9b1d6#,bg=#2A2F41#,bold],}#{?window_bell_flag,#[fg=#a9b1d6#,bg=#2A2F41#,bold]!#[fg=#a9b1d6#,bg=#2A2F41#,bold],} #[default]'
   require_tmux_option_value "$check_socket" session window-status-format \
     "$task6_expected_window_status_format" \
     "tmux inactive window format is exact" || true
@@ -14317,7 +14317,7 @@ if [ "$task10_native_ready" = true ]; then
     zoom_windows=$(capture_field \
       "$check_tmp/status-zoom-marker.txt" windows || true)
     require_text_contains "$zoom_windows" \
-      "#[fg=#787c99,bg=#1A1B26]#[fg=#1A1B26,bg=#787c99]$alert_index#[fg=#787c99,bg=#1A1B26] alert" \
+      "#[fg=#787c99,bg=#1A1B26]#[fg=#1A1B26,bg=#787c99]$alert_index#[fg=#787c99,bg=#1A1B26]alert" \
       "inactive zoomed window rounds its numeric index badge" || task10_native_ready=false
   else
     fail "inactive zoom marker status capture failed"
