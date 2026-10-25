@@ -17,14 +17,23 @@ from migration.plan import inspect
 class Runtime:
     def __init__(self, home, manifest):
         self.home, self.manifest = home, manifest
+        self.manifests = {manifest['activationPackage']: manifest}
         self.calls = []
 
     def retain(self, generation, destination):
         Path(destination).symlink_to(generation)
 
     def activate(self, generation):
+        self.manifests[self.manifest['activationPackage']] = self.manifest
+        manifest = self.manifests.setdefault(generation, self.manifest)
+        previous = self.manifests[self.calls[-1]] if self.calls else {'files': []}
+        targets = {entry['target'] for entry in manifest['files']}
+        for entry in previous['files']:
+            target = self.home / entry['target']
+            if entry['target'] not in targets and target.is_symlink() and target.resolve() == Path(entry['source']).resolve():
+                target.unlink()
         self.calls.append(generation)
-        for entry in self.manifest['files']:
+        for entry in manifest['files']:
             target = self.home / entry['target']
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.is_symlink():
@@ -32,8 +41,8 @@ class Runtime:
             target.symlink_to(entry['source'])
 
     def verify(self, manifest):
-        for entry in manifest['files']:
-            assert (self.home / entry['target']).resolve() == Path(entry['source']).resolve()
+        from migration.transaction import verify_deployed_files
+        verify_deployed_files(manifest, self.home)
 
     def selected_generation(self, manifest):
         return self.calls[-1] if self.calls else None
@@ -80,6 +89,30 @@ class TransactionTests(unittest.TestCase):
     def module(self):
         self.assertTrue((ROOT / 'nix/migration/transaction.py').exists(), 'transaction implementation missing')
         return importlib.import_module('migration.transaction')
+
+    def added_generation(self, digit='1', target='.config/nvim/added.lua'):
+        generation = '/nix/store/' + digit * 32 + '-added-generation'
+        source = self.root / ('added-source-' + digit)
+        source.write_text('return "added ' + digit + '"\n')
+        real_generation = self.root / ('added-generation-' + digit)
+        real_generation.mkdir()
+        from migration import plan as inspection
+        previous = inspection.fingerprint
+        patch.object(inspection, 'fingerprint', side_effect=lambda path:
+                     previous(real_generation if str(path) == generation else path)).start()
+        manifest = dict(self.manifest, activationPackage=generation, files=self.manifest['files'] + [
+            dict(target=target, source=str(source), executable=False)])
+        self.runtime.manifests[generation] = manifest
+        return manifest, self.home / target
+
+    def apply_added_generation(self):
+        module = self.module()
+        module.apply(self.plan, self.manifest, runtime=self.runtime)
+        manifest, added = self.added_generation()
+        plan = inspect(manifest, self.home)
+        self.assertEqual(plan['conflicts'], [])
+        module.apply(plan, manifest, runtime=self.runtime)
+        return plan, manifest, added
 
     def test_apply_and_repeat_preserve_legacy_original_and_release_owner_last(self):
         module = self.module()
@@ -858,16 +891,251 @@ class TransactionTests(unittest.TestCase):
             with self.subTest(modern=modern, payload=payload), self.assertRaises(Conflict):
                 module.profile_entries(payload, modern)
 
-    def test_new_generation_target_set_changes_require_explicit_reversal(self):
+    def test_managed_target_removal_and_rename_require_explicit_reversal(self):
         module = self.module()
         module.apply(self.plan, self.manifest, runtime=self.runtime)
-        for files in [[], self.manifest['files'] + [dict(target='.config/extra', source=str(self.source), executable=False)]]:
+        for files in [[], [dict(self.manifest['files'][0], target='.config/renamed')]]:
             changed = dict(self.manifest, files=files)
             plan = inspect(changed, self.home)
             self.assertIn('changed-managed-targets', [item['code'] for item in plan['conflicts']])
             with self.assertRaises(Conflict):
                 module.apply(plan, changed, runtime=self.runtime)
             self.assertEqual(len(self.runtime.calls), 1)
+
+    def test_managed_service_target_additions_require_explicit_reversal(self):
+        module = self.module()
+        module.apply(self.plan, self.manifest, runtime=self.runtime)
+        manifest, added = self.added_generation(target='.config/systemd/user/added.service')
+        Path(manifest['files'][-1]['source']).write_text('[Service]\nExecStart=/bin/true\n')
+        manifest['services'] = [dict(manager='systemd', name='added.service', kind='service',
+                                     files=[manifest['files'][-1]])]
+        manifest['serviceManagerEffects'] = [dict(manager='systemd', systemctlPath='/bin/true')]
+        def query(command, home):
+            return dict(command=command, status=0, stderr='',
+                        stdout='LoadState=not-found\nActiveState=inactive\nUnitFileState=disabled\n')
+        with patch('migration.plan.query', side_effect=query):
+            plan = inspect(manifest, self.home)
+            self.assertTrue(any(item['path'] == str(self.home) for item in plan['conflicts']))
+            with self.assertRaises(Conflict):
+                module.apply(plan, manifest, runtime=self.runtime)
+        self.assertFalse(added.exists() or added.is_symlink())
+        self.assertEqual(self.runtime.calls, [str(self.generation)])
+
+    def test_raw_service_file_additions_require_explicit_reversal(self):
+        module = self.module()
+        for target in ['.config/systemd/user/extra.service',
+                       '.config/systemd/user/tmux.service.d/extra.conf',
+                       '.config/systemd/user/default.target.wants/extra.service',
+                       'Library/LaunchAgents/extra.plist']:
+            with self.subTest(target=target):
+                self.setUp()
+                module.apply(self.plan, self.manifest, runtime=self.runtime)
+                manifest, added = self.added_generation(target=target)
+                self.assertEqual(manifest['services'], [])
+                plan = inspect(manifest, self.home)
+                self.assertTrue(any(item['path'] == str(added) for item in plan['conflicts']))
+                with self.assertRaises(Conflict):
+                    module.apply(plan, manifest, runtime=self.runtime)
+                self.assertFalse(added.exists() or added.is_symlink())
+                self.assertEqual(self.runtime.calls, [str(self.generation)])
+
+    def test_added_leaf_apply_rollback_reselect_and_reversal_preserve_local_state(self):
+        module = self.module()
+        local = self.home / '.config/nvim/local.lua'
+        local.parent.mkdir()
+        local.write_text('local extension\n')
+        seed = local.with_name('lazy-lock.json')
+        seed.write_text('user lock versions\n')
+        self.manifest['mutableSeeds'] = [dict(target=str(seed.relative_to(self.home)), source=str(self.source))]
+        self.plan = inspect(self.manifest, self.home)
+        plan, manifest, added = self.apply_added_generation()
+        record = next(item for item in module.Journal(self.home, plan['transactionId']).data['records'] if item['path'] == str(added))
+        self.assertEqual(record['state'], {'type': 'absent'})
+        self.assertTrue(added.is_symlink())
+        module.apply(plan, manifest, runtime=self.runtime)
+        self.assertEqual(len(self.runtime.calls), 2)
+        module.rollback(self.home, str(self.generation), runtime=self.runtime)
+        self.assertFalse(added.exists() or added.is_symlink())
+        module.rollback(self.home, manifest['activationPackage'], runtime=self.runtime)
+        self.assertTrue(added.is_symlink())
+        module.restore_legacy(self.home, plan['transactionId'], runtime=self.runtime)
+        self.assertIsNone(read_owner(self.home))
+        self.assertFalse(added.exists() or added.is_symlink())
+        self.assertEqual(self.target.read_bytes(), self.source.read_bytes())
+        self.assertFalse(self.target.is_symlink())
+        self.assertEqual(seed.read_text(), 'user lock versions\n')
+        self.assertEqual(local.read_text(), 'local extension\n')
+
+    def test_managed_additions_refuse_every_occupied_leaf(self):
+        module = self.module()
+        for kind in ['identical', 'different', 'symlink', 'directory']:
+            with self.subTest(kind=kind):
+                self.setUp()
+                module.apply(self.plan, self.manifest, runtime=self.runtime)
+                manifest, added = self.added_generation()
+                added.parent.mkdir()
+                source = Path(manifest['files'][-1]['source'])
+                if kind == 'symlink': added.symlink_to(source)
+                elif kind == 'directory': added.mkdir()
+                else: added.write_text(source.read_text() if kind == 'identical' else 'local contents')
+                before = module.leaf_state(added)
+                plan = inspect(manifest, self.home)
+                self.assertTrue(any(item['path'] == str(added) for item in plan['conflicts']))
+                self.assertEqual(plan['files'][-1]['action'], 'preserve')
+                with self.assertRaises(Conflict):
+                    module.apply(plan, manifest, runtime=self.runtime)
+                self.assertEqual(module.leaf_state(added), before)
+                self.assertEqual(len(self.runtime.calls), 1)
+
+    def test_managed_addition_rejects_stale_preview_and_prior_mutable_seed(self):
+        module = self.module()
+        for kind in ['stale-preview', 'prior-seed']:
+            with self.subTest(kind=kind):
+                self.setUp()
+                target = '.config/nvim/lazy-lock.json' if kind == 'prior-seed' else '.config/nvim/added.lua'
+                if kind == 'prior-seed':
+                    self.manifest['mutableSeeds'] = [dict(target=target, source=str(self.source))]
+                    self.plan = inspect(self.manifest, self.home)
+                module.apply(self.plan, self.manifest, runtime=self.runtime)
+                manifest, added = self.added_generation(target=target)
+                manifest['mutableSeeds'] = []
+                plan = inspect(manifest, self.home)
+                if kind == 'stale-preview':
+                    self.assertEqual(plan['conflicts'], [])
+                    added.parent.mkdir()
+                    added.write_text('appeared after preview')
+                else:
+                    self.assertTrue(any(item['path'] == str(added) for item in plan['conflicts']))
+                with self.assertRaises(Conflict):
+                    module.apply(plan, manifest, runtime=self.runtime)
+                self.assertEqual(len(self.runtime.calls), 1)
+                if kind == 'stale-preview': self.assertEqual(added.read_text(), 'appeared after preview')
+
+    def test_added_leaf_apply_retry_and_reversal_preserve_later_edit(self):
+        module = self.module()
+        for edited in [False, True]:
+            with self.subTest(edited=edited):
+                self.setUp()
+                module.apply(self.plan, self.manifest, runtime=self.runtime)
+                manifest, added = self.added_generation()
+                plan = inspect(manifest, self.home)
+                self.assertEqual(plan['conflicts'], [])
+                activate = self.runtime.activate
+                def interrupted(generation):
+                    activate(generation)
+                    raise InterruptedError('after installing added leaf')
+                with patch.object(self.runtime, 'activate', side_effect=interrupted), self.assertRaises(InterruptedError):
+                    module.apply(plan, manifest, runtime=self.runtime)
+                if edited:
+                    added.unlink()
+                    added.write_text('later local edit')
+                    with self.assertRaises(Conflict):
+                        module.apply(plan, manifest, runtime=self.runtime)
+                    module.restore_legacy(self.home, plan['transactionId'], runtime=self.runtime)
+                    retained = Path(plan['journalPath']) / 'post-migration' / added.relative_to(self.home)
+                    self.assertEqual(retained.read_text(), 'later local edit')
+                    self.assertFalse(added.exists())
+                else:
+                    module.apply(plan, manifest, runtime=self.runtime)
+                    self.assertEqual(read_owner(self.home)['phase'], 'home-manager')
+                    self.assertTrue(added.is_symlink())
+
+    def test_added_leaf_rollback_retry_rechecks_removed_leaf_and_publication(self):
+        module = self.module()
+        for boundary in ['activate', 'publish']:
+            for edited in [False, True]:
+                with self.subTest(boundary=boundary, edited=edited):
+                    self.setUp()
+                    _, _, added = self.apply_added_generation()
+                    activate, owner = self.runtime.activate, module.Journal.owner
+                    def interrupted(generation):
+                        activate(generation)
+                        raise InterruptedError('after removing added leaf')
+                    def publish(journal, phase, generation=None):
+                        if phase == 'home-manager': raise InterruptedError('before rollback publication')
+                        return owner(journal, phase, generation)
+                    context = patch.object(self.runtime, 'activate', side_effect=interrupted) if boundary == 'activate' else patch.object(module.Journal, 'owner', new=publish)
+                    with context, self.assertRaises(InterruptedError):
+                        module.rollback(self.home, str(self.generation), runtime=self.runtime)
+                    self.assertFalse(added.exists())
+                    calls = len(self.runtime.calls)
+                    if edited:
+                        added.write_text('created during rollback interruption')
+                        with self.assertRaises(Conflict):
+                            module.rollback(self.home, str(self.generation), runtime=self.runtime)
+                        self.assertEqual(added.read_text(), 'created during rollback interruption')
+                        self.assertEqual(len(self.runtime.calls), calls)
+                        self.assertEqual(read_owner(self.home)['phase'], 'transferring')
+                    else:
+                        module.rollback(self.home, str(self.generation), runtime=self.runtime)
+                        self.assertFalse(added.exists())
+                        self.assertEqual(read_owner(self.home)['selectedGeneration'], str(self.generation))
+
+    def test_added_leaf_reselection_refuses_local_collision_even_with_identical_bytes(self):
+        module = self.module()
+        for kind in ['identical', 'symlink']:
+            with self.subTest(kind=kind):
+                self.setUp()
+                _, manifest, added = self.apply_added_generation()
+                module.rollback(self.home, str(self.generation), runtime=self.runtime)
+                source = Path(manifest['files'][-1]['source'])
+                if kind == 'identical': added.write_bytes(source.read_bytes())
+                else: added.symlink_to(source)
+                before, calls = module.leaf_state(added), len(self.runtime.calls)
+                with self.assertRaises(Conflict):
+                    module.rollback(self.home, manifest['activationPackage'], runtime=self.runtime)
+                self.assertEqual(module.leaf_state(added), before)
+                self.assertEqual(len(self.runtime.calls), calls)
+
+    def test_added_leaf_rollback_requires_obsolete_leaf_absence_after_activation(self):
+        module = self.module()
+        _, _, added = self.apply_added_generation()
+        source = added.resolve()
+        activate = self.runtime.activate
+        def leaves_obsolete(generation):
+            activate(generation)
+            added.symlink_to(source)
+        with patch.object(self.runtime, 'activate', side_effect=leaves_obsolete), self.assertRaises(Conflict):
+            module.rollback(self.home, str(self.generation), runtime=self.runtime)
+        self.assertEqual(read_owner(self.home)['phase'], 'transferring')
+        added.unlink()
+        module.rollback(self.home, str(self.generation), runtime=self.runtime)
+        self.assertFalse(added.exists())
+
+    def test_historical_additions_survive_branching_retained_generations(self):
+        module = self.module()
+        _, second, added_b = self.apply_added_generation()
+        module.rollback(self.home, str(self.generation), runtime=self.runtime)
+        third, added_c = self.added_generation('2', '.config/nvim/other.lua')
+        plan = inspect(third, self.home)
+        self.assertEqual(plan['conflicts'], [])
+        module.apply(plan, third, runtime=self.runtime)
+        self.assertFalse(added_b.exists())
+        self.assertTrue(added_c.is_symlink())
+        module.rollback(self.home, second['activationPackage'], runtime=self.runtime)
+        self.assertTrue(added_b.is_symlink())
+        self.assertFalse(added_c.exists())
+        module.restore_legacy(self.home, plan['transactionId'], runtime=self.runtime)
+        self.assertFalse(added_b.exists() or added_c.exists())
+        self.assertIsNone(read_owner(self.home))
+
+    def test_inactive_historical_targets_guard_later_addition_previews(self):
+        module = self.module()
+        for kind in ['occupied', 'ancestor-overlap']:
+            with self.subTest(kind=kind):
+                self.setUp()
+                _, _, added = self.apply_added_generation()
+                module.rollback(self.home, str(self.generation), runtime=self.runtime)
+                target = str(added.relative_to(self.home)) + '/nested' if kind == 'ancestor-overlap' else '.config/nvim/other.lua'
+                manifest, candidate = self.added_generation('2', target)
+                if kind == 'occupied': added.write_text('later local file')
+                plan = inspect(manifest, self.home)
+                self.assertTrue(any(item['path'] in [str(added), str(candidate)] for item in plan['conflicts']))
+                calls = len(self.runtime.calls)
+                with self.assertRaises(Conflict):
+                    module.apply(plan, manifest, runtime=self.runtime)
+                self.assertEqual(len(self.runtime.calls), calls)
+                if kind == 'occupied': self.assertEqual(added.read_text(), 'later local file')
 
     def test_competing_dead_lock_reclaimers_never_enter_two_protected_regions(self):
         import subprocess
