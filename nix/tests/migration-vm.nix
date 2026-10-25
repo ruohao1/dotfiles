@@ -43,7 +43,9 @@ let
   };
   releaseSources = lib.mapAttrs (_: record: pkgs.writeTextDir "dotfiles-release.json" (builtins.toJSON record)) releaseRecords;
   releaseHome = name: factory: factory (identity // {
-    modules = [ common ];
+    modules = [ common ] ++ lib.optional (name == "releaseB") {
+      home.file.".config/dotfiles/release-added.conf".text = "release B managed configuration\n";
+    };
     deploymentIdentity = { schema = 1; release = releaseRecords.${name}; consumerSource = toString releaseSources.${name}; profile = "fixture-host"; };
   });
   releaseA = releaseHome "releaseA" releaseLibA.mkHome;

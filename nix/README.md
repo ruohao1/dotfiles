@@ -546,7 +546,22 @@ Keep candidate roots, journals and backups until you have separately reviewed
 their retention. The updater performs no cleanup. Start updates from a shell
 using the current canonical `$HOME/.nix-profile/bin`: an old direct store PATH or
 foreign shadow is still refused. Releases that change the managed target set
-require explicit legacy restoration/re-adoption; v1 does not automate that change.
+can add files when each new target is absent. An existing file, directory or
+symlink at a new target is a conflict, even when its contents match the release.
+Resolve the conflict and create a new preview before applying the update.
+Removing or renaming managed targets, or changing service targets, still requires
+explicit legacy restoration and re-adoption. Updates also refuse to replace a
+managed leaf with a parent or child path, or to convert an existing mutable seed
+into a managed file.
+
+Rollback removes files introduced by a newer generation after checking that they
+still match their reviewed managed state. Selecting that retained newer generation
+again requires those added targets to be absent. All retained managed paths stay
+reserved until `restore-legacy`; paths outside the selected generation must remain
+absent, including before another update. Modified or occupied targets stop the
+operation. If activation leaves an obsolete file behind, ownership stays pending
+for explicit recovery. Writable seeds such as `lazy-lock.json` remain user-owned
+and are preserved across updates and rollback.
 
 ## Manual release runbook
 

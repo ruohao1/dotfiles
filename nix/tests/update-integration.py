@@ -21,6 +21,8 @@ from update import deployment, releases, state
 home = Path(os.environ['HOME'])
 assert home == Path('/home/migrator') and os.getuid() == 1000
 profiles = json.loads(Path(fixture['profiles']).read_text())
+added_target = home / '.config/dotfiles/release-added.conf'
+added_contents = 'release B managed configuration\n'
 review_root = Path('/var/tmp/isq318-reviews/release-update')
 review_root.mkdir(mode=0o700)
 root = state.open_state(home, create=True)
@@ -72,6 +74,10 @@ def observe(name, label):
     assert installed['state'] == 'installed', installed
     assert installed['release'] == expected['deploymentIdentity']['release'], installed
     assert installed['generation'] == expected['activationPackage'], installed
+    if name == 'releaseB':
+        assert added_target.is_symlink() and added_target.read_text() == added_contents
+    else:
+        assert not os.path.lexists(added_target), 'newer-only managed file survived rollback'
     selected = shutil.which('uv')
     assert selected == str(home / '.nix-profile/bin/uv'), selected
     requirement = next(item for item in expected['commandRequirements'] if item['command'] == 'uv')
@@ -82,7 +88,8 @@ def observe(name, label):
     assert native and all(item['status'] == 'observed' for item in native), native
     packages = Runtime(home).profile_packages(home / '.nix-profile')
     assert [item['paths'] for item in native_entries(packages)] == [[fixture['nativePackage']]], packages
-    value = {'installed': installed, 'uv': {'selected': selected, 'resolved': str(Path(selected).resolve()),
+    value = {'installed': installed, 'addedFile': fingerprint(added_target),
+             'uv': {'selected': selected, 'resolved': str(Path(selected).resolve()),
              'version': version}, 'native': native, 'packages': packages}
     state.write_json(review_root / (label + '.json'), value)
     return value
@@ -118,7 +125,23 @@ execute('releaseA', 'plan', '--profile', 'fixture-host', '--output', str(adoptio
 execute('releaseA', 'apply', '--plan', str(adoption))
 before = observe('releaseA', 'release-a')
 native_before = native_snapshot()
+mutable_lock = home / '.config/nvim/lazy-lock.json'
+mutable_lock.write_text('{"release-update-fixture": true}\n')
+mutable_before = fingerprint(mutable_lock)
 release_b = manifest('releaseB')['deploymentIdentity']['release']
+# A new managed target must be absent, even when an existing file has identical bytes.
+added_target.write_text(added_contents)
+occupied_before = fingerprint(added_target)
+occupied_plan = review_root / 'occupied-addition.json'
+execute('releaseB', 'plan', '--profile', 'fixture-host', '--output', str(occupied_plan))
+occupied = state.read_json(occupied_plan, limit=state.MAX_PLAN_BYTES)
+assert any(item['path'] == str(added_target) for item in occupied['conflicts']), occupied['conflicts']
+refused = subprocess.run([fixture['executors']['releaseB'], 'apply', '--plan', str(occupied_plan)],
+                         capture_output=True, text=True)
+assert refused.returncode == 1, refused
+assert fingerprint(added_target) == occupied_before
+assert deployment.read_installed(home) == before['installed']
+added_target.unlink()
 # An old direct-store PATH still refuses the upgrade; only the owned profile
 # route may authorize the provider transition.
 shadow_plan = review_root / 'direct-store-shadow.json'
@@ -152,6 +175,7 @@ assert pending['state'] == 'pending' and pending['release'] is None, pending
 interrupted = Journal(home, pending['transactionId']).data
 assert interrupted['steps']['stop-services'] == 'intent', interrupted['steps']
 assert not any(name == 'activate' or name.startswith('archive-') for name in interrupted['steps'])
+assert not os.path.lexists(added_target)
 stopped = subprocess.run(['systemctl', '--user', 'is-active', 'tmux-workspace.service'],
                          capture_output=True, text=True)
 assert stopped.returncode == 3 and stopped.stdout.strip() in ('inactive', 'failed'), stopped
@@ -162,6 +186,7 @@ failure_marker.unlink()
 deployment._execute(retained, ['apply', '--plan', retained['planPath']])
 after = observe('releaseB', 'release-b')
 assert native_snapshot() == native_before, 'update mutated a retained external native runtime'
+assert fingerprint(mutable_lock) == mutable_before, 'update changed the writable lock seed'
 retained = deployment.recovery(root, after['installed']['transactionId'])
 plan = state.read_json(retained['planPath'], limit=state.MAX_PLAN_BYTES)
 transition = next(item for item in plan['providerTransitions'] if item['command'] == 'uv')
@@ -176,10 +201,27 @@ assert hashlib.sha256((json.dumps(plan, sort_keys=True, indent=2) + '\n').encode
 # PATH. This exercises post-activation native/provider transition reconciliation.
 deployment._execute(retained, ['apply', '--plan', retained['planPath']])
 assert native_snapshot() == native_before
+assert fingerprint(added_target) == after['addedFile']
 with state.lock(root, blocking=True), patch('sys.stdin', io.StringIO('yes\n')):
     assert deployment.rollback(root, profiles['releaseA']['generation']) == 0
 rolled_back = observe('releaseA', 'rolled-back-a')
 assert native_snapshot() == native_before, 'rollback mutated a retained external native runtime'
+assert fingerprint(mutable_lock) == mutable_before, 'rollback changed the writable lock seed'
+# Retained roll-forward must check the newly claimed path again before activation.
+added_target.write_text(added_contents)
+occupied_before = fingerprint(added_target)
+with state.lock(root, blocking=True), patch('sys.stdin', io.StringIO('yes\n')):
+    try:
+        deployment.rollback(root, profiles['releaseB']['generation'])
+    except Conflict:
+        pass
+    else:
+        raise AssertionError('retained roll-forward accepted an occupied new target')
+assert fingerprint(added_target) == occupied_before
+assert deployment.read_installed(home) == rolled_back['installed']
+added_target.unlink()
+assert fingerprint(mutable_lock) == mutable_before
+assert native_snapshot() == native_before
 assert git(original, 'rev-parse', 'HEAD') == original_commit
 assert git(original, 'status', '--porcelain=v1') == ''
 assert original_files == {name: (original / name).read_bytes() for name in original_files}
@@ -191,5 +233,7 @@ state.write_json(review_root / 'summary.json', {
     'interruptedInstall': pending, 'recoveredWithoutNewPreview': True,
     'retainedPlan': retained['planPath'], 'retainedExecutor': retained['executor'],
     'providerTransition': transition,
+    'addedFile': str(added_target), 'occupiedAdditionRefused': True,
+    'retainedRollForwardRechecked': True, 'mutableSeedUnchanged': True,
 })
-print('Actual release A -> B -> rollback A, changed uv and retained native runtimes verified.')
+print('Actual release A -> B -> A, added-file conflicts/removal and retained mutable/native state verified.')

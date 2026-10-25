@@ -65,9 +65,10 @@ It requires tmux 3.2+, Python 3.9+, and fzf (included by both installation paths
 The picker uses its own fzf options; global fzf option overrides do not apply.
 
 The helper is included automatically in fresh native and Nix installations.
-Existing Nix-managed installations need the [documented restoration/re-adoption
-procedure](../../nix/README.md#confirmed-release-updates) when adopting this new managed file; the current
-updater does not handle changes to the managed target list.
+Existing Nix-managed installations can receive this helper through a
+[confirmed release update](../../nix/README.md#confirmed-release-updates).
+Its new target path must be absent; an existing file or symlink causes a conflict
+and is preserved. Rollback removes the newly managed helper.
 
 ## Shared status bar
 

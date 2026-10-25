@@ -115,6 +115,27 @@ class MigrationPlanTests(unittest.TestCase):
         result = self.inspect()
         self.assertTrue({'home-mismatch', 'system-mismatch', 'unsafe-parent'} <= self.codes(result))
 
+    def test_writable_or_foreign_owned_parent_conflicts_during_preview(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        parent = self.target().parent
+        parent.chmod(0o777)
+        result = self.inspect()
+        self.assertTrue(any(item['code'] == 'unsafe-parent' and item['path'] == str(parent)
+                            for item in result['conflicts']))
+        parent.chmod(0o700)
+        original = Path.lstat
+        def foreign_owner(path):
+            result = original(path)
+            if path == parent:
+                return SimpleNamespace(st_mode=result.st_mode, st_uid=os.getuid() + 1,
+                                       st_gid=result.st_gid)
+            return result
+        with patch.object(Path, 'lstat', new=foreign_owner):
+            result = self.inspect()
+        self.assertTrue(any(item['code'] == 'unsafe-parent' and item['path'] == str(parent)
+                            for item in result['conflicts']))
+
     def test_mutable_seeds_preserved_and_linux_service_leaves_normalized(self):
         self.manifest['mutableSeeds'] = [{'target': 'lazy-lock.json', 'source': str(self.source)}]
         (self.home / 'lazy-lock.json').write_text('user locks')

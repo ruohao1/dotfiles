@@ -74,12 +74,18 @@ def leaf_state(path):
     return state
 
 
-def verify_deployed_files(manifest, home, *, allow_absent=False, alternatives=()):
+def verify_deployed_files(manifest, home, *, allow_absent=False, alternatives=(), retained=()):
     choices = [{item['target']: item for item in normalized_files(other)} for other in [manifest, *alternatives]]
-    for target in sorted(set().union(*(choice.keys() for choice in choices))):
+    targets = set().union(*(choice.keys() for choice in choices))
+    inactive = {item['target'] for other in retained for item in normalized_files(other)} - targets
+    for target in sorted(targets | inactive):
         path = home / target
         check_profile_parents(path, home)
         actual = fingerprint(path)
+        if target in inactive:
+            if actual['type'] != 'absent':
+                raise Conflict('inactive managed file must be absent: ' + str(path))
+            continue
         if allow_absent and actual['type'] == 'absent':
             continue
         def matches(item):
@@ -358,7 +364,7 @@ def validate_activation_inputs(journal, runtime):
     home, manifest = journal.home, journal.data['manifest']
     for item in normalized_files(manifest):
         directory((home / item['target']).parent, home)
-    verify_deployed_files(manifest, home, allow_absent=True)
+    verify_deployed_files(manifest, home, allow_absent=True, retained=journal.data['generations'].values())
     validate_profile_inputs(journal, runtime, journal.data['generations'], allow_missing=True)
 
 
@@ -542,6 +548,7 @@ def verify_resumed_native(journal, lock, runtime):
 
 
 def verify_transaction(journal, manifest, runtime):
+    verify_deployed_files(manifest, journal.home, retained=journal.data['generations'].values())
     runtime.verify(manifest)
     if native_entries(runtime.profile_packages(journal.home / '.nix-profile')) != journal.data['nativePackagesBefore']:
         raise Conflict('native package profile entries changed during activation')
@@ -886,7 +893,8 @@ def rollback(home, generation, *, runtime=None):
         choices = [manifest] if retry else []
         for text in manifest['profilePaths']:
             check_profile_parents(Path(text), home)
-        verify_deployed_files(current, home, allow_absent=retry and prior['state'] == 'intent', alternatives=choices)
+        verify_deployed_files(current, home, allow_absent=retry and prior['state'] == 'intent',
+                              alternatives=choices, retained=journal.data['generations'].values())
         allowed = {source_generation, generation} if retry else {source_generation}
         selected = runtime.selected_generation(current)
         if selected not in allowed and not (retry and prior['state'] == 'intent' and selected is None):

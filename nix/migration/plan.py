@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import uuid
 
-from .model import Conflict, canonical_home, fingerprint, manifest_fingerprint, ownership_root, read_owner
+from .model import Conflict, canonical_home, fingerprint, manifest_fingerprint, ownership_root, read_owner, safe_directory
 
 
 NATIVE_PATH_COMMANDS = {'ghostty': 'ghostty', 'linux-bubblewrap': 'bwrap'}
@@ -140,6 +140,12 @@ def inspect(manifest, home, *, transaction_id=None):
                 if state['type'] not in ['directory', 'absent']:
                     conflict('unsafe-parent', parent, 'A deployed leaf would traverse a symlink or non-directory')
                     return False
+                if state['type'] == 'directory':
+                    try:
+                        safe_directory(parent)
+                    except Conflict as error:
+                        conflict('unsafe-parent', parent, str(error))
+                        return False
         return True
 
     if manifest['homeDirectory'] != str(home):
@@ -147,6 +153,9 @@ def inspect(manifest, home, *, transaction_id=None):
     if manifest['system'] != current_system():
         conflict('system-mismatch', home, f"Manifest targets {manifest['system']}; host is {current_system()}")
     previous_files = {}
+    retained_targets, retained_seeds = set(), set()
+    selected_files = normalized_files(manifest)
+    selected_targets = {item['target'] for item in selected_files}
     prior_journal = previous = None
     managed = False
     observe(home)
@@ -166,9 +175,17 @@ def inspect(manifest, home, *, transaction_id=None):
                 prior_journal = Journal(home, owner['transactionId'])
                 previous = prior_journal.data['generations'][owner['selectedGeneration']]
                 previous_files = {item['target']: item for item in normalized_files(previous)}
+                retained_targets = {item['target'] for retained in prior_journal.data['generations'].values()
+                                    for item in normalized_files(retained)}
+                retained_seeds = {relative_target(item['target']) for retained in prior_journal.data['generations'].values()
+                                  for item in retained['mutableSeeds']}
                 managed = True
-                if set(previous_files) != {item['target'] for item in normalized_files(manifest)}:
-                    conflict('changed-managed-targets', home, 'Changing the owned target set requires explicit reversal before migration')
+                if not set(previous_files) <= selected_targets:
+                    conflict('changed-managed-targets', home, 'Removing or renaming owned targets requires explicit reversal before migration')
+                service_targets = [{file['target'] for service in deployment['services'] for file in service['files']}
+                                   for deployment in [previous, manifest]]
+                if service_targets[0] != service_targets[1]:
+                    conflict('changed-managed-services', home, 'Changing service targets requires explicit reversal before migration')
                 observe(prior_journal.path)
             else:
                 conflict('existing-ownership', root / 'owner.json', f"Home ownership phase: {owner['phase']}")
@@ -184,7 +201,12 @@ def inspect(manifest, home, *, transaction_id=None):
     if reservation['type'] != 'absent':
         conflict('transaction-collision', journal, 'Reserved transaction path is occupied; this exact reservation cannot be reused')
 
-    for file in normalized_files(manifest):
+    for name in sorted(retained_targets - selected_targets):
+        target = home / name
+        if parents(target) and observe(target)['type'] != 'absent':
+            conflict('inactive-managed-target', target, 'A retained generation reserves this inactive path; preserve it until explicitly resolved')
+
+    for file in selected_files:
         target = home / file['target']
         safe_parents = parents(target)
         source = observe(file['source'])
@@ -197,9 +219,19 @@ def inspect(manifest, home, *, transaction_id=None):
         if source['type'] not in ['file', 'symlink'] or not source.get('sha256'):
             conflict('missing-source', file['source'], 'Source must resolve to an immutable regular file')
         prior = previous_files.get(file['target'])
+        if any(file['target'] != name and (file['target'].startswith(name + '/') or name.startswith(file['target'] + '/'))
+               for name in retained_targets):
+            conflict('retained-target-overlap', target, 'Managed leaves must not overlap paths reserved by retained generations')
+        if any(file['target'] == name or file['target'].startswith(name + '/') or name.startswith(file['target'] + '/')
+               for name in retained_seeds):
+            conflict('mutable-seed-overlap', target, 'A retained mutable seed must remain user-owned')
+            record['action'] = 'preserve'
         owned = prior is not None and ((destination['type'] == 'symlink' and Path(target).resolve() == Path(prior['source']).resolve())
             or (prior['deployment'] == 'owned-copy' and destination['type'] == 'file' and destination.get('sha256') == fingerprint(prior['source']).get('sha256')))
-        if owned:
+        if managed and prior is None and destination['type'] != 'absent':
+            record['action'] = 'preserve'
+            conflict('occupied-new-target', target, 'A newly managed path must be absent; existing contents will be preserved')
+        elif owned:
             record['action'] = 'backup-and-' + action
         elif destination['type'] == 'symlink':
             record['action'] = 'preserve'
@@ -219,6 +251,9 @@ def inspect(manifest, home, *, transaction_id=None):
 
     for seed in manifest['mutableSeeds']:
         target = home / relative_target(seed['target'])
+        if any(seed['target'] == name or seed['target'].startswith(name + '/') or name.startswith(seed['target'] + '/')
+               for name in retained_targets):
+            conflict('retained-target-overlap', target, 'A mutable seed must not overlap paths reserved by retained generations')
         if any(record['target'] == seed['target'] for record in plan['files']):
             raise Conflict(f'mutable seed overlaps deployed leaf: {seed["target"]}')
         safe_parents = parents(target)
