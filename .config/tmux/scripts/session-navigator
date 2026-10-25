@@ -17,17 +17,19 @@ def navigate(socket, client, popup=False):
         ).stdout.decode("utf-8", errors="surrogateescape").removesuffix("\n")
 
     def origin():
-        for identity in tmux("list-clients", "-F", "#{pid}\t#{client_pid}\t#{client_name}").splitlines():
-            fields = identity.split("\t", 2)
-            if len(fields) == 3 and fields[2] == client and all(s.isdigit() for s in fields[:2]):
-                return identity
+        for identity in tmux("list-clients", "-F", "#{pid}\t#{client_pid}\t#{client_name}\t#{session_id}").splitlines():
+            fields = identity.split("\t", 3)
+            if (len(fields) == 4 and fields[2] == client and all(s.isdigit() for s in fields[:2])
+                    and re.fullmatch(r"\$[0-9]+", fields[3])):
+                return tuple(fields[:3]), fields[3]
         raise RuntimeError("the invoking client is no longer available")
 
     def label(text):
         return "".join(char if char.isprintable() else " " for char in text)
 
-    def record(identity, text):
-        return (identity + "\t" + label(text)).encode("utf-8") + b"\0"
+    def record(identity, text, active=False):
+        marker = "● " if active else "  "
+        return (identity + "\t" + marker + label(text)).encode("utf-8") + b"\0"
 
     def choose(choices, prompt, header):
         env = os.environ.copy()
@@ -49,7 +51,7 @@ def navigate(socket, client, popup=False):
         return choices[result.stdout]
 
     try:
-        identity = origin()
+        identity, active_session = origin()
         if popup:
             # display-popup does not expand formats in its shell command.
             command = shlex.join([sys.executable, os.path.abspath(__file__), socket, client])
@@ -77,14 +79,15 @@ def navigate(socket, client, popup=False):
                 name = "Editor · Neovim"
             else:
                 name = "Terminal · " + name
-            projects.setdefault(path, {})[record(session, name)] = session
+            projects.setdefault(path, {})[record(session, name, active=session == active_session)] = session
         if not projects:
             raise RuntimeError("no sessions are available")
         choices = {}
         for path, sessions in projects.items():
             name = os.path.basename(path.rstrip(os.sep)) or path
             count = str(len(sessions)) + (" session" if len(sessions) == 1 else " sessions")
-            key = record(next(iter(sessions.values())), f"{name}  {path}  ({count})")
+            key = record(next(iter(sessions.values())), f"{name}  {path}  ({count})",
+                         active=active_session in sessions.values())
             choices[key] = (path, sessions)
         project = choose(choices, "Projects> ", "Enter: choose project | Esc/Ctrl-C: cancel")
         if project is None:
@@ -97,7 +100,7 @@ def navigate(socket, client, popup=False):
                              label(path) + "\nEnter: switch session | Esc/Ctrl-C: cancel")
             if session is None:
                 return 0
-        if origin() != identity:
+        if origin()[0] != identity:
             raise RuntimeError("the invoking client changed; open the picker again")
         tmux("has-session", "-t", session)
         tmux("switch-client", "-c", client, "-t", session)

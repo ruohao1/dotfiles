@@ -197,6 +197,38 @@ class SessionNavigatorTests(unittest.TestCase):
         self.assertEqual(self.positions(), {self.invoker['name']: self.target,
                                            self.other['name']: self.second})
         self.assertEqual(len(self.picker_calls()), 1, 'singleton project should switch directly')
+        labels = dict(row.split('\t', 1) for row in self.picker_calls()[0]['records'])
+        self.assertTrue(labels[self.first].startswith('● '))
+        self.assertTrue(labels[self.second].startswith('  '))
+        result = self.navigate('cancel')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        labels = dict(row.split('\t', 1) for row in self.picker_calls()[0]['records'])
+        self.assertTrue(labels[self.target].startswith('● '))
+        self.assertTrue(labels[self.first].startswith('  '))
+        self.assertEqual(self.positions(), {self.invoker['name']: self.target,
+                                           self.other['name']: self.second})
+
+    def test_active_markers_use_the_invoking_client_and_group_membership(self):
+        path = self.root / 'active-project'
+        path.mkdir()
+        names = ('a-shell', self.managed_editor_name(path), 'z-extra')
+        members = [self.session(name, path) for name in names]
+        self.command('switch-client', '-c', self.invoker['name'], '-t', members[1])
+        self.command('switch-client', '-c', self.other['name'], '-t', members[2])
+        before = self.positions()
+        result = self.navigate(['select', 'cancel'], target=members[1], project_ids=members)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.picker_calls()
+        projects = dict(row.split('\t', 1) for row in calls[0]['records'])
+        marked = [identity for identity, label in projects.items() if label.startswith('● ')]
+        self.assertEqual(marked, [members[0]], 'active session is not the project representative')
+        self.assertTrue(all(label.startswith('  ') for identity, label in projects.items()
+                            if identity != members[0]))
+        sessions = dict(row.split('\t', 1) for row in calls[1]['records'])
+        self.assertEqual(sessions, {members[0]: '  Terminal · a-shell',
+                                    members[1]: '● Editor · Neovim',
+                                    members[2]: '  Terminal · z-extra'})
+        self.assertEqual(self.positions(), before)
 
     def test_shared_directory_is_one_project_with_every_session_selectable(self):
         path = self.root / 'shared-project'
@@ -227,8 +259,8 @@ class SessionNavigatorTests(unittest.TestCase):
         result = self.navigate(target=members[1], project_ids=members)
         self.assertEqual(result.returncode, 0, result.stderr)
         labels = dict(row.split('\t', 1) for row in self.picker_calls()[1]['records'])
-        self.assertEqual(labels, {members[0]: 'Terminal · my-shell', members[1]: 'Editor · Neovim',
-                                  members[2]: 'Terminal · nvim-custom', members[3]: 'Terminal · extra-terminal'})
+        self.assertEqual(labels, {members[0]: '  Terminal · my-shell', members[1]: '  Editor · Neovim',
+                                  members[2]: '  Terminal · nvim-custom', members[3]: '  Terminal · extra-terminal'})
         self.assertEqual(self.positions(), {self.invoker['name']: members[1], self.other['name']: self.second})
         self.assertEqual(self.command('list-sessions', '-F', '#{session_id}\t#{session_name}'), before)
 
@@ -243,7 +275,7 @@ class SessionNavigatorTests(unittest.TestCase):
         result = self.navigate(target=members[1], project_ids=members, helper=standalone)
         self.assertEqual(result.returncode, 0, result.stderr)
         labels = dict(row.split('\t', 1) for row in self.picker_calls()[1]['records'])
-        self.assertEqual(labels, {members[0]: 'Terminal · shell', members[1]: 'Terminal · ' + editor_name})
+        self.assertEqual(labels, {members[0]: '  Terminal · shell', members[1]: '  Terminal · ' + editor_name})
         self.assertEqual(self.positions(), {self.invoker['name']: members[1], self.other['name']: self.second})
 
     def test_distinct_directories_with_the_same_basename_stay_separate(self):
@@ -413,6 +445,7 @@ class SessionNavigatorTests(unittest.TestCase):
             os.write(self.invoker['master'], b'f')
             self.wait(lambda: ready.exists() and searched.exists()
                       and json.loads(ready.read_text())['prompt'] == '--prompt=Projects> ')
+            self.wait(lambda: '●'.encode() in self.invoker['output'])
 
         def closed():
             if not finished.exists():
