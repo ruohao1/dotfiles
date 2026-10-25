@@ -54,6 +54,17 @@ Existing Nix-managed installations need the [documented restoration/re-adoption
 procedure](../../nix/README.md#confirmed-release-updates) when adopting this new managed file; the current
 updater does not handle changes to the managed target list.
 
+## Shared status bar
+
+The bottom bar shows the mode and project name, followed by the window list and
+the current file or directory context. The project name comes from the session's
+starting directory. Changing directory in a pane does not change that label.
+The selected window has a blue background. A zoomed window boxes its index:
+`[1] nvim`, compared with `1 nvim` normally. `•` marks background output and `!`
+marks a terminal bell. These markers do not report task success or failure.
+Neovim shows `[+]` for unsaved changes. Narrow terminals shorten optional text
+and hide the clock while retaining mode and window navigation.
+
 ## SSH and machines without a desktop
 
 Install this configuration on the remote host. Open two local terminals, SSH to

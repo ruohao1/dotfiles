@@ -8,6 +8,8 @@ Native editor status stays visible in ordinary tmux. The dotfiles tmux stack can
 take over status only after a successful publication to the editor's originating
 session; failures or a disabled session status row restore native status. The
 starter hides the row while its screen is visible in either environment.
+The native and dotfiles tmux status rows show `[+]` when the current buffer has
+unsaved changes, including at narrow widths; saving clears the marker.
 
 The native statusline's rich Git segment requires the optional sibling
 `dotfiles/git-summary` executable. Without it, mode, path, diagnostics and cursor

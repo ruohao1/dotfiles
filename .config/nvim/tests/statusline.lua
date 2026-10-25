@@ -184,6 +184,7 @@ eq(
     mode = "INSERT",
     root = "/work/repo",
     path = "lua/init.lua",
+    modified = false,
     errors = 2,
     warnings = 3,
     line = 7,
@@ -192,6 +193,9 @@ eq(
   },
   "canonical named-buffer snapshot"
 )
+for _, value in ipairs({ true, false, 1, "1", "true" }) do
+  eq(test.build_snapshot({ modified = value }).modified, value == true, "strict modified snapshot")
+end
 
 for _, special in ipairs({
   { name = "", buftype = "" },
@@ -266,6 +270,36 @@ local narrow = test.render_parts({
 }, "must-not-render")
 eq(narrow.left_text, " I ", "narrow mode only")
 eq(narrow.right_text, " 12:3 ", "narrow cursor only")
+eq(
+  test.render_parts({
+    mode = "INSERT",
+    modified = true,
+    line = 12,
+    column = 3,
+    width = 79,
+  }, "").right_text,
+  " [+] 12:3 ",
+  "narrow status retains the unsaved marker"
+)
+for _, width in ipairs({ 79, 80, 99, 100, 119, 120 }) do
+  local snapshot = {
+    path = string.rep("界", 30) .. "file.lua",
+    errors = 999999999,
+    warnings = 999999999,
+    line = 999999999,
+    column = 999999999,
+    width = width,
+  }
+  local clean = test.render_parts(snapshot, "")
+  snapshot.modified = true
+  local dirty = test.render_parts(snapshot, "")
+  contains(dirty.right_text, "[+]", "dirty marker at " .. width .. " columns")
+  eq(
+    vim.fn.strdisplaywidth(dirty.right_text),
+    vim.fn.strdisplaywidth(clean.right_text) + (width < 80 and 4 or 0),
+    "dirty status width budget at " .. width .. " columns"
+  )
+end
 
 local omitted = test.render_parts({
   mode = "NORMAL",
@@ -628,6 +662,7 @@ local bridge_option_names = {
   "@dotfiles_nvim_mode",
   "@dotfiles_nvim_root",
   "@dotfiles_nvim_path",
+  "@dotfiles_nvim_modified",
   "@dotfiles_nvim_errors",
   "@dotfiles_nvim_warnings",
   "@dotfiles_nvim_line",
@@ -791,6 +826,14 @@ eq(canonical.errors, "0", "negative diagnostic clamped")
 eq(canonical.warnings, "0", "infinite diagnostic rejected")
 eq(canonical.line, "1", "invalid line fallback")
 eq(canonical.column, "999999999", "column upper clamp")
+eq(canonical.modified, "0", "missing modified state defaults to clean")
+for _, value in ipairs({ true, false, 1, "1", "true" }) do
+  eq(
+    bridge_test.canonicalize({ modified = value }).modified,
+    value == true and "1" or "0",
+    "bridge publishes only strict boolean modified state"
+  )
+end
 eq(bridge_test.canonicalize({ root = "/repo/" .. c1_csi_bridge }).root, "", "C1 root is rejected")
 
 local combining_bridge = vim.fn.nr2char(0x301)
@@ -858,6 +901,36 @@ for _, result in ipairs({
   assert(h.availability[#h.availability] ~= true, "exit zero without exact ack hid the native row")
   eq(publisher:debug_state().published, nil, "unacknowledged publication never advances dedup")
   publisher:stop()
+end
+
+do
+  local h = publisher_harness()
+  local publisher = bridge_test.new(h.deps)
+  ready_bridge(h, publisher)
+  local snapshot = bridge_snapshot()
+  local count = #h.calls
+  for _, modified in ipairs({ true, false }) do
+    snapshot.modified = modified
+    publisher:request(snapshot)
+    flush_bridge(h)
+    count = count + 1
+    eq(#h.calls, count, "modified-only transition publishes")
+    complete_bridge(h)
+    eq(
+      publisher:debug_state().published.modified,
+      modified and "1" or "0",
+      "modified state acknowledged"
+    )
+    publisher:request(snapshot)
+    flush_bridge(h)
+    eq(#h.calls, count, "unchanged modified state deduplicates")
+  end
+  publisher:stop()
+  contains(
+    table.concat(h.calls[#h.calls].argv, " "),
+    "@dotfiles_nvim_modified",
+    "cleanup owns modified option"
+  )
 end
 
 do
@@ -1204,6 +1277,10 @@ do
     eq(h.install_calls, 1, "outside tmux installs expression")
     eq(h.cache_factory_calls, 1, "outside tmux creates one cache")
     eq(h.publisher_setup_calls, 0, "outside tmux has no publisher")
+    eq(controller:snapshot().modified, false, "runtime defaults to clean state")
+    h.live.modified = "1"
+    h.fire("BufModifiedSet")
+    eq(controller:snapshot().modified, false, "runtime rejects truthy nonboolean modified state")
     eq(controller:snapshot().width, 80, "public snapshot reads initial live width")
     h.live.width = 120
     eq(controller:snapshot().width, 120, "public snapshot does not cache width")
@@ -1224,6 +1301,14 @@ do
     h.publisher.on_available(false)
     eq(h.options.laststatus, 3, "lost remote ownership restores native row")
     controller:set_startup_visible(true)
+    h.live.modified = true
+    h.fire("BufModifiedSet")
+    eq(controller:snapshot().modified, true, "modified state reaches the public snapshot")
+    eq(
+      h.publisher.requests[#h.publisher.requests].modified,
+      true,
+      "modified state reaches the publisher"
+    )
     h.publisher.on_available(true)
     h.publisher.on_available(false)
     eq(h.options.laststatus, 0, "handoff cannot reveal a starter status row")
@@ -1357,6 +1442,7 @@ do
     h.redraws = 0
     local reads = h.live_reads
     for _, event in ipairs({
+      "BufModifiedSet",
       "ModeChanged",
       "CursorMoved",
       "CursorMovedI",
@@ -1365,8 +1451,8 @@ do
       h.fire(event)
     end
     eq(#h.cache.updates, 0, "semantic events never invalidate Git")
-    eq(h.live_reads, reads + 4, "semantic events rebuild snapshots")
-    eq(h.redraws, 4, "semantic events redraw")
+    eq(h.live_reads, reads + 5, "semantic events rebuild snapshots")
+    eq(h.redraws, 5, "semantic events redraw")
 
     h.cache.updates = {}
     for _, event in ipairs({
@@ -1433,6 +1519,7 @@ do
     h.publisher.requests = {}
     h.redraws = 0
     for _, event in ipairs({
+      "BufModifiedSet",
       "ModeChanged",
       "CursorMoved",
       "CursorMovedI",
@@ -1440,8 +1527,8 @@ do
     }) do
       h.fire(event)
     end
-    eq(#h.publisher.requests, 4, "semantic events publish snapshots")
-    eq(h.redraws, 4, "published semantic events redraw")
+    eq(#h.publisher.requests, 5, "semantic events publish snapshots")
+    eq(h.redraws, 5, "published semantic events redraw")
   end)
 end
 
@@ -1533,6 +1620,7 @@ do
   local window = vim.api.nvim_get_current_win()
   local original_buffer = vim.api.nvim_get_current_buf()
   local buffer = vim.api.nvim_create_buf(false, false)
+  local path = vim.fn.tempname() .. ".lua"
   local ok, failure = xpcall(function()
     vim.api.nvim_win_set_buf(window, buffer)
     vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { "\t界x" })
@@ -1542,11 +1630,15 @@ do
     local snapshot = test.live_snapshot()
     eq(snapshot.column, 7, "snapshot uses visual cursor column")
     assert(snapshot.column ~= 5, "snapshot used one-based byte column")
+    eq(snapshot.modified, true, "editing marks the live snapshot modified")
+    vim.cmd("silent write " .. vim.fn.fnameescape(path))
+    eq(test.live_snapshot().modified, false, "saving clears the live modified state")
   end, debug.traceback)
   vim.api.nvim_win_set_buf(window, original_buffer)
   if vim.api.nvim_buf_is_valid(buffer) then
     vim.api.nvim_buf_delete(buffer, { force = true })
   end
+  vim.fn.delete(path)
   assert(ok, failure)
 end
 

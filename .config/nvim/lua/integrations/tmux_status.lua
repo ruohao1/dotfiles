@@ -4,6 +4,7 @@ local option_names = {
   "@dotfiles_nvim_mode",
   "@dotfiles_nvim_root",
   "@dotfiles_nvim_path",
+  "@dotfiles_nvim_modified",
   "@dotfiles_nvim_errors",
   "@dotfiles_nvim_warnings",
   "@dotfiles_nvim_line",
@@ -21,7 +22,7 @@ local allowed_modes = {
   TERMINAL = true,
 }
 
-local snapshot_keys = { "mode", "root", "path", "errors", "warnings", "line", "column" }
+local snapshot_keys = { "mode", "root", "path", "modified", "errors", "warnings", "line", "column" }
 
 local function valid_pane(pane)
   return type(pane) == "string" and pane:match("^%%%d+$") ~= nil
@@ -92,6 +93,7 @@ local function canonicalize(snapshot)
     mode = mode,
     root = safe_root(snapshot.root),
     path = safe_text(snapshot.path, 512),
+    modified = snapshot.modified == true and "1" or "0",
     errors = decimal(snapshot.errors, 0),
     warnings = decimal(snapshot.warnings, 0),
     line = decimal(snapshot.line, 1),
