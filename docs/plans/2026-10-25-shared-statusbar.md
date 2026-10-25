@@ -16,11 +16,11 @@
 
 Use the existing native tmux formats and Neovim bridge. Keep the TokyoNight palette and existing Git helper. No plugin or runtime dependency is needed. Project identity comes from the session starting directory, so changing a pane's directory does not change its project label. Add it after mode, retaining the existing Git segment position. Bound that segment to leave room for the project.
 
-Keep the existing 80/100/120-column profiles and 48-cell side limits. Project caps are 8/10/12 cells; below 80 use 8 cells and hide it below 40. Window-name caps are 5/10/12 cells. Git display caps stay at 8/12/16 cells so change counters retain their space. Keep the original positions: mode/project/Git on the left, windows absolutely centered, and file context on the right. Use one space at segment and tab boundaries. Keep the current file or directory context on the right. Hide the shell clock below 80. Window indices remain outside truncated window names so zoom brackets cannot be clipped. Unsaved state is a strict boolean, published as `@dotfiles_nvim_modified=0|1`; its marker remains available in the narrow profile.
+Keep the existing 80/100/120-column profiles and 48-cell side limits. Project caps are 8/10/12 cells; below 80 use 8 cells and hide it below 40. Window-name caps are 5/10/12 cells. Git display caps stay at 8/12/16 cells so change counters retain their space. Keep the original positions: mode/project/Git on the left, windows absolutely centered, and file context on the right. Keep the original one-cell padding on both sides of segments and tabs, and the spaces before activity/bell markers. Keep the current file or directory context on the right. Hide the shell clock below 80. Window indices remain outside truncated window names so zoom brackets cannot be clipped. Unsaved state is a strict boolean, published as `@dotfiles_nvim_modified=0|1`; its marker remains available in the narrow profile.
 
 Selection by background and zoom by brackets remain independent. Text labels and italic zoom were considered and rejected during design. The user's boxed-index choice uses ordinary terminal characters.
 
-The compact-layout refinement reduces redundant padding and long labels. Keep relative file paths: replacing them with basenames would make files such as `src/index.ts` and `tests/index.ts` indistinguishable.
+The compact-layout refinement shortens long labels while retaining the original positions and padding. Keep relative file paths: replacing them with basenames would make files such as `src/index.ts` and `tests/index.ts` indistinguishable.
 
 ## Work and verification
 
@@ -40,4 +40,4 @@ Review focus: hostile project/window/file names, inactive zoomed windows, extrem
 - Three runtime files were activated with backups. Five tmux status options were reloaded without restarting sessions. The existing local release-badge setting was preserved. Already-running editors use their loaded modules until restarted.
 - The compact follow-up passed the same 14 tmux tests on both versions, plus attached rendering probes at 80/100/120 columns with empty Git. One status file and four options were updated with a separate backup. ShellCheck and independent review passed.
 
-The user clarified that compact spacing must retain the original positions. Restored absolute window centering; the shorter names and spacing remain.
+The user clarified that compactness must retain the original positions and padding. Windows stay absolutely centered; only the shorter names remain from the compact refinement.

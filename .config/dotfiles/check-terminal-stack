@@ -10513,8 +10513,8 @@ if [ "$tmux_started" = true ]; then
     'fg=#f7768e,bg=#1A1B26' \
     "tmux bell marker uses the exact red style" || true
 
-  task6_expected_window_status_format='#[fg=#787c99,bg=#1A1B26]#{?window_zoomed_flag,[#{window_index}],#{window_index}} #{?#{e|>=:#{client_width},120},#{=12:#{qh:window_name}},#{?#{e|>=:#{client_width},100},#{=10:#{qh:window_name}},#{=5:#{qh:window_name}}}}#{?window_activity_flag,#[fg=#7dcfff#,bg=#1A1B26]•#[fg=#787c99#,bg=#1A1B26],}#{?window_bell_flag,#[fg=#f7768e#,bg=#1A1B26]!#[fg=#787c99#,bg=#1A1B26],} #[default]'
-  task6_expected_window_status_current_format='#[fg=#1A1B26,bg=#7aa2f7,bold]#{?window_zoomed_flag,[#{window_index}],#{window_index}} #{?#{e|>=:#{client_width},120},#{=12:#{qh:window_name}},#{?#{e|>=:#{client_width},100},#{=10:#{qh:window_name}},#{=5:#{qh:window_name}}}}#{?window_activity_flag,#[fg=#1A1B26#,bg=#7aa2f7#,bold]•#[fg=#1A1B26#,bg=#7aa2f7#,bold],}#{?window_bell_flag,#[fg=#1A1B26#,bg=#7aa2f7#,bold]!#[fg=#1A1B26#,bg=#7aa2f7#,bold],} #[default]'
+  task6_expected_window_status_format='#[fg=#787c99,bg=#1A1B26] #{?window_zoomed_flag,[#{window_index}],#{window_index}} #{?#{e|>=:#{client_width},120},#{=12:#{qh:window_name}},#{?#{e|>=:#{client_width},100},#{=10:#{qh:window_name}},#{=5:#{qh:window_name}}}}#{?window_activity_flag, #[fg=#7dcfff#,bg=#1A1B26]•#[fg=#787c99#,bg=#1A1B26],}#{?window_bell_flag, #[fg=#f7768e#,bg=#1A1B26]!#[fg=#787c99#,bg=#1A1B26],} #[default]'
+  task6_expected_window_status_current_format='#[fg=#1A1B26,bg=#7aa2f7,bold] #{?window_zoomed_flag,[#{window_index}],#{window_index}} #{?#{e|>=:#{client_width},120},#{=12:#{qh:window_name}},#{?#{e|>=:#{client_width},100},#{=10:#{qh:window_name}},#{=5:#{qh:window_name}}}}#{?window_activity_flag, #[fg=#1A1B26#,bg=#7aa2f7#,bold]•#[fg=#1A1B26#,bg=#7aa2f7#,bold],}#{?window_bell_flag, #[fg=#1A1B26#,bg=#7aa2f7#,bold]!#[fg=#1A1B26#,bg=#7aa2f7#,bold],} #[default]'
   require_tmux_option_value "$check_socket" session window-status-format \
     "$task6_expected_window_status_format" \
     "tmux inactive window format is exact" || true
@@ -10624,7 +10624,7 @@ if [ "$tmux_started" = true ]; then
     "$tmux_expected_status_job #(printf #{T:@dotfiles_nvim_path})" \
     "tmux job auditor rejects a T-expanded job" || true
 
-  task6_project_block='#{?#{e|>=:#{client_width},40},#[fg=#a9b1d6#,bg=#1A1B26]#{?#{e|>=:#{client_width},120},#{=12:#{b;qh:session_path}},#{?#{e|>=:#{client_width},100},#{=10:#{b;qh:session_path}},#{=8:#{b;qh:session_path}}}} #[default],}'
+  task6_project_block='#{?#{e|>=:#{client_width},40},#[fg=#a9b1d6#,bg=#1A1B26] #{?#{e|>=:#{client_width},120},#{=12:#{b;qh:session_path}},#{?#{e|>=:#{client_width},100},#{=10:#{b;qh:session_path}},#{=8:#{b;qh:session_path}}}} #[default],}'
   # shellcheck disable=SC2016  # This is the exact literal native job key.
   task6_mode_job='#($HOME/.config/dotfiles/git-summary --tmux-pane #{pane_id} --profile #{?#{e|>=:#{client_width},120},wide,#{?#{e|>=:#{client_width},100},medium,compact}})'
   task6_status_left=$(tmux -S "$check_socket" show-options -gv \
@@ -10759,7 +10759,7 @@ TASK6_APPLICATION_CASES
 
   task6_app_block=$(printf \
     '#[fg=#1A1B26,bg=#7aa2f7,bold] %s #[default]' APP)
-  task6_zero_block='#[fg=#73daca,bg=#24283b]0 #[default]'
+  task6_zero_block='#[fg=#73daca,bg=#24283b] 0 #[default]'
 
   if [ -z "$task6_probe_pane" ] || [ -z "$task6_git_probe_format" ] \
     || ! tmux -S "$check_socket" set-option -p -t "$task6_probe_pane" \
@@ -13942,11 +13942,11 @@ fi
 if [ "$task10_width_ready" = true ]; then
   task10_width_assertions=true
   for width_contract in \
-    80:26:34 \
-    99:26:34 \
-    100:32:38 \
-    119:32:38 \
-    120:38:48
+    80:28:34 \
+    99:28:34 \
+    100:34:38 \
+    119:34:38 \
+    120:40:48
   do
     width_value=${width_contract%%:*}
     width_remainder=${width_contract#*:}
@@ -14027,7 +14027,7 @@ fi
 if [ "$task10_width_ready" = true ]; then
   full_native=$((80 - full_left - full_right))
   project_label=$(basename "$check_tmp" | cut -c 1-8)
-  mode_only_left=$(printf ' %s %s ' NORMAL "$project_label")
+  mode_only_left=$(printf ' %s  %s ' NORMAL "$project_label")
   if wait_control_field_visible_equals \
       "$status_client_a" "$width_pane" 80 left "$mode_only_left" \
       "$check_tmp/status-width-empty.txt"; then
