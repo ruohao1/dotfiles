@@ -921,6 +921,24 @@ class TransactionTests(unittest.TestCase):
         self.assertFalse(added.exists() or added.is_symlink())
         self.assertEqual(self.runtime.calls, [str(self.generation)])
 
+    def test_raw_service_file_additions_require_explicit_reversal(self):
+        module = self.module()
+        for target in ['.config/systemd/user/extra.service',
+                       '.config/systemd/user/tmux.service.d/extra.conf',
+                       '.config/systemd/user/default.target.wants/extra.service',
+                       'Library/LaunchAgents/extra.plist']:
+            with self.subTest(target=target):
+                self.setUp()
+                module.apply(self.plan, self.manifest, runtime=self.runtime)
+                manifest, added = self.added_generation(target=target)
+                self.assertEqual(manifest['services'], [])
+                plan = inspect(manifest, self.home)
+                self.assertTrue(any(item['path'] == str(added) for item in plan['conflicts']))
+                with self.assertRaises(Conflict):
+                    module.apply(plan, manifest, runtime=self.runtime)
+                self.assertFalse(added.exists() or added.is_symlink())
+                self.assertEqual(self.runtime.calls, [str(self.generation)])
+
     def test_added_leaf_apply_rollback_reselect_and_reversal_preserve_local_state(self):
         module = self.module()
         local = self.home / '.config/nvim/local.lua'

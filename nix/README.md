@@ -550,7 +550,8 @@ can add files when each new target is absent. An existing file, directory or
 symlink at a new target is a conflict, even when its contents match the release.
 Resolve the conflict and create a new preview before applying the update.
 Removing or renaming managed targets, or changing service targets, still requires
-explicit legacy restoration and re-adoption. Updates also refuse to replace a
+explicit legacy restoration and re-adoption. New files under `.config/systemd/`
+or `Library/LaunchAgents/` also require that procedure. Updates refuse to replace a
 managed leaf with a parent or child path, or to convert an existing mutable seed
 into a managed file.
 

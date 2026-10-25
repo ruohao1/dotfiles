@@ -219,6 +219,10 @@ def inspect(manifest, home, *, transaction_id=None):
         if source['type'] not in ['file', 'symlink'] or not source.get('sha256'):
             conflict('missing-source', file['source'], 'Source must resolve to an immutable regular file')
         prior = previous_files.get(file['target'])
+        if managed and prior is None and any(file['target'] == name or file['target'].startswith(name + '/')
+                                              for name in ['.config/systemd', 'Library/LaunchAgents']):
+            conflict('changed-managed-services', target, 'Adding files in service directories requires explicit reversal before migration')
+            record['action'] = 'preserve'
         if any(file['target'] != name and (file['target'].startswith(name + '/') or name.startswith(file['target'] + '/'))
                for name in retained_targets):
             conflict('retained-target-overlap', target, 'Managed leaves must not overlap paths reserved by retained generations')
