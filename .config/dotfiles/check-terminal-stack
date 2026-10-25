@@ -10473,8 +10473,8 @@ if [ "$tmux_started" = true ]; then
     "tmux status keeps its five-second interval" || true
   require_tmux_option_value "$check_socket" session status-position bottom \
     "tmux status remains at the bottom" || true
-  require_tmux_option_value "$check_socket" session status-justify left \
-    "tmux window list stays beside the left context" || true
+  require_tmux_option_value "$check_socket" session status-justify absolute-centre \
+    "tmux window list is absolutely centered" || true
   require_tmux_option_value "$check_socket" session status-left-length 48 \
     "tmux left limit is 48" || true
   require_tmux_option_value "$check_socket" session status-right-length 48 \
@@ -12250,7 +12250,7 @@ TASK6_APPLICATION_CASES
   require_tmux_option_value "$check_socket" session status on "tmux reload preserves status" || true
   require_tmux_option_value "$check_socket" session status-interval 5 "tmux reload preserves status-interval" || true
   require_tmux_option_value "$check_socket" session status-position bottom "tmux reload preserves status-position" || true
-  require_tmux_option_value "$check_socket" session status-justify left "tmux reload preserves left-aligned windows" || true
+  require_tmux_option_value "$check_socket" session status-justify absolute-centre "tmux reload preserves absolute window centering" || true
   require_tmux_option_value "$check_socket" session status-left-length 48 "tmux reload preserves the 48-cell left limit" || true
   require_tmux_option_value "$check_socket" session status-right-length 48 "tmux reload preserves the 48-cell right limit" || true
   require_tmux_option_value "$check_socket" session status-style 'fg=#a9b1d6,bg=#1A1B26' "tmux reload preserves the row base style" || true

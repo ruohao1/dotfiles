@@ -57,8 +57,8 @@ updater does not handle changes to the managed target list.
 ## Shared status bar
 
 The bottom bar shows the mode and project name, followed by the window list and
-the current file or directory context. Mode, project, and windows form a compact
-group on the left; file context stays on the right. The project name comes from
+the current file or directory context. Mode and project stay on the left, windows
+stay centered, and file context stays on the right. The project name comes from
 the session's starting directory. Changing directory in a pane does not change
 that label.
 The selected window has a blue background. A zoomed window boxes its index:
