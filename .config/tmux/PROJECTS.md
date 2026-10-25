@@ -72,8 +72,8 @@ the current file or directory context. Mode and project stay on the left, window
 stay centered, and file context stays on the right. The project name comes from
 the session's starting directory. Changing directory in a pane does not change
 that label.
-Zoomed windows have a blue background. Otherwise, the focused window has a
-subtle gray background and bold text; other windows use dim text. Tabs keep the
+The focused window has a blue background when zoomed, or a subtle gray background
+otherwise. Inactive windows use dim text even when zoomed. Tabs keep the
 same plain index and name in every state, so their width and text positions stay
 fixed. `•` marks background output and `!`
 marks a terminal bell. These markers do not report task success or failure.
