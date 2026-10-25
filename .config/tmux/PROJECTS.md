@@ -61,10 +61,10 @@ the current file or directory context. Mode and project stay on the left, window
 stay centered, and file context stays on the right. The project name comes from
 the session's starting directory. Changing directory in a pane does not change
 that label.
-The selected window has a subtle dark background and bold text.
-A zoomed window puts its index in a rounded gray badge using the configured
-Nerd Font. Its ends use the existing spaces beside the index, so zooming keeps
-the tab width and name position fixed. `•` marks background output and `!`
+Zoomed windows have a blue background. Otherwise, the focused window has a
+subtle gray background and bold text; other windows use dim text. Tabs keep the
+same plain index and name in every state, so their width and text positions stay
+fixed. `•` marks background output and `!`
 marks a terminal bell. These markers do not report task success or failure.
 Neovim shows `[+]` for unsaved changes. Narrow terminals shorten optional text
 and hide the clock while retaining mode and window navigation.

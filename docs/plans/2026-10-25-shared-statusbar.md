@@ -6,7 +6,7 @@
 
 - Keep the mode at the left. COPY, RESIZE, and PREFIX retain priority over editor mode.
 - Show the project name without Editor or Terminal suffixes.
-- Use a subtle dark background and bold text for the selected window. Use `1 nvim` normally and a rounded gray badge around the index when zoomed, including inactive zoomed windows.
+- Use blue for zoomed windows, gray for the focused window otherwise, and dim text for other windows. Keep plain `1 nvim` text in every state.
 - Keep `•` for background output and `!` for a terminal bell. These do not imply task completion or failure.
 - Use no additional state labels, zoom icon, or italics.
 - Show `[+]` for an unsaved editor buffer. Preserve file, diagnostics, and cursor context.
@@ -16,9 +16,9 @@
 
 Use the existing native tmux formats and Neovim bridge. Keep the TokyoNight palette and existing Git helper. No plugin or runtime dependency is needed. Project identity comes from the session starting directory, so changing a pane's directory does not change its project label. Add it after mode, retaining the existing Git segment position. Bound that segment to leave room for the project.
 
-Keep the existing 80/100/120-column profiles and 48-cell side limits. Project caps are 8/10/12 cells; below 80 use 8 cells and hide it below 40. Window-name caps are 5/10/12 cells. Git display caps stay at 8/12/16 cells so change counters retain their space. Keep the original positions: mode/project/Git on the left, windows absolutely centered, and file context on the right. Keep the original one-cell padding on both sides of segments and tabs, with activity/bell symbols attached to the window name. Keep one space between the index and name when unzoomed; do not use a colon. When zoomed, the rounded ends fill the existing leading space and index/name gap. Tab width and name position stay fixed. Keep the current file or directory context on the right. Hide the shell clock below 80. Window indices remain outside truncated window names so zoom badges cannot be clipped. Unsaved state is a strict boolean, published as `@dotfiles_nvim_modified=0|1`; its marker remains available in the narrow profile.
+Keep the existing 80/100/120-column profiles and 48-cell side limits. Project caps are 8/10/12 cells; below 80 use 8 cells and hide it below 40. Window-name caps are 5/10/12 cells. Git display caps stay at 8/12/16 cells so change counters retain their space. Keep the original positions: mode/project/Git on the left, windows absolutely centered, and file context on the right. Keep the original one-cell padding on both sides of segments and tabs, with activity/bell symbols attached to the window name. Keep one space between the index and name; do not use a colon. Only colors change with zoom or focus. Tab width and name position stay fixed. Keep the current file or directory context on the right. Hide the shell clock below 80. Window indices remain outside truncated window names. Unsaved state is a strict boolean, published as `@dotfiles_nvim_modified=0|1`; its marker remains available in the narrow profile.
 
-Selection by a subtle background and bold text, and zoom by a rounded index badge, remain independent. The user preferred this quieter selection over the initial blue fill and smoother corners over square brackets. The badge uses the existing muted gray palette and the configured Nerd Font's rounded caps, using the existing two spacing cells around the index rather than adding width. Text labels and italic zoom were considered and rejected during design.
+Zoom takes precedence over focus: zoomed windows use blue, the focused unzoomed window uses gray, and other windows use dim text. The user chose color states with no brackets or rounded badges. Use the existing palette and plain terminal text. Activity and bell symbols use dark text on blue zoomed tabs and their existing colors on inactive unzoomed tabs.
 
 The compact-layout refinement shortens long labels while retaining the original positions and padding. Keep relative file paths: replacing them with basenames would make files such as `src/index.ts` and `tests/index.ts` indistinguishable.
 
@@ -42,4 +42,4 @@ Review focus: hostile project/window/file names, inactive zoomed windows, extrem
 
 The user clarified that compactness must retain the original positions and padding. Windows stay absolutely centered; only the shorter names remain from the compact refinement.
 
-The tab format is `1 nvim`, with a rounded gray index badge when zoomed. Activity/bell symbols still attach directly to the name, as in `codex•!`. Zoom fills the two existing spaces beside the index with rounded ends. Tab width, name position, trailing padding, and bar positions stay unchanged.
+The tab format stays `1 nvim` in every state. Activity/bell symbols still attach directly to the name, as in `codex•!`. Tab width, name position, padding, and bar positions stay unchanged.
