@@ -1450,11 +1450,13 @@ tmux_status_source_is_safe() {
     '#{e|>=:#{client_width},120}' \
     '#{qh:@dotfiles_nvim_mode}' \
     '#{qh:@dotfiles_nvim_path}' \
+    '#{==:#{@dotfiles_nvim_modified},1}' \
     '#{qh:@dotfiles_nvim_errors}' \
     '#{qh:@dotfiles_nvim_warnings}' \
     '#{qh:@dotfiles_nvim_line}' \
     '#{qh:@dotfiles_nvim_column}' \
     '#{qh:pane_current_path}' \
+    '#{b;qh:session_path}' \
     '#{qh:window_name}' \
     '#{b:pane_current_command}' \
     's/^(sh|bash|zsh|fish|dash|ksh|nu)$/SHELL/' \
@@ -1477,6 +1479,7 @@ tmux_status_source_is_safe() {
     '#{@dotfiles_nvim_root}' \
     '#{@dotfiles_nvim_path}' \
     '#{pane_current_path}' \
+    '#{session_path}' \
     '#{window_name}' \
     '#{E:' \
     '#{T:' \
@@ -1515,13 +1518,16 @@ tmux_status_source_is_safe() {
 #{@dotfiles_nvim_warnings}|5|raw warning predicate
 #{@dotfiles_nvim_line}|5|raw line predicate
 #{@dotfiles_nvim_column}|5|raw column predicate
+#{@dotfiles_nvim_modified}|4|raw modified predicate
+#{==:#{@dotfiles_nvim_modified},1}|4|exact modified predicate
 #{qh:@dotfiles_nvim_mode}|12|quoted mode display
 #{qh:@dotfiles_nvim_errors}|3|quoted error display
 #{qh:@dotfiles_nvim_warnings}|3|quoted warning display
 #{qh:@dotfiles_nvim_line}|3|quoted line display
 #{qh:@dotfiles_nvim_column}|3|quoted column display
-#{qh:@dotfiles_nvim_path}|4|quoted Neovim path display
+#{qh:@dotfiles_nvim_path}|7|quoted Neovim path display
 #{qh:pane_current_path}|3|quoted pane path display
+#{b;qh:session_path}|3|quoted project basename
 #{qh:window_name}|6|quoted window name display
 TMUX_STATUS_DISPLAY_COUNTS
 
@@ -1542,8 +1548,10 @@ TMUX_STATUS_DISPLAY_COUNTS
 @dotfiles_nvim_warnings|8|warnings
 @dotfiles_nvim_line|8|line
 @dotfiles_nvim_column|8|column
-@dotfiles_nvim_path|4|Neovim path
+@dotfiles_nvim_path|7|Neovim path
+@dotfiles_nvim_modified|4|modified
 pane_current_path|3|pane path
+session_path|3|project path
 window_name|6|window name
 session_name|0|session name
 TMUX_STATUS_KEY_COUNTS
@@ -6394,6 +6402,7 @@ pane_status_option_name_is_owned() {
     @dotfiles_nvim_mode|\
     @dotfiles_nvim_root|\
     @dotfiles_nvim_path|\
+    @dotfiles_nvim_modified|\
     @dotfiles_nvim_errors|\
     @dotfiles_nvim_warnings|\
     @dotfiles_nvim_line|\
@@ -6450,6 +6459,7 @@ pane_status_snapshot() {
     set-option -pt "$snapshot_pane" @dotfiles_nvim_mode "$snapshot_mode" \; \
     set-option -pt "$snapshot_pane" @dotfiles_nvim_root "$snapshot_root" \; \
     set-option -pt "$snapshot_pane" @dotfiles_nvim_path "$snapshot_path" \; \
+    set-option -pt "$snapshot_pane" @dotfiles_nvim_modified 0 \; \
     set-option -pt "$snapshot_pane" @dotfiles_nvim_errors "$snapshot_errors" \; \
     set-option -pt "$snapshot_pane" @dotfiles_nvim_warnings "$snapshot_warnings" \; \
     set-option -pt "$snapshot_pane" @dotfiles_nvim_line "$snapshot_line" \; \
@@ -6469,6 +6479,7 @@ clear_pane_status_snapshot() {
     @dotfiles_nvim_mode \
     @dotfiles_nvim_root \
     @dotfiles_nvim_path \
+    @dotfiles_nvim_modified \
     @dotfiles_nvim_errors \
     @dotfiles_nvim_warnings \
     @dotfiles_nvim_line \
@@ -6496,7 +6507,7 @@ capture_pane_status_options() {
     > "$option_raw" 2>/dev/null \
     || return 1
   LC_ALL=C awk '
-    $1 ~ /^@dotfiles_nvim_(owner|active|mode|root|path|errors|warnings|line|column)$/ {
+    $1 ~ /^@dotfiles_nvim_(owner|active|mode|root|path|modified|errors|warnings|line|column)$/ {
       print
     }
   ' "$option_raw" > "$option_output"
@@ -9888,6 +9899,12 @@ if [ -r "$tmux_entry" ] \
   require_tmux_status_source_replacement_rejected raw-pane-path \
     '#{qh:pane_current_path}' '#{pane_current_path}' \
     "tmux status source audit rejects a raw pane path" || true
+  require_tmux_status_source_replacement_rejected raw-project-path \
+    '#{b;qh:session_path}' '#{b:session_path}' \
+    "tmux status source audit rejects an unquoted project basename" || true
+  require_tmux_status_source_replacement_rejected modified-truthiness \
+    '#{==:#{@dotfiles_nvim_modified},1}' '#{@dotfiles_nvim_modified}' \
+    "tmux status source audit rejects a truthy modified flag" || true
   require_tmux_status_source_replacement_rejected raw-window-name \
     '#{qh:window_name}' '#{window_name}' \
     "tmux status source audit rejects a raw window name" || true
@@ -10365,7 +10382,7 @@ if [ "$tmux_started" = true ]; then
       "$check_tmp/tmux-stock-status-format-after.txt" \
     && grep -Fq '#[list=right-marker]' \
       "$check_tmp/tmux-stock-status-format-after.txt"; then
-    pass "tmux status preserves this binary's stock clickable absolute-centering scaffolding byte-for-byte"
+    pass "tmux status preserves this binary's stock clickable status scaffolding byte-for-byte"
   else
     fail "tmux status replaced or weakened this binary's stock status-format[0] scaffolding"
   fi
@@ -10487,7 +10504,7 @@ if [ "$tmux_started" = true ]; then
     'fg=#787c99,bg=#1A1B26' \
     "tmux inactive windows use the exact muted style" || true
   require_tmux_option_value "$check_socket" session window-status-current-style \
-    'fg=#a9b1d6,bg=#2A2F41' \
+    'fg=#a9b1d6,bg=#2A2F41,bold' \
     "tmux current window uses the exact active surface" || true
   require_tmux_option_value "$check_socket" session window-status-activity-style \
     'fg=#7dcfff,bg=#1A1B26' \
@@ -10496,8 +10513,8 @@ if [ "$tmux_started" = true ]; then
     'fg=#f7768e,bg=#1A1B26' \
     "tmux bell marker uses the exact red style" || true
 
-  task6_expected_window_status_format='#[fg=#787c99,bg=#1A1B26] #{?#{e|>=:#{client_width},120},#{=18:#{window_index}:#{qh:window_name}},#{?#{e|>=:#{client_width},100},#{=16:#{window_index}:#{qh:window_name}},#{=7:#{window_index}:#{qh:window_name}}}}#{?window_zoomed_flag,#[fg=#e0af68#,bg=#1A1B26]Z#[fg=#787c99#,bg=#1A1B26],}#{?window_activity_flag,#[fg=#7dcfff#,bg=#1A1B26]•#[fg=#787c99#,bg=#1A1B26],}#{?window_bell_flag,#[fg=#f7768e#,bg=#1A1B26]!#[fg=#787c99#,bg=#1A1B26],} #[default]'
-  task6_expected_window_status_current_format='#[fg=#a9b1d6,bg=#2A2F41,bold] #{?#{e|>=:#{client_width},120},#{=18:#{window_index}:#{qh:window_name}},#{?#{e|>=:#{client_width},100},#{=16:#{window_index}:#{qh:window_name}},#{=7:#{window_index}:#{qh:window_name}}}}#{?window_zoomed_flag,#[fg=#e0af68#,bg=#2A2F41]Z#[fg=#a9b1d6#,bg=#2A2F41#,bold],}#{?window_activity_flag,#[fg=#7dcfff#,bg=#2A2F41]•#[fg=#a9b1d6#,bg=#2A2F41#,bold],}#{?window_bell_flag,#[fg=#f7768e#,bg=#2A2F41]!#[fg=#a9b1d6#,bg=#2A2F41#,bold],} #[default]'
+  task6_expected_window_status_format='#{?window_zoomed_flag,#[fg=#1A1B26#,bg=#7aa2f7#,bold],#[fg=#787c99#,bg=#1A1B26]} #{window_index} #{?#{e|>=:#{client_width},120},#{=12:#{qh:window_name}},#{?#{e|>=:#{client_width},100},#{=10:#{qh:window_name}},#{=5:#{qh:window_name}}}}#{?window_activity_flag,#{?window_zoomed_flag,#[fg=#1A1B26#,bg=#7aa2f7#,bold],#[fg=#7dcfff#,bg=#1A1B26]}•#{?window_zoomed_flag,#[fg=#1A1B26#,bg=#7aa2f7#,bold],#[fg=#787c99#,bg=#1A1B26]},}#{?window_bell_flag,#{?window_zoomed_flag,#[fg=#1A1B26#,bg=#7aa2f7#,bold],#[fg=#f7768e#,bg=#1A1B26]}!#{?window_zoomed_flag,#[fg=#1A1B26#,bg=#7aa2f7#,bold],#[fg=#787c99#,bg=#1A1B26]},} #[default]'
+  task6_expected_window_status_current_format='#{?window_zoomed_flag,#[fg=#1A1B26#,bg=#7aa2f7#,bold],#[fg=#a9b1d6#,bg=#2A2F41#,bold]} #{window_index} #{?#{e|>=:#{client_width},120},#{=12:#{qh:window_name}},#{?#{e|>=:#{client_width},100},#{=10:#{qh:window_name}},#{=5:#{qh:window_name}}}}#{?window_activity_flag,•,}#{?window_bell_flag,!,} #[default]'
   require_tmux_option_value "$check_socket" session window-status-format \
     "$task6_expected_window_status_format" \
     "tmux inactive window format is exact" || true
@@ -10607,6 +10624,7 @@ if [ "$tmux_started" = true ]; then
     "$tmux_expected_status_job #(printf #{T:@dotfiles_nvim_path})" \
     "tmux job auditor rejects a T-expanded job" || true
 
+  task6_project_block='#{?#{e|>=:#{client_width},40},#[fg=#a9b1d6#,bg=#1A1B26] #{?#{e|>=:#{client_width},120},#{=12:#{b;qh:session_path}},#{?#{e|>=:#{client_width},100},#{=10:#{b;qh:session_path}},#{=8:#{b;qh:session_path}}}} #[default],}'
   # shellcheck disable=SC2016  # This is the exact literal native job key.
   task6_mode_job='#($HOME/.config/dotfiles/git-summary --tmux-pane #{pane_id} --profile #{?#{e|>=:#{client_width},120},wide,#{?#{e|>=:#{client_width},100},medium,compact}})'
   task6_status_left=$(tmux -S "$check_socket" show-options -gv \
@@ -10616,6 +10634,7 @@ if [ "$tmux_started" = true ]; then
     2>/dev/null) || task6_probe_pane=
   task6_mode_probe_format=$(printf '%s\n' "$task6_status_left" \
     | task6_replace_all "$task6_mode_job" '#{@task6_git_result}' \
+    | task6_replace_all "$task6_project_block" '' \
     | task6_replace_all pane_in_mode @task6_pane_in_mode \
     | task6_replace_all client_key_table @task6_key_table \
     | task6_replace_all client_prefix @task6_prefix \
@@ -10714,7 +10733,7 @@ TASK6_APPLICATION_CASES
   task6_git_references=$(count_occurrences \
     "$check_tmp/task6-status-left.txt" "$task6_git_job")
 
-  if [ "${task6_git_references:-0}" -eq 2 ] \
+  if [ "${task6_git_references:-0}" -eq 4 ] \
     && tmux_status_jobs_are_exact \
       "$check_socket" terminal-stack-check \
       > "$check_tmp/task6-git-cache-key.txt" 2>&1; then
@@ -10730,6 +10749,7 @@ TASK6_APPLICATION_CASES
     2>/dev/null) || task6_probe_pane=
   task6_git_probe_format=$(printf '%s\n' "$task6_status_left" \
     | task6_replace_all "$task6_git_job" '#{@task6_git_result}' \
+    | task6_replace_all "$task6_project_block" '' \
     | task6_replace_all pane_in_mode @task6_pane_in_mode \
     | task6_replace_all client_key_table @task6_key_table \
     | task6_replace_all client_prefix @task6_prefix \
@@ -12242,7 +12262,7 @@ TASK6_APPLICATION_CASES
   require_tmux_option_value "$check_socket" session visual-bell off "tmux reload preserves disabled bell overlays" || true
   require_tmux_option_value "$check_socket" session window-status-separator '' "tmux reload preserves the gapless window list" || true
   require_tmux_option_value "$check_socket" session window-status-style 'fg=#787c99,bg=#1A1B26' "tmux reload preserves the inactive window style" || true
-  require_tmux_option_value "$check_socket" session window-status-current-style 'fg=#a9b1d6,bg=#2A2F41' "tmux reload preserves the current window style" || true
+  require_tmux_option_value "$check_socket" session window-status-current-style 'fg=#a9b1d6,bg=#2A2F41,bold' "tmux reload preserves the current window style" || true
   require_tmux_option_value "$check_socket" session window-status-activity-style 'fg=#7dcfff,bg=#1A1B26' "tmux reload preserves the activity window style" || true
   require_tmux_option_value "$check_socket" session window-status-bell-style 'fg=#f7768e,bg=#1A1B26' "tmux reload preserves the bell window style" || true
   require_tmux_option_value "$check_socket" session window-status-format "$task6_expected_window_status_format" "tmux reload preserves the exact inactive window format" || true
@@ -13380,6 +13400,7 @@ if [ "$tmux_started" = true ] \
   if [ "$task9_ready" = true ]; then
     task9_numeric_ready=true
     for lifecycle_numeric in \
+      @dotfiles_nvim_modified \
       @dotfiles_nvim_errors \
       @dotfiles_nvim_warnings \
       @dotfiles_nvim_line \
@@ -13872,8 +13893,11 @@ if [ "$task10_width_ready" = true ]; then
     || task10_width_ready=false
   wide_git=$("$git_summary" --path "$width_repo" --profile wide) \
     || task10_width_ready=false
+  compact_git=$(printf '%s\n' "$compact_git" | LC_ALL=C sed 's/.*\(.\{7\}\)$/…\1/')
+  medium_git=$(printf '%s\n' "$medium_git" | LC_ALL=C sed 's/.*\(.\{11\}\)$/…\1/')
+  wide_git=$(printf '%s\n' "$wide_git" | LC_ALL=C sed 's/.*\(.\{15\}\)$/…\1/')
   width_identity=$(tmux -S "$check_socket" display-message -p \
-    -t "$width_pane" '#{window_index}:#{window_name}' 2>/dev/null || true)
+    -t "$width_pane" '#{window_index} #{window_name}' 2>/dev/null || true)
   if [ "$task10_width_ready" = true ] \
     && [ -n "$compact_git" ] \
     && [ -n "$medium_git" ] \
@@ -13882,7 +13906,7 @@ if [ "$task10_width_ready" = true ]; then
     && [ "$medium_git" != "$wide_git" ] \
     && printf '%s\n' "$width_identity" |
       LC_ALL=C awk '
-        NR == 1 && /^[0-9]+:width$/ { valid = 1 }
+        NR == 1 && /^[0-9]+ width$/ { valid = 1 }
         END { exit NR != 1 || !valid }
       '; then
     pass "responsive width fixture resolved exact profile text and identity"
@@ -13918,11 +13942,11 @@ fi
 if [ "$task10_width_ready" = true ]; then
   task10_width_assertions=true
   for width_contract in \
-    80:32:34 \
-    99:32:34 \
-    100:36:38 \
-    119:36:38 \
-    120:46:48
+    80:28:34 \
+    99:28:34 \
+    100:34:38 \
+    119:34:38 \
+    120:40:48
   do
     width_value=${width_contract%%:*}
     width_remainder=${width_contract#*:}
@@ -14002,7 +14026,8 @@ fi
 
 if [ "$task10_width_ready" = true ]; then
   full_native=$((80 - full_left - full_right))
-  mode_only_left=$(printf ' %s ' NORMAL)
+  project_label=$(basename "$check_tmp" | cut -c 1-8)
+  mode_only_left=$(printf ' %s  %s ' NORMAL "$project_label")
   if wait_control_field_visible_equals \
       "$status_client_a" "$width_pane" 80 left "$mode_only_left" \
       "$check_tmp/status-width-empty.txt"; then
@@ -14019,9 +14044,9 @@ if [ "$task10_width_ready" = true ]; then
       :*|*:) task10_width_ready=false ;;
     esac
     if [ "$empty_left_visible" = "$mode_only_left" ]; then
-      pass "empty optional blocks leave the exact mode-only row"
+      pass "empty optional blocks leave the exact mode-and-project row"
     else
-      fail "empty optional blocks did not leave the exact mode-only row"
+      fail "empty optional blocks did not leave the exact mode-and-project row"
       task10_width_ready=false
     fi
     if [ "$task10_width_ready" = true ]; then
@@ -14038,7 +14063,7 @@ if [ "$task10_width_ready" = true ]; then
       fail "empty optional blocks returned nondecimal widths"
     fi
   else
-    fail "empty optional blocks did not converge on the exact mode-only row"
+    fail "empty optional blocks did not converge on the exact mode-and-project row"
     task10_width_ready=false
   fi
 fi
@@ -14292,8 +14317,8 @@ if [ "$task10_native_ready" = true ]; then
     zoom_windows=$(capture_field \
       "$check_tmp/status-zoom-marker.txt" windows || true)
     require_text_contains "$zoom_windows" \
-      '#[fg=#e0af68,bg=#1A1B26]Z' \
-      "inactive zoomed window exposes Z" || task10_native_ready=false
+      "#[fg=#1A1B26,bg=#7aa2f7,bold] $alert_index alert" \
+      "inactive zoomed window uses the blue style" || task10_native_ready=false
   else
     fail "inactive zoom marker status capture failed"
     task10_native_ready=false
@@ -14772,7 +14797,7 @@ else
 fi
 
 # shellcheck disable=SC2016  # Literal payload must reach the renderer unchanged.
-hostile_branch='topic#(touch${IFS}PWNED_MARKER)#{session_name}#[fg=red]'
+hostile_branch='topic#(touch${IFS}PWNED_MARKER)#{pid}#[fg=red]'
 if [ "$task10_hostile_ready" = true ]; then
   case "$real_git" in
     /*) [ -x "$real_git" ] || task10_hostile_ready=false ;;
@@ -14938,7 +14963,7 @@ else
   task10_hostile_cleanup=false
 fi
 
-hostile_expected='…NED_MARKER)#{session_name}#[fg=red]'
+hostile_expected='…#{pid}#[fg=red]'
 if [ "$task10_hostile_ready" = true ] \
   && wait_control_left_contains \
     "$status_client_a" "$hostile_pane" "$hostile_expected" \
@@ -14967,10 +14992,10 @@ if [ "$task10_hostile_ready" = true ] \
   require_text_contains "$hostile_complete_visible_b" "$hostile_expected" \
     "client B hostile branch remains literal within wide cap" \
     || hostile_long_assertions=false
-  require_text_contains "$hostile_complete_raw_a" '#{session_name}' \
+  require_text_contains "$hostile_complete_raw_a" '#{pid}' \
     "one expansion consumes doubled format hash" \
     || hostile_long_assertions=false
-  require_text_absent "$hostile_complete_raw_a" '##{session_name}' \
+  require_text_absent "$hostile_complete_raw_a" '##{pid}' \
     "format hash is not over-escaped" \
     || hostile_long_assertions=false
   require_text_contains "$hostile_complete_raw_a" '##[fg=red]' \
@@ -14998,7 +15023,7 @@ fi
 
 hostile_short_gate_started=false
 # shellcheck disable=SC2016  # Literal payload must reach the renderer unchanged.
-short_hostile='x#(touch${IFS}PWNED_MARKER)'
+short_hostile='#(touch${IFS}X)'
 if [ "$task10_hostile_ready" = true ]; then
   if wait_status_running_count "$hostile_calls" 0 \
     && rm -f "$hostile_release" \
@@ -15069,8 +15094,8 @@ fi
 
 if [ "$hostile_paths_ready" = true ]; then
   if [ -d "$hostile_repo" ] && [ ! -L "$hostile_repo" ] \
-    && [ ! -e "$check_tmp/PWNED_MARKER" ] \
-    && [ ! -e "$hostile_repo/PWNED_MARKER" ]; then
+    && [ ! -e "$check_tmp/X" ] \
+    && [ ! -e "$hostile_repo/X" ]; then
     pass "literal job-shaped branch text never executed"
   else
     fail "literal job-shaped branch text created PWNED_MARKER"
@@ -15386,8 +15411,8 @@ run_interactive_matrix() {
   ask "tmux COPY, RESIZE, and PREFIX overrode the Neovim or application mode in priority order"
   ask "the Git block showed a clean branch and exact + staged, ~ unstaged, ? untracked, and ! conflicted counts"
   ask "switching buffers between two repositories changed Git root and project-relative file without stale output"
-  ask "Neovim error, warning, line, and visual-column values updated without adding a second persistent row"
-  ask "shell and local full-screen applications showed local path and time while SSH and mosh showed time only"
+  ask "Neovim unsaved, error, warning, line, and visual-column values updated without adding a second persistent row"
+  ask "at 80 columns or wider, local applications showed path and time while SSH and mosh showed time only"
   ask "active, zoom, activity, and bell window states used the approved block colors and markers"
   ask "clicking an inactive tmux window selected it through the native window range"
   ask "tmux kept exactly one useful persistent row at 80 columns and at 120 or more columns"

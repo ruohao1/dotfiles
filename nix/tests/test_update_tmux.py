@@ -3,6 +3,7 @@ import fcntl
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import shutil
 import signal
@@ -100,6 +101,14 @@ class UpdateTmuxTests(unittest.TestCase):
         self.drain()
         return self.command('display-message', '-p', '-c', self.client_name, '#{T:status-' + side + '}')
 
+    def windows(self):
+        return self.command('display-message', '-p', '-c', self.client_name,
+                            '#{W:#{T:window-status-format},#{T:window-status-current-format}}')
+
+    @staticmethod
+    def visible(value):
+        return re.sub(r'#\[[^\]]*\]', '', value).replace('##', '#')
+
     def stop(self):
         self.release.touch()
         for pid, master in self.clients:
@@ -140,15 +149,28 @@ class UpdateTmuxTests(unittest.TestCase):
         self.command('select-window', '-t', pane)
         self.wait(lambda: self.command('display-message', '-p', '-t', pane, '#{pane_current_command}')
                   in ('nvim', 'nvim-wrapped'))
-        for name, value in [('active', '1'), ('mode', 'INSERT'), ('path', 'src/main.lua'),
+        for name, value in [('active', '1'), ('mode', 'INSERT'), ('path', 'src/main.lua'), ('modified', '1'),
                             ('errors', '2'), ('warnings', '1'), ('line', '42'), ('column', '7')]:
             self.command('set-option', '-p', '-t', pane, '@dotfiles_nvim_' + name, value)
         self.attach()
         self.wait(lambda: b'update v1.2.3' in self.output)
         self.assertIn('INSERT', self.render('left'))
         right = self.render()
-        for cue in ['src/main.lua', 'E2', 'W1', '42:7']:
+        for cue in ['src/main.lua', '[+]', 'E2', 'W1', '42:7']:
             self.assertIn(cue, right)
+        self.assertLess(right.index('src/main.lua'), right.index('[+]'))
+        self.assertLess(right.index('[+]'), right.index('E2'))
+        self.assertIn('#[fg=#e0af68,bg=#2A2F41][+]', right)
+        for value in ('0', '', 'true', '01', '1#[fg=red]'):
+            self.command('set-option', '-p', '-t', pane, '@dotfiles_nvim_modified', value)
+            self.assertNotIn('[+]', self.render())
+        self.command('set-option', '-p', '-t', pane, '@dotfiles_nvim_modified', '1')
+        self.resize(60)
+        self.wait(lambda: self.command('display-message', '-p', '-c', self.client_name, '#{client_width}') == '60')
+        self.assertIn('[+]', self.render())
+        self.assertIn('42:7', self.render())
+        self.resize(120)
+        self.wait(lambda: self.command('display-message', '-p', '-c', self.client_name, '#{client_width}') == '120')
         self.command('copy-mode', '-t', pane)
         self.assertIn('COPY', self.render('left'))
         self.command('send-keys', '-t', pane, '-X', 'cancel')
@@ -157,6 +179,116 @@ class UpdateTmuxTests(unittest.TestCase):
         self.assertIn('RESIZE', self.render('left'))
         self.command('switch-client', '-c', self.client_name, '-T', 'prefix')
         self.assertIn('PREFIX', self.render('left'))
+
+    def test_window_state_colors_keep_tab_width_and_name_position(self):
+        self.command('set-option', '-gw', 'monitor-activity', 'off')
+        self.command('rename-window', '-t', 'updates:0', 'console')
+        self.command('split-window', '-d', '-t', 'updates:0', '/bin/sh')
+        self.command('new-window', '-d', '-t', 'updates:1', '-n', 'other', '/bin/sh')
+        self.attach()
+        self.assertIn('#[fg=#a9b1d6,bg=#2A2F41,bold] 0 console', self.windows())
+        self.assertIn('#[fg=#787c99,bg=#1A1B26] 1 other', self.windows())
+        plain = self.visible(self.windows())
+        self.assertEqual(plain, ' 0 console  1 other ')
+        self.command('resize-pane', '-Z', '-t', 'updates:0')
+        self.assertEqual(self.visible(self.windows()), plain)
+        self.assertIn('#[fg=#1A1B26,bg=#7aa2f7,bold] 0 console', self.windows())
+        self.command('select-window', '-t', 'updates:1')
+        self.assertEqual(self.visible(self.windows()), plain)
+        self.assertIn('#[fg=#1A1B26,bg=#7aa2f7,bold] 0 console', self.windows())
+        self.assertIn('#[fg=#a9b1d6,bg=#2A2F41,bold] 1 other', self.windows())
+        self.command('resize-pane', '-Z', '-t', 'updates:0')
+        self.assertIn('#[fg=#787c99,bg=#1A1B26] 0 console', self.windows())
+        self.assertEqual(self.visible(self.windows()), plain)
+        self.command('rename-window', '-t', 'updates:0', 'a-very-long-window-name')
+        self.command('resize-pane', '-Z', '-t', 'updates:0')
+        self.resize(60)
+        self.wait(lambda: self.command('display-message', '-p', '-c', self.client_name, '#{client_width}') == '60')
+        self.assertIn(' 0 a-ver ', self.visible(self.windows()))
+        self.assertNotIn('a-very-long-window-name', self.visible(self.windows()))
+        self.command('move-window', '-s', 'updates:0', '-t', 'updates:12')
+        self.assertIn(' 12 a-ver ', self.visible(self.windows()))
+        self.assertNotIn('[12]', self.visible(self.windows()))
+        for selected in ('updates:1', 'updates:12'):
+            self.command('select-window', '-t', selected)
+            zoomed = self.visible(self.windows())
+            self.command('resize-pane', '-Z', '-t', 'updates:12')
+            self.assertEqual(zoomed, self.visible(self.windows()))
+            self.command('resize-pane', '-Z', '-t', 'updates:12')
+
+    def test_inactive_output_and_bell_markers_clear_when_selected(self):
+        pane = self.command('new-window', '-d', '-P', '-F', '#{pane_id}', '-t', 'updates:1',
+                            '-n', 'alerts', '/bin/sh')
+        self.attach()
+        self.command('send-keys', '-t', pane, "printf 'output\\n'", 'Enter')
+        self.wait(lambda: self.command('display-message', '-p', '-t', pane, '#{window_activity_flag}') == '1')
+        self.assertIn('#[fg=#7dcfff,bg=#1A1B26]•', self.windows())
+        self.assertIn('alerts•', self.visible(self.windows()))
+        self.command('send-keys', '-t', pane, "printf '\\007'", 'Enter')
+        self.wait(lambda: self.command('display-message', '-p', '-t', pane, '#{window_bell_flag}') == '1')
+        self.assertIn('#[fg=#f7768e,bg=#1A1B26]!', self.windows())
+        self.assertIn('alerts•!', self.visible(self.windows()))
+        self.command('split-window', '-d', '-t', pane, '/bin/sh')
+        self.command('resize-pane', '-Z', '-t', pane)
+        self.assertIn('#[fg=#1A1B26,bg=#7aa2f7,bold] 1 alerts', self.windows())
+        self.assertIn('#[fg=#1A1B26,bg=#7aa2f7,bold]•', self.windows())
+        self.assertIn('#[fg=#1A1B26,bg=#7aa2f7,bold]!', self.windows())
+        self.assertIn('alerts•!', self.visible(self.windows()))
+        self.command('resize-pane', '-Z', '-t', pane)
+        self.assertIn('#[fg=#7dcfff,bg=#1A1B26]•', self.windows())
+        self.assertIn('#[fg=#f7768e,bg=#1A1B26]!', self.windows())
+        self.command('select-window', '-t', pane)
+        self.assertNotIn('•', self.visible(self.windows()))
+        self.assertNotIn('!', self.visible(self.windows()))
+
+    def test_project_uses_session_start_directory_and_quotes_format_characters(self):
+        project = self.root / 'r#(touch X)'
+        project.mkdir()
+        self.command('new-session', '-d', '-s', 'project', '-c', str(project).replace('#', '##'), '/bin/sh')
+        self.assertEqual(self.command('display-message', '-p', '-t', 'project:', '#{session_path}'), str(project))
+        self.attach()
+        self.command('switch-client', '-c', self.client_name, '-t', 'project')
+        self.assertIn('r#(touch X)', self.visible(self.render('left')))
+        self.command('send-keys', '-t', 'project:', 'cd /', 'Enter')
+        self.wait(lambda: self.command('display-message', '-p', '-t', 'project:', '#{pane_current_path}') == '/')
+        self.assertIn('r#(touch X)', self.visible(self.render('left')))
+        self.assertFalse((project / 'X').exists(), 'project label executed a tmux job')
+        self.resize(60)
+        self.wait(lambda: self.command('display-message', '-p', '-c', self.client_name, '#{client_width}') == '60')
+        left = self.visible(self.render('left'))
+        self.assertIn(' S ', left)
+        self.assertNotIn('r#(touch X)', left)
+        self.assertNotRegex(self.visible(self.render()), r'\d\d:\d\d')
+
+    def test_narrow_clock_is_hidden_for_shell_and_remote_commands(self):
+        original = self.command('show-options', '-gv', 'status-right')
+        self.command('set-option', '-g', 'status-right',
+                     original.replace('pane_current_command', '@status_test_command'))
+        self.attach()
+        for command in ('sh', 'ssh', 'mosh-client'):
+            with self.subTest(command=command):
+                self.command('set-option', '-g', '@status_test_command', command)
+                for width, visible in ((79, False), (80, True)):
+                    self.resize(width)
+                    self.wait(lambda: self.command('display-message', '-p', '-c', self.client_name,
+                                                    '#{client_width}') == str(width))
+                    self.assertEqual(bool(re.search(r'\d\d:\d\d', self.visible(self.render()))), visible)
+
+    def test_attached_git_summary_keeps_counter_tail_within_each_width_budget(self):
+        summary = self.home / '.config/dotfiles/git-summary'
+        summary.write_text("#!/bin/sh\nprintf '%s\\n' 'topic/abcdefghijklmnopqrstuvwxyz +12 ~3 ?4 !1'\n")
+        self.attach()
+        for width, expected in [(120, '…yz +12 ~3 ?4 !1'), (100, '…12 ~3 ?4 !1'), (80, '…3 ?4 !1')]:
+            with self.subTest(width=width):
+                self.output.clear()
+                self.resize(width)
+                self.command('refresh-client', '-S', '-t', self.client_name)
+                self.wait(lambda: expected.encode() in self.output)
+                self.assertNotIn(b'topic/abcdefghijklmnopqrstuvwxyz', self.output)
+        self.output.clear()
+        self.resize(60)
+        self.wait(lambda: self.command('display-message', '-p', '-c', self.client_name, '#{client_width}') == '60')
+        self.assertNotIn(b' ?4 !1', self.output)
 
     def test_two_clients_stop_triggering_jobs_after_detach(self):
         self.helper()
@@ -177,6 +309,28 @@ class UpdateTmuxTests(unittest.TestCase):
         harness.write_text(function + '\ntmux_status_jobs_are_exact "$1" updates\n')
         return subprocess.run(['/bin/sh', str(harness), str(self.socket)], env=self.env,
                               cwd=self.home, text=True, capture_output=True, timeout=10)
+
+    def test_source_audit_requires_quoted_project_and_exact_modified_predicate(self):
+        source = (SOURCE / '.config/dotfiles/check-terminal-stack').read_text()
+        functions = ''
+        for name in ['count_occurrences', 'tmux_status_assignment_manifest_is_exact',
+                     'tmux_status_palette_is_exact', 'tmux_status_source_is_safe']:
+            functions += name + '() {' + source.split(name + '() {', 1)[1].split('\n}\n', 1)[0] + '\n}\n'
+        harness = self.root / 'source-audit.sh'
+        harness.write_text(functions + '\ntmux_status_source_is_safe "$1"\n')
+        original = (SOURCE / '.config/tmux/conf/status.conf').read_text()
+        candidate = self.root / 'status.conf'
+        mutations = [None,
+                     ('#{b;qh:session_path}', '#{b:session_path}'),
+                     ('#{b;qh:session_path}', '#{session_path}'),
+                     ('#{==:#{@dotfiles_nvim_modified},1}', '#{@dotfiles_nvim_modified}'),
+                     ('#{==:#{@dotfiles_nvim_modified},1}', '#{==:#{@dotfiles_nvim_modified},true}')]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                candidate.write_text(original if mutation is None else original.replace(mutation[0], mutation[1], 1))
+                result = subprocess.run(['/bin/sh', str(harness), str(candidate)], env=self.env,
+                                        cwd=self.home, text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode == 0, mutation is None, result.stdout + result.stderr)
 
     def test_checker_accepts_only_the_exact_updater_job(self):
         result = self.audit_status_jobs()

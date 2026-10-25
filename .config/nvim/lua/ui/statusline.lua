@@ -155,6 +155,7 @@ local semantic_fields = {
   "mode",
   "root",
   "path",
+  "modified",
   "errors",
   "warnings",
   "line",
@@ -239,6 +240,7 @@ local function build_snapshot(context)
       root = root,
       cwd = context.cwd,
     }),
+    modified = context.modified == true,
     errors = finite_integer(context.errors, 0),
     warnings = finite_integer(context.warnings, 0),
     line = finite_integer(context.line, 1),
@@ -263,6 +265,7 @@ local function live_snapshot()
     mode = vim.api.nvim_get_mode().mode,
     name = name,
     buftype = buftype,
+    modified = vim.bo[bufnr].modified,
     root = root,
     cwd = vim.fn.getcwd(0, 0),
     errors = #vim.diagnostic.get(bufnr, {
@@ -298,6 +301,7 @@ local function canonical_semantic(snapshot)
     mode = canonical_mode(snapshot.mode),
     root = root,
     path = sanitize_tail_bytes(snapshot.path, 512),
+    modified = snapshot.modified == true,
     errors = finite_integer(snapshot.errors, 0),
     warnings = finite_integer(snapshot.warnings, 0),
     line = finite_integer(snapshot.line, 1),
@@ -358,10 +362,14 @@ local function render_parts(snapshot, git_summary)
   end
 
   if profile.path > 0 then
-    local path = truncate_left(snapshot.path or "", profile.path)
+    local path =
+      truncate_left(snapshot.path or "", profile.path - (snapshot.modified == true and 4 or 0))
     if path ~= "" then
       add_component("DotfilesStatusContext", path)
     end
+  end
+  if snapshot.modified == true then
+    add_component("DotfilesStatusWarning", "[+]")
   end
 
   local errors = finite_integer(snapshot.errors, 0)
@@ -648,6 +656,7 @@ local git_refresh_events = {
 }
 
 local semantic_only_events = {
+  BufModifiedSet = true,
   ModeChanged = true,
   CursorMoved = true,
   CursorMovedI = true,
@@ -971,6 +980,7 @@ local function new_runtime(deps)
     "DirChanged",
   }, "Refresh status state and Git context")
   register_scheduled({
+    "BufModifiedSet",
     "ModeChanged",
     "CursorMoved",
     "CursorMovedI",
