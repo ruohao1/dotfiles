@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT/'nix'))
 from update import UpdateError, state
 from update import deployment
+from migration import status
 
 RELEASE = {'repository': 'ruohao1/dotfiles', 'releaseId': 2,
            'version': 'v1.2.3', 'commit': 'b'*40}
@@ -226,6 +228,148 @@ class Installed(unittest.TestCase):
                 consumerSource='/nix/store/'+'a'*32+'-source', profile='host')
         self.plan = inspect(self.manifest, self.home)
         apply(self.plan, self.manifest, runtime=self.runtime)
+
+    def test_migration_status_returns_manifests_without_writing(self):
+        self.apply()
+        def snapshot():
+            return {str(path.relative_to(self.home)): (
+                path.lstat().st_mode,
+                os.readlink(path) if path.is_symlink() else path.read_bytes() if path.is_file() else None)
+                for path in self.home.rglob('*')}
+        before = snapshot()
+        with patch.object(Path, 'is_dir', return_value=True):
+            self.assertEqual(status.inspect_status(self.home), dict(state='active',
+                transactionId=self.plan['transactionId'], generation=str(self.generation), manifest=self.manifest,
+                retained=[dict(generation=str(self.generation), manifest=self.manifest)]))
+            self.assertEqual(deployment.read_installed(self.home), dict(state='installed', release=OLD,
+                transactionId=self.plan['transactionId'], generation=str(self.generation),
+                retained=[dict(generation=str(self.generation), release=OLD)]))
+        self.assertEqual(status.retained_plan(self.home, self.plan['transactionId']), self.plan)
+        self.assertEqual(snapshot(), before)
+        self.assertEqual(self.runtime.calls, [str(self.generation)])
+
+    def test_status_without_owner_distinguishes_absence_and_lock(self):
+        from migration.model import Conflict, ownership_root
+        root = ownership_root(self.home)
+        self.assertEqual(status.inspect_status(self.home), dict(state='unmanaged', retained=[], detail=''))
+        self.assertIsNone(status.retained_plan(self.home, 'e'*32))
+        self.assertFalse(root.exists())
+        (root/'lock').mkdir(parents=True, mode=0o700)
+        self.assertEqual(deployment.read_installed(self.home), dict(state='pending', release=None,
+            retained=[], detail='Deployment lock requires inspection.'))
+        with self.assertRaises(Conflict):
+            deployment.read_installed('relative-home')
+
+    def test_pending_status_checks_retained_identities_without_profile_probes(self):
+        from migration.transaction import Journal
+        self.apply()
+        journal = Journal(self.home, self.plan['transactionId'])
+        for phase, owner_phase, rollback in [('activating', 'home-manager', {}),
+                ('active', 'transferring', {}), ('active', 'recovering', {}),
+                ('active', 'home-manager', dict(state='intent', generation=str(self.generation)))]:
+            with self.subTest(phase=phase, owner_phase=owner_phase, rollback=rollback), \
+                    patch.object(status.Runtime, 'selected_generation', side_effect=AssertionError('pending profile probe')):
+                journal.data.update(phase=phase, rollback=rollback)
+                journal.save()
+                journal.owner(owner_phase)
+                self.assertEqual(status.inspect_status(self.home)['state'], 'pending')
+                self.assertEqual(deployment.read_installed(self.home)['retained'],
+                                 [dict(generation=str(self.generation), release=OLD)])
+        other = '/nix/store/'+'2'*32+'-generation'
+        journal.data['generations'][other] = dict(self.manifest, activationPackage=other, deploymentIdentity={})
+        journal.save()
+        self.assertEqual(status.inspect_status(self.home)['state'], 'pending')
+        self.assertEqual(deployment.read_installed(self.home), dict(state='inconsistent', release=None,
+            retained=[], detail='invalid generation release identity'))
+
+    def test_unpublished_children_override_active_parent_and_ambiguity_fails(self):
+        from migration import plan, transaction
+        from migration.model import Conflict, read_owner
+        self.apply()
+        owner = read_owner(self.home)
+        original = transaction.Journal.step
+        def stop(journal, name, action):
+            if name == 'publish-transferring':
+                raise InterruptedError('before child owner publication')
+            return original(journal, name, action)
+        for count in [1, 2]:
+            proposal = plan.inspect(self.manifest, self.home)
+            with patch.object(transaction.Journal, 'step', stop), self.assertRaises(InterruptedError):
+                transaction.apply(proposal, self.manifest, runtime=self.runtime)
+            self.assertEqual(read_owner(self.home), owner)
+            if count == 1:
+                self.assertEqual(deployment.read_installed(self.home), dict(state='pending', release=None,
+                    transactionId=proposal['transactionId'],
+                    retained=[dict(generation=str(self.generation), release=OLD)]))
+            else:
+                with self.assertRaisesRegex(Conflict, 'multiple unfinished journals'):
+                    status.inspect_status(self.home)
+                self.assertEqual(deployment.read_installed(self.home)['state'], 'inconsistent')
+        (Path(proposal['journalPath']).parent/'invalid-transaction').mkdir(mode=0o700)
+        with self.assertRaisesRegex(Conflict, 'invalid transaction ID'):
+            status.inspect_status(self.home)
+
+    def test_status_rejects_owner_journal_and_generation_drift(self):
+        from migration.model import ownership_root
+        from migration.transaction import Journal, write_json
+        self.apply()
+        journal = Journal(self.home, self.plan['transactionId'])
+        original = journal.path.read_bytes()
+        owner_path = ownership_root(self.home)/'owner.json'
+        owner_bytes = owner_path.read_bytes()
+        for changed in ['owner-path', 'owner-fingerprint', 'journal-selection', 'retained-identity', 'missing-generation']:
+            journal.data = json.loads(original)
+            owner = json.loads(owner_bytes)
+            if changed == 'owner-path':
+                owner['journalPath'] += '.other'
+            elif changed == 'owner-fingerprint':
+                owner['manifestFingerprint'] = 'f'*64
+            elif changed == 'journal-selection':
+                journal.data['selectedGeneration'] = '/nix/store/foreign'
+            elif changed == 'retained-identity':
+                journal.data['generations'][str(self.generation)]['activationPackage'] = '/nix/store/foreign'
+            journal.save()
+            write_json(owner_path, owner)
+            with self.subTest(changed=changed), patch.object(Path, 'is_dir', return_value=changed != 'missing-generation'):
+                self.assertEqual(deployment.read_installed(self.home)['state'], 'inconsistent')
+
+    def test_recovery_decisions_preserve_rollback_priority_and_quoting(self):
+        from migration.model import Conflict, ownership_root
+        from migration.transaction import Journal, write_json
+        self.apply()
+        journal = Journal(self.home, self.plan['transactionId'])
+        owner_path = ownership_root(self.home)/'owner.json'
+        owner = json.loads(owner_path.read_bytes())
+        for rollback, ownership, operation in [(None, 'matching', 'apply'), (None, 'absent', 'restore-legacy'),
+                (None, 'other', 'restore-legacy'), ('intent', 'malformed', 'rollback'),
+                ('complete', 'malformed', 'rollback')]:
+            journal.data['rollback'] = {} if rollback is None else dict(state=rollback, generation=str(self.generation))
+            journal.save()
+            if ownership == 'absent':
+                owner_path.unlink()
+            else:
+                write_json(owner_path, {} if ownership == 'malformed' else
+                           dict(owner, transactionId='f'*32) if ownership == 'other' else owner)
+            candidate = dict(executor='/retained executor/bin/run', callerPath='/original path/bin',
+                planPath='/retained plan/review.json', transactionId=self.plan['transactionId'])
+            action = dict(command=operation)
+            if operation == 'rollback':
+                action['generation'] = str(self.generation)
+            with self.subTest(rollback=rollback, ownership=ownership), patch.dict(os.environ, HOME=str(self.home)):
+                self.assertEqual(status.recovery_action(self.home, candidate['transactionId']), action)
+                commands = [shlex.split(line) for line in deployment.recovery_commands(candidate).splitlines()]
+                prefix = ['env', 'HOME='+str(self.home), 'PATH='+candidate['callerPath'], candidate['executor']]
+                restore = prefix+['restore-legacy', '--transaction', candidate['transactionId']]
+                expected = [restore] if operation == 'restore-legacy' else [prefix+(
+                    ['apply', '--plan', candidate['planPath']] if operation == 'apply' else
+                    ['rollback', '--generation', str(self.generation)]), restore]
+                self.assertEqual(commands, expected)
+        self.assertEqual(status.recovery_action(self.home, 'e'*32), dict(command='apply'))
+        journal.path.write_text('{}')
+        with self.assertRaises(Conflict):
+            status.recovery_action(self.home, self.plan['transactionId'])
+        with self.assertRaises(Conflict):
+            status.retained_plan(self.home, self.plan['transactionId'])
 
     def test_old_journal_and_manual_profile_drift_are_truthful(self):
         self.assertTrue(hasattr(deployment, 'read_installed'), 'installed state reader missing')

@@ -14,8 +14,9 @@ import uuid
 from urllib.parse import quote
 
 from . import UpdateError, state
-from migration.model import Conflict, canonical_home, ownership_root, read_owner, safe_directory
-from migration.transaction import Journal, Runtime
+from migration import status as migration_status
+from migration.model import Conflict, canonical_home, safe_directory
+from migration.transaction import Runtime
 
 
 def _validator():
@@ -204,44 +205,15 @@ def read_installed(home):
     """Only the validated selected generation can claim an installed release."""
     home = canonical_home(home)
     try:
-        owner = read_owner(home)
-        transactions = ownership_root(home)/'transactions'
-        unpublished = []
-        if transactions.exists():
-            safe_directory(transactions)
-            for entry in transactions.iterdir():
-                retained = Journal(home, entry.name)
-                if (retained.data['phase'] == 'prepared'
-                        and retained.data.get('parentTransaction') == (owner['transactionId'] if owner else None)):
-                    unpublished.append(retained)
-        if len(unpublished) > 1:
-            raise UpdateError('multiple unfinished journals require explicit recovery')
-        if unpublished:
-            journal = unpublished[0]
-        elif owner is None:
-            locked = (ownership_root(home)/'lock').exists()
-            return {'state': 'pending' if locked else 'unmanaged', 'release': None, 'retained': [],
-                    'detail': 'Deployment lock requires inspection.' if locked else ''}
-        else:
-            journal = Journal(home, owner['transactionId'])
-        if not unpublished and (owner['journalPath'] != str(journal.path)
-                or owner['manifestFingerprint'] != journal.data['plan']['manifestFingerprint']):
-            raise UpdateError('owner and journal disagree')
-        result = {'state': 'pending', 'release': None, 'transactionId': journal.data['transactionId'], 'retained': []}
-        for generation, manifest in journal.data['generations'].items():
-            if manifest['activationPackage'] != generation:
-                raise UpdateError('retained generation identity mismatch')
-            result['retained'].append({'generation': generation, 'release': _identity(manifest)})
-        if (unpublished or owner['phase'] != 'home-manager' or journal.data['phase'] != 'active'
-                or journal.data.get('rollback', {}).get('state') == 'intent'):
-            return result
-        generation = owner['selectedGeneration']
-        manifest = journal.data['generations'][generation]
-        if (journal.data['selectedGeneration'] != generation
-                or Runtime(home).selected_generation(manifest) != generation or not Path(generation).is_dir()):
-            raise UpdateError('selected Home Manager profile differs from ownership evidence')
-        release = _identity(manifest)
-        return dict(result, state='installed' if release else 'unversioned', generation=generation, release=release)
+        observed = migration_status.inspect_status(home)
+        result = {key: value for key, value in observed.items() if key not in ('manifest', 'retained')}
+        result.update(release=None, retained=[
+            {'generation': item['generation'], 'release': _identity(item['manifest'])}
+            for item in observed['retained']])
+        if observed['state'] == 'active':
+            release = _identity(observed['manifest'])
+            result.update(state='installed' if release else 'unversioned', release=release)
+        return result
     except (Conflict, UpdateError, OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         return {'state': 'inconsistent', 'release': None, 'retained': [], 'detail': str(error)}
 
@@ -331,11 +303,9 @@ def recovery(root, transaction):
             raise UpdateError('retained plan hash or transaction identity changed')
         _validate_preview(value, plan, home)
         _executor(value)
-        journal_path = home/'.local/state/dotfiles-ownership/transactions'/transaction
-        if journal_path.exists():
-            journal = Journal(home, transaction)
-            if journal.data['plan'] != plan:
-                raise UpdateError('retained preview differs from transaction journal')
+        reviewed_plan = migration_status.retained_plan(home, transaction)
+        if reviewed_plan is not None and reviewed_plan != plan:
+            raise UpdateError('retained preview differs from transaction journal')
         matches.append(value)
     if len(matches) != 1:
         raise UpdateError('no unique retained executor for this transaction; use its original bootstrap-nix recovery source')
@@ -346,17 +316,11 @@ def recovery_commands(candidate):
     prefix = ['env', 'HOME='+os.environ['HOME'], 'PATH='+candidate['callerPath'], candidate['executor']]
     restore = ['restore-legacy', '--transaction', candidate['transactionId']]
     command = ['apply', '--plan', candidate['planPath']]
-    home = canonical_home(os.environ['HOME'])
-    journal_path = ownership_root(home)/'transactions'/candidate['transactionId']
-    if journal_path.exists():
-        journal = Journal(home, candidate['transactionId'])
-        rollback = journal.data.get('rollback', {})
-        if rollback.get('state') in ('intent', 'complete'):
-            command = ['rollback', '--generation', rollback['generation']]
-        else:
-            owner = read_owner(home)
-            if not owner or owner['transactionId'] != candidate['transactionId']:
-                command = restore
+    action = migration_status.recovery_action(os.environ['HOME'], candidate['transactionId'])
+    if action['command'] == 'rollback':
+        command = ['rollback', '--generation', action['generation']]
+    elif action['command'] == 'restore-legacy':
+        command = restore
     commands = [command] if command == restore else [command, restore]
     return '\n'.join(shlex.join(prefix+args) for args in commands)
 
