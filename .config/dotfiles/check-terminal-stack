@@ -10504,7 +10504,7 @@ if [ "$tmux_started" = true ]; then
     'fg=#787c99,bg=#1A1B26' \
     "tmux inactive windows use the exact muted style" || true
   require_tmux_option_value "$check_socket" session window-status-current-style \
-    'fg=#1A1B26,bg=#7aa2f7,bold' \
+    'fg=#a9b1d6,bg=#2A2F41,bold' \
     "tmux current window uses the exact active surface" || true
   require_tmux_option_value "$check_socket" session window-status-activity-style \
     'fg=#7dcfff,bg=#1A1B26' \
@@ -10514,7 +10514,7 @@ if [ "$tmux_started" = true ]; then
     "tmux bell marker uses the exact red style" || true
 
   task6_expected_window_status_format='#[fg=#787c99,bg=#1A1B26] #{?window_zoomed_flag,[#{window_index}],#{window_index}} #{?#{e|>=:#{client_width},120},#{=12:#{qh:window_name}},#{?#{e|>=:#{client_width},100},#{=10:#{qh:window_name}},#{=5:#{qh:window_name}}}}#{?window_activity_flag,#[fg=#7dcfff#,bg=#1A1B26]•#[fg=#787c99#,bg=#1A1B26],}#{?window_bell_flag,#[fg=#f7768e#,bg=#1A1B26]!#[fg=#787c99#,bg=#1A1B26],} #[default]'
-  task6_expected_window_status_current_format='#[fg=#1A1B26,bg=#7aa2f7,bold] #{?window_zoomed_flag,[#{window_index}],#{window_index}} #{?#{e|>=:#{client_width},120},#{=12:#{qh:window_name}},#{?#{e|>=:#{client_width},100},#{=10:#{qh:window_name}},#{=5:#{qh:window_name}}}}#{?window_activity_flag,#[fg=#1A1B26#,bg=#7aa2f7#,bold]•#[fg=#1A1B26#,bg=#7aa2f7#,bold],}#{?window_bell_flag,#[fg=#1A1B26#,bg=#7aa2f7#,bold]!#[fg=#1A1B26#,bg=#7aa2f7#,bold],} #[default]'
+  task6_expected_window_status_current_format='#[fg=#a9b1d6,bg=#2A2F41,bold] #{?window_zoomed_flag,[#{window_index}],#{window_index}} #{?#{e|>=:#{client_width},120},#{=12:#{qh:window_name}},#{?#{e|>=:#{client_width},100},#{=10:#{qh:window_name}},#{=5:#{qh:window_name}}}}#{?window_activity_flag,#[fg=#a9b1d6#,bg=#2A2F41#,bold]•#[fg=#a9b1d6#,bg=#2A2F41#,bold],}#{?window_bell_flag,#[fg=#a9b1d6#,bg=#2A2F41#,bold]!#[fg=#a9b1d6#,bg=#2A2F41#,bold],} #[default]'
   require_tmux_option_value "$check_socket" session window-status-format \
     "$task6_expected_window_status_format" \
     "tmux inactive window format is exact" || true
@@ -12262,7 +12262,7 @@ TASK6_APPLICATION_CASES
   require_tmux_option_value "$check_socket" session visual-bell off "tmux reload preserves disabled bell overlays" || true
   require_tmux_option_value "$check_socket" session window-status-separator '' "tmux reload preserves the gapless window list" || true
   require_tmux_option_value "$check_socket" session window-status-style 'fg=#787c99,bg=#1A1B26' "tmux reload preserves the inactive window style" || true
-  require_tmux_option_value "$check_socket" session window-status-current-style 'fg=#1A1B26,bg=#7aa2f7,bold' "tmux reload preserves the current window style" || true
+  require_tmux_option_value "$check_socket" session window-status-current-style 'fg=#a9b1d6,bg=#2A2F41,bold' "tmux reload preserves the current window style" || true
   require_tmux_option_value "$check_socket" session window-status-activity-style 'fg=#7dcfff,bg=#1A1B26' "tmux reload preserves the activity window style" || true
   require_tmux_option_value "$check_socket" session window-status-bell-style 'fg=#f7768e,bg=#1A1B26' "tmux reload preserves the bell window style" || true
   require_tmux_option_value "$check_socket" session window-status-format "$task6_expected_window_status_format" "tmux reload preserves the exact inactive window format" || true

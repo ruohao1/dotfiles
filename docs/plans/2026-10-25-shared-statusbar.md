@@ -6,7 +6,7 @@
 
 - Keep the mode at the left. COPY, RESIZE, and PREFIX retain priority over editor mode.
 - Show the project name without Editor or Terminal suffixes.
-- Strongly highlight the selected window. Use `1 nvim` normally and `[1] nvim` when zoomed, including inactive zoomed windows.
+- Use a subtle dark background and bold text for the selected window. Use `1 nvim` normally and `[1] nvim` when zoomed, including inactive zoomed windows.
 - Keep `•` for background output and `!` for a terminal bell. These do not imply task completion or failure.
 - Use no additional state labels, zoom icon, or italics.
 - Show `[+]` for an unsaved editor buffer. Preserve file, diagnostics, and cursor context.
@@ -18,7 +18,7 @@ Use the existing native tmux formats and Neovim bridge. Keep the TokyoNight pale
 
 Keep the existing 80/100/120-column profiles and 48-cell side limits. Project caps are 8/10/12 cells; below 80 use 8 cells and hide it below 40. Window-name caps are 5/10/12 cells. Git display caps stay at 8/12/16 cells so change counters retain their space. Keep the original positions: mode/project/Git on the left, windows absolutely centered, and file context on the right. Keep the original one-cell padding on both sides of segments and tabs, with activity/bell symbols attached to the window name. Keep one space between the index and name; do not use a colon. Keep the current file or directory context on the right. Hide the shell clock below 80. Window indices remain outside truncated window names so zoom brackets cannot be clipped. Unsaved state is a strict boolean, published as `@dotfiles_nvim_modified=0|1`; its marker remains available in the narrow profile.
 
-Selection by background and zoom by brackets remain independent. Text labels and italic zoom were considered and rejected during design. The user's boxed-index choice uses ordinary terminal characters.
+Selection by a subtle background and bold text, and zoom by brackets, remain independent. The user preferred this quieter selection over the initial blue fill. Text labels and italic zoom were considered and rejected during design. The user's boxed-index choice uses ordinary terminal characters.
 
 The compact-layout refinement shortens long labels while retaining the original positions and padding. Keep relative file paths: replacing them with basenames would make files such as `src/index.ts` and `tests/index.ts` indistinguishable.
 
