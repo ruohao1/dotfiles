@@ -180,26 +180,33 @@ class UpdateTmuxTests(unittest.TestCase):
         self.command('switch-client', '-c', self.client_name, '-T', 'prefix')
         self.assertIn('PREFIX', self.render('left'))
 
-    def test_selected_window_and_boxed_zoom_index_keep_the_window_name(self):
+    def test_selected_window_and_rounded_zoom_index_keep_the_window_name(self):
         self.command('rename-window', '-t', 'updates:0', 'console')
         self.command('split-window', '-d', '-t', 'updates:0', '/bin/sh')
         self.command('new-window', '-d', '-t', 'updates:1', '-n', 'other', '/bin/sh')
         self.attach()
         self.assertIn('#[fg=#a9b1d6,bg=#2A2F41,bold] 0 console', self.windows())
         self.command('resize-pane', '-Z', '-t', 'updates:0')
-        self.assertIn('[0] console', self.visible(self.windows()))
+        self.assertIn('0 console', self.visible(self.windows()))
+        self.assertIn('#[fg=#787c99,bg=#2A2F41]#[fg=#1A1B26,bg=#787c99]0'
+                      '#[fg=#787c99,bg=#2A2F41]#[fg=#a9b1d6,bg=#2A2F41,bold] console', self.windows())
         self.command('select-window', '-t', 'updates:1')
-        self.assertIn('[0] console', self.visible(self.windows()))
+        self.assertIn('0 console', self.visible(self.windows()))
+        self.assertIn('#[fg=#787c99,bg=#1A1B26]#[fg=#1A1B26,bg=#787c99]0'
+                      '#[fg=#787c99,bg=#1A1B26] console', self.windows())
         self.assertIn('#[fg=#a9b1d6,bg=#2A2F41,bold] 1 other', self.windows())
         self.command('resize-pane', '-Z', '-t', 'updates:0')
-        self.assertNotIn('[0]', self.visible(self.windows()))
+        self.assertNotIn('0', self.visible(self.windows()))
         self.assertIn('0 console', self.visible(self.windows()))
         self.command('rename-window', '-t', 'updates:0', 'a-very-long-window-name')
         self.command('resize-pane', '-Z', '-t', 'updates:0')
         self.resize(60)
         self.wait(lambda: self.command('display-message', '-p', '-c', self.client_name, '#{client_width}') == '60')
-        self.assertIn('[0] ', self.visible(self.windows()))
+        self.assertIn('0 ', self.visible(self.windows()))
         self.assertNotIn('a-very-long-window-name', self.visible(self.windows()))
+        self.command('move-window', '-s', 'updates:0', '-t', 'updates:12')
+        self.assertIn('12 a-ver', self.visible(self.windows()))
+        self.assertNotIn('[12]', self.visible(self.windows()))
 
     def test_inactive_output_and_bell_markers_clear_when_selected(self):
         pane = self.command('new-window', '-d', '-P', '-F', '#{pane_id}', '-t', 'updates:1',
