@@ -39,13 +39,24 @@ existing session rooted at the exact current directory before the Git root.
 
 ## Switch between running sessions
 
-Press **Alt+Space, then f** to open a fuzzy session picker. Type a session name
-or part of its project path, then press Enter to switch this terminal. The list
-includes separate Neovim sessions. Escape or Ctrl+C closes the picker without
-switching. Other attached terminals keep their current sessions.
+Press **Alt+Space, then f** to open a fuzzy project picker. Each project appears
+once, with its directory and session count. Type a project name or part of its
+path, then press Enter. If the project has one session, this terminal switches
+directly. If it has several, a second picker lets you search their names and
+choose a session, including Neovim or any extra shell sessions.
 
-The picker searches sessions on the current tmux server. It displays each
-session's starting directory, even if a shell has since changed directories.
+The managed editor appears as **Editor · Neovim**. Other sessions appear as
+**Terminal · name**, so extra terminals remain distinguishable. These are picker
+labels; the actual tmux session names stay unchanged.
+
+Escape or Ctrl+C at either step closes the picker without switching. Other
+attached terminals keep their current sessions.
+
+The picker groups sessions on the current tmux server by their exact starting
+directory, even if a shell has since changed directories. Different worktrees
+and different starting directories remain separate projects; it does not infer
+Git roots or combine sessions with different paths. Every session remains
+available within its project, and the picker never creates or closes sessions.
 It requires tmux 3.2+, Python 3.9+, and fzf (included by both installation paths).
 The picker uses its own fzf options; global fzf option overrides do not apply.
 

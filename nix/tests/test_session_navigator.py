@@ -1,4 +1,5 @@
 """Exercise session navigation on private tmux servers, never the user's server."""
+import errno
 import fcntl
 import json
 import os
@@ -19,6 +20,7 @@ import unittest
 SOURCE = Path(__file__).resolve().parents[2]
 HELPER = Path(os.environ.get('DOTFILES_SESSION_NAVIGATOR_HELPER',
                              SOURCE / '.config/tmux/scripts/session-navigator'))
+PROJECT_HELPER = HELPER.resolve().with_name('project-session')
 KEYS = Path(os.environ.get('DOTFILES_SESSION_NAVIGATOR_KEYS', SOURCE / '.config/tmux/conf/keys.conf'))
 TMUX = shutil.which('tmux')
 FZF = shutil.which('fzf')
@@ -29,11 +31,18 @@ from pathlib import Path
 data = sys.stdin.buffer.read()
 Path(os.environ['NAV_INPUT']).write_bytes(data)
 Path(os.environ['NAV_ENV']).write_text(json.dumps(dict(os.environ)))
-mode = os.environ.get('NAV_MODE', 'select')
+calls = Path(os.environ['NAV_CALLS'])
+stage = len(calls.read_text().splitlines()) if calls.exists() else 0
+with calls.open('a') as log:
+    log.write(json.dumps({'prompt': next(arg for arg in sys.argv if arg.startswith('--prompt=')),
+                         'records': data.decode().rstrip('\0').split('\0')}) + '\n')
+modes = json.loads(os.environ['NAV_MODES'])
+mode = modes[min(stage, len(modes) - 1)]
 if mode in ('cancel', 'interrupt', 'error'):
     sys.exit({'cancel': 1, 'interrupt': 130, 'error': 2}[mode])
+allowed = json.loads(os.environ['NAV_PROJECT_IDS']) if stage == 0 else [os.environ['NAV_SELECTED']]
 record = next(row for row in data.split(b'\0')
-              if row.startswith(os.environ['NAV_SELECTED'].encode() + b'\t'))
+              if row.split(b'\t', 1)[0].decode() in allowed)
 if mode == 'disappear':
     subprocess.run([os.environ['NAV_TMUX'], '-S', os.environ['NAV_SOCKET'],
                     'kill-session', '-t', os.environ['NAV_SELECTED']], check=True)
@@ -67,6 +76,7 @@ class SessionNavigatorTests(unittest.TestCase):
                     'TERM': 'xterm-256color', 'LANG': 'C.UTF-8', 'SHELL': '/bin/sh',
                     'TMUX': str(self.root / 'wrong-socket') + ',0,0', 'TMUX_PANE': '%999999',
                     'NAV_INPUT': str(self.root / 'fzf-input'), 'NAV_ENV': str(self.root / 'fzf-env'),
+                    'NAV_CALLS': str(self.root / 'fzf-calls'),
                     'NAV_TMUX': TMUX, 'NAV_SOCKET': str(self.socket)}
         self.clients = []
         self.server = subprocess.Popen([TMUX, '-D', '-S', str(self.socket), '-f', '/dev/null'],
@@ -90,8 +100,11 @@ class SessionNavigatorTests(unittest.TestCase):
         return result.stdout.removesuffix('\n')
 
     def session(self, name, path=None):
+        if path is None:
+            path = self.root / 'projects' / name
+            path.mkdir(parents=True, exist_ok=True)
         return self.command('new-session', '-d', '-P', '-F', '#{session_id}', '-s', name,
-                            '-c', str(path or self.home), '/bin/sh')
+                            '-c', str(path), '/bin/sh')
 
     def attach(self, session):
         pid, master = pty.fork()
@@ -144,9 +157,21 @@ class SessionNavigatorTests(unittest.TestCase):
         executable.write_text('#!' + sys.executable + '\n' + body)
         executable.chmod(0o755)
 
-    def navigate(self, mode='select', target=None, **extra):
-        return subprocess.run([str(HELPER), str(self.socket), self.invoker['name']],
-                              env=dict(self.env, NAV_MODE=mode, NAV_SELECTED=target or self.target,
+    def picker_calls(self):
+        return [json.loads(line) for line in (self.root / 'fzf-calls').read_text().splitlines()]
+
+    def managed_editor_name(self, path):
+        result = subprocess.run([sys.executable, str(PROJECT_HELPER), 'editor-name', str(path)],
+                                env=self.env, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.removesuffix('\n')
+
+    def navigate(self, mode='select', target=None, project_ids=None, helper=HELPER, **extra):
+        target = target or self.target
+        (self.root / 'fzf-calls').unlink(missing_ok=True)
+        return subprocess.run([str(helper), str(self.socket), self.invoker['name']],
+                              env=dict(self.env, NAV_MODES=json.dumps(mode if isinstance(mode, list) else [mode]),
+                                       NAV_SELECTED=target, NAV_PROJECT_IDS=json.dumps(project_ids or [target]),
                                        NAV_CLIENT=self.invoker['name'], **extra),
                               cwd=self.home, text=True, capture_output=True, timeout=10)
 
@@ -171,6 +196,120 @@ class SessionNavigatorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.positions(), {self.invoker['name']: self.target,
                                            self.other['name']: self.second})
+        self.assertEqual(len(self.picker_calls()), 1, 'singleton project should switch directly')
+
+    def test_shared_directory_is_one_project_with_every_session_selectable(self):
+        path = self.root / 'shared-project'
+        path.mkdir()
+        members = [self.session(name, path) for name in ('project-shell', 'nvim-project', 'extra-shell')]
+        result = self.navigate(target=members[-1], project_ids=members)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.picker_calls()
+        self.assertEqual(len(calls), 2, 'shared project must open a second session picker')
+        self.assertEqual(calls[0]['prompt'], '--prompt=Projects> ')
+        self.assertEqual(calls[1]['prompt'], '--prompt=Sessions> ')
+        self.assertEqual(len(calls[0]['records']), 4)
+        project_rows = [row for row in calls[0]['records'] if row.split('\t', 1)[0] in members]
+        self.assertEqual(len(project_rows), 1)
+        self.assertIn(str(path), project_rows[0])
+        self.assertIn('3 sessions', project_rows[0])
+        self.assertEqual({row.split('\t', 1)[0] for row in calls[1]['records']}, set(members))
+        self.assertEqual(self.positions(), {self.invoker['name']: members[-1],
+                                           self.other['name']: self.second})
+
+    def test_friendly_labels_identify_only_the_exact_managed_editor_without_renaming(self):
+        path = self.root / 'friendly-project'
+        path.mkdir()
+        names = ('my-shell', self.managed_editor_name(path), 'nvim-custom', 'extra-terminal')
+        members = [self.session(name, path) for name in names]
+        self.assertEqual(self.command('show-options', '-qv', '-t', members[1], '@dotfiles_project_role'), '')
+        before = self.command('list-sessions', '-F', '#{session_id}\t#{session_name}')
+        result = self.navigate(target=members[1], project_ids=members)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        labels = dict(row.split('\t', 1) for row in self.picker_calls()[1]['records'])
+        self.assertEqual(labels, {members[0]: 'Terminal · my-shell', members[1]: 'Editor · Neovim',
+                                  members[2]: 'Terminal · nvim-custom', members[3]: 'Terminal · extra-terminal'})
+        self.assertEqual(self.positions(), {self.invoker['name']: members[1], self.other['name']: self.second})
+        self.assertEqual(self.command('list-sessions', '-F', '#{session_id}\t#{session_name}'), before)
+
+    def test_missing_project_helper_keeps_sessions_accessible_with_terminal_labels(self):
+        standalone = self.root / 'standalone' / 'session-navigator'
+        standalone.parent.mkdir()
+        shutil.copy2(HELPER, standalone)
+        path = self.root / 'fallback-project'
+        path.mkdir()
+        editor_name = self.managed_editor_name(path)
+        members = [self.session(name, path) for name in ('shell', editor_name)]
+        result = self.navigate(target=members[1], project_ids=members, helper=standalone)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        labels = dict(row.split('\t', 1) for row in self.picker_calls()[1]['records'])
+        self.assertEqual(labels, {members[0]: 'Terminal · shell', members[1]: 'Terminal · ' + editor_name})
+        self.assertEqual(self.positions(), {self.invoker['name']: members[1], self.other['name']: self.second})
+
+    def test_distinct_directories_with_the_same_basename_stay_separate(self):
+        paths = [self.root / side / 'project' for side in ('left', 'right')]
+        for path in paths:
+            path.mkdir(parents=True)
+        members = [self.session(name, path) for name, path in zip(('left', 'right'), paths)]
+        for target, path in zip(members, paths):
+            with self.subTest(path=path):
+                result = self.navigate(target=target)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = self.picker_calls()
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(len(calls[0]['records']), 5)
+                self.assertTrue(any(str(path) in row for row in calls[0]['records']))
+                self.assertEqual(self.positions()[self.invoker['name']], target)
+
+    def test_raw_paths_remain_distinct_when_display_labels_collide(self):
+        for kind, suffixes, count in (('controls', (b'\t', b'\n'), 5), ('invalid', (b'\xff', b'\xfe'), 7)):
+            with self.subTest(kind=kind):
+                paths = [Path(os.fsdecode(os.fsencode(self.root) + b'/' + kind.encode() + suffix))
+                         for suffix in suffixes]
+                try:
+                    for path in paths:
+                        path.mkdir()
+                except (UnicodeError, OSError) as error:
+                    if kind == 'invalid' and (isinstance(error, UnicodeError) or error.errno == errno.EILSEQ):
+                        self.skipTest('filesystem rejects non-UTF8 filenames')
+                    raise
+                members = [self.session(kind + name, path) for name, path in zip(('-one', '-two'), paths)]
+                result = self.navigate(target=members[1])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = self.picker_calls()
+                self.assertEqual(len(calls), 1)
+                offered = dict(row.split('\t', 1) for row in calls[0]['records'])
+                self.assertEqual(len(offered), count)
+                if kind == 'controls':
+                    self.assertEqual(offered[members[0]], offered[members[1]])
+                self.assertTrue(set(members).issubset(offered))
+                self.assertEqual(self.positions()[self.invoker['name']], members[1])
+
+    def test_second_picker_cancellation_and_invalid_output_leave_clients_unchanged(self):
+        path = self.root / 'shared-project'
+        path.mkdir()
+        members = [self.session(name, path) for name in ('project-shell', 'nvim-project')]
+        before = self.positions()
+        for mode in ('cancel', 'interrupt', 'error', 'modified', 'foreign', 'multiple', 'empty', 'unterminated'):
+            with self.subTest(mode=mode):
+                result = self.navigate(['select', mode], target=members[1], project_ids=members)
+                self.assertEqual(len(self.picker_calls()), 2)
+                self.assertEqual(result.returncode == 0, mode in ('cancel', 'interrupt'), result.stderr)
+                self.assertEqual(self.positions(), before)
+
+    def test_second_picker_disappearing_session_or_client_never_redirects(self):
+        path = self.root / 'shared-project'
+        path.mkdir()
+        members = [self.session(name, path) for name in ('project-shell', 'project-shell-other', 'nvim-project')]
+        before = self.positions()
+        result = self.navigate(['select', 'disappear'], target=members[0], project_ids=members)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(len(self.picker_calls()), 2)
+        self.assertEqual(self.positions(), before)
+        result = self.navigate(['select', 'detach'], target=members[1], project_ids=members[1:])
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(len(self.picker_calls()), 2)
+        self.assertEqual(self.positions(), {self.other['name']: self.second})
 
     def test_cancellation_does_not_switch_either_client(self):
         before = self.positions()
@@ -207,18 +346,21 @@ class SessionNavigatorTests(unittest.TestCase):
         path = self.root / ('project' + suffix.replace('/', '_') + '\tline\nnext\x1b[31m')
         path.mkdir()
         target = self.session('destination' + suffix, path)
-        result = self.navigate(target=target)
+        peer = self.session('peer', path)
+        result = self.navigate(target=target, project_ids=[target, peer])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.positions(), {self.invoker['name']: target,
                                            self.other['name']: self.second})
-        records = (self.root / 'fzf-input').read_bytes().split(b'\0')
-        record = next(row for row in records if row.startswith(target.encode() + b'\t'))
-        label = record.split(b'\t', 1)[1].decode()
-        self.assertIn('λ', label)
-        self.assertIn('destination', label)
-        self.assertIn('project', label)
-        self.assertIn(str(self.root), label)
-        self.assertFalse(any(ord(char) < 32 or ord(char) == 127 for char in label), repr(label))
+        calls = self.picker_calls()
+        project = next(row.split('\t', 1)[1] for row in calls[0]['records']
+                       if row.split('\t', 1)[0] in (target, peer))
+        session = next(row.split('\t', 1)[1] for row in calls[1]['records'] if row.startswith(target + '\t'))
+        self.assertIn('project', project)
+        self.assertIn(str(self.root), project)
+        self.assertIn('destination', session)
+        for label in (project, session):
+            self.assertIn('λ', label)
+            self.assertFalse(any(ord(char) < 32 or ord(char) == 127 for char in label), repr(label))
         self.assertFalse(marker.exists(), 'a display label was evaluated as shell or tmux code')
 
     def test_inherited_fzf_options_cannot_change_selection_protocol(self):
@@ -237,6 +379,7 @@ class SessionNavigatorTests(unittest.TestCase):
         scripts = self.home / '.config/tmux/scripts'
         scripts.mkdir(parents=True)
         shutil.copy2(HELPER, scripts / 'session-navigator')
+        shutil.copy2(PROJECT_HELPER, scripts / 'project-session')
         installed_keys = scripts.parent / 'keys.conf'
         shutil.copy2(KEYS, installed_keys)
         self.command('source-file', str(installed_keys))
@@ -244,13 +387,16 @@ class SessionNavigatorTests(unittest.TestCase):
         self.command('set-option', '-g', 'prefix2', 'None')
         path = self.root / "path-only-search-token-λ ' quoted"
         path.mkdir()
-        target = self.session("popup-λ ' quoted", path)
+        target = self.session(self.managed_editor_name(path), path)
+        peer = self.session('console-shell', path)
         ready = self.root / 'real-fzf-ready'
         finished = self.root / 'real-fzf-finished'
         searched = self.root / 'real-fzf-searched'
         observer = '--bind=focus:execute-silent(printf %s {1} > ' + shlex.quote(str(searched)) + ')'
-        self.write_fzf('import os, subprocess, sys\nfrom pathlib import Path\n'
-                       + 'Path(' + repr(str(ready)) + ').write_text(str(os.getppid()))\n'
+        self.write_fzf('import json, os, subprocess, sys\nfrom pathlib import Path\n'
+                       + 'Path(' + repr(str(searched)) + ').unlink(missing_ok=True)\n'
+                       + 'prompt = next(arg for arg in sys.argv if arg.startswith("--prompt="))\n'
+                       + 'Path(' + repr(str(ready)) + ').write_text(json.dumps({"pid": os.getppid(), "prompt": prompt}))\n'
                        + 'result = subprocess.run([' + repr(FZF) + ', *sys.argv[1:], ' + repr(observer) + '])\n'
                        + 'Path(' + repr(str(finished)) + ').write_text(str(result.returncode))\n'
                        + 'sys.exit(result.returncode)\n')
@@ -265,36 +411,47 @@ class SessionNavigatorTests(unittest.TestCase):
             self.wait(lambda: self.invoker['name'] + '\t1' in self.command(
                 'list-clients', '-F', '#{client_name}\t#{client_prefix}').splitlines())
             os.write(self.invoker['master'], b'f')
-            self.wait(lambda: ready.exists() and searched.exists())
+            self.wait(lambda: ready.exists() and searched.exists()
+                      and json.loads(ready.read_text())['prompt'] == '--prompt=Projects> ')
 
         def closed():
             if not finished.exists():
                 return False
             try:
-                os.kill(int(ready.read_text()), 0)
+                os.kill(json.loads(ready.read_text())['pid'], 0)
             except ProcessLookupError:
                 return True
             return False
 
-        for query in (b'pthonlysrch', b'popup'):
-            with self.subTest(query=query):
-                self.command('switch-client', '-c', self.invoker['name'], '-t', self.first)
-                popup()
-                os.write(self.invoker['master'], query)
-                self.wait(lambda: searched.exists() and searched.read_text() == target)
-                os.write(self.invoker['master'], b'\r')
-                self.wait(closed)
-                self.assertEqual(finished.read_text(), '0')
-                self.wait(lambda: self.positions().get(self.invoker['name']) == target)
-                self.assertEqual(self.positions()[self.other['name']], self.second)
-        for key in (b'\x1b', b'\x03'):
-            with self.subTest(cancel_key=key):
-                before = self.positions()
-                popup()
-                os.write(self.invoker['master'], key)
-                self.wait(closed)
-                self.assertEqual(finished.read_text(), '130')
-                self.assertEqual(self.positions(), before)
+        def choose_project():
+            before = self.positions()
+            os.write(self.invoker['master'], b'pthonlysrch')
+            self.wait(lambda: searched.exists() and searched.read_text() in (target, peer))
+            os.write(self.invoker['master'], b'\r')
+            self.wait(lambda: json.loads(ready.read_text())['prompt'] == '--prompt=Sessions> '
+                      and searched.exists())
+            self.assertEqual(self.positions(), before, 'choosing the project must not switch yet')
+
+        popup()
+        choose_project()
+        os.write(self.invoker['master'], b'Neovim')
+        self.wait(lambda: searched.exists() and searched.read_text() == target)
+        os.write(self.invoker['master'], b'\r')
+        self.wait(closed)
+        self.assertEqual(finished.read_text(), '0')
+        self.wait(lambda: self.positions().get(self.invoker['name']) == target)
+        self.assertEqual(self.positions()[self.other['name']], self.second)
+        for stage in ('project', 'session'):
+            for key in (b'\x1b', b'\x03'):
+                with self.subTest(stage=stage, cancel_key=key):
+                    before = self.positions()
+                    popup()
+                    if stage == 'session':
+                        choose_project()
+                    os.write(self.invoker['master'], key)
+                    self.wait(closed)
+                    self.assertEqual(finished.read_text(), '130')
+                    self.assertEqual(self.positions(), before)
 
 
 if __name__ == '__main__':

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Choose an existing session for one explicitly targeted tmux client."""
+"""Choose a project and session for one explicitly targeted tmux client."""
 import os
 import re
+import runpy
 import shlex
 import shutil
 import subprocess
@@ -13,7 +14,7 @@ def navigate(socket, client, popup=False):
         return subprocess.run(
             ["tmux", "-u", "-S", socket, *args], check=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
-        ).stdout.decode("utf-8", errors="replace").removesuffix("\n")
+        ).stdout.decode("utf-8", errors="surrogateescape").removesuffix("\n")
 
     def origin():
         for identity in tmux("list-clients", "-F", "#{pid}\t#{client_pid}\t#{client_name}").splitlines():
@@ -21,6 +22,31 @@ def navigate(socket, client, popup=False):
             if len(fields) == 3 and fields[2] == client and all(s.isdigit() for s in fields[:2]):
                 return identity
         raise RuntimeError("the invoking client is no longer available")
+
+    def label(text):
+        return "".join(char if char.isprintable() else " " for char in text)
+
+    def record(identity, text):
+        return (identity + "\t" + label(text)).encode("utf-8") + b"\0"
+
+    def choose(choices, prompt, header):
+        env = os.environ.copy()
+        # User fzf actions may rewrite output or run commands outside this picker.
+        env.pop("FZF_DEFAULT_OPTS", None)
+        env.pop("FZF_DEFAULT_OPTS_FILE", None)
+        result = subprocess.run(
+            ["fzf", "--read0", "--print0", "--delimiter=\t", "--with-nth=2..",
+             "--no-multi", "--layout=reverse", "--prompt=" + prompt,
+             "--header=" + header],
+            input=b"".join(choices), stdout=subprocess.PIPE, env=env,
+        )
+        if result.returncode in (1, 130):
+            return None
+        if result.returncode != 0:
+            raise RuntimeError("fzf failed")
+        if result.stdout not in choices:
+            raise RuntimeError("invalid selection; no session was switched")
+        return choices[result.stdout]
 
     try:
         identity = origin()
@@ -31,38 +57,48 @@ def navigate(socket, client, popup=False):
             return 0
         if not shutil.which("fzf"):
             raise RuntimeError("fzf is not available")
-        choices = {}
+        # Reuse the launcher's name even when restoration has lost role metadata.
+        editor_name = None
+        try:
+            helper = os.path.join(os.path.dirname(os.path.realpath(__file__)), "project-session")
+            editor_name = runpy.run_path(helper).get("editor_name")
+        except FileNotFoundError:
+            pass
+        projects = {}
         for session in tmux("list-sessions", "-F", "#{session_id}").splitlines():
             if not re.fullmatch(r"\$[0-9]+", session):
                 raise RuntimeError("invalid session identity")
             try:
-                label = tmux("display-message", "-p", "-t", session + ":",
-                             "#{session_name}  #{session_path}")
+                path = tmux("display-message", "-p", "-t", session + ":", "#{session_path}")
+                name = tmux("display-message", "-p", "-t", session + ":", "#{session_name}")
             except subprocess.CalledProcessError:
                 continue  # A session may close while the list is being built.
-            label = "".join(char if char.isprintable() else " " for char in label)
-            choices[(session + "\t" + label).encode("utf-8") + b"\0"] = session
-        if not choices:
+            if editor_name and name == editor_name(path):
+                name = "Editor · Neovim"
+            else:
+                name = "Terminal · " + name
+            projects.setdefault(path, {})[record(session, name)] = session
+        if not projects:
             raise RuntimeError("no sessions are available")
-        env = os.environ.copy()
-        # User fzf actions may rewrite output or run commands outside this picker.
-        env.pop("FZF_DEFAULT_OPTS", None)
-        env.pop("FZF_DEFAULT_OPTS_FILE", None)
-        result = subprocess.run(
-            ["fzf", "--read0", "--print0", "--delimiter=\t", "--with-nth=2..",
-             "--no-multi", "--layout=reverse", "--prompt=Sessions> ",
-             "--header=Enter: switch session | Esc/Ctrl-C: cancel"],
-            input=b"".join(choices), stdout=subprocess.PIPE, env=env,
-        )
-        if result.returncode in (1, 130):
+        choices = {}
+        for path, sessions in projects.items():
+            name = os.path.basename(path.rstrip(os.sep)) or path
+            count = str(len(sessions)) + (" session" if len(sessions) == 1 else " sessions")
+            key = record(next(iter(sessions.values())), f"{name}  {path}  ({count})")
+            choices[key] = (path, sessions)
+        project = choose(choices, "Projects> ", "Enter: choose project | Esc/Ctrl-C: cancel")
+        if project is None:
             return 0
-        if result.returncode != 0:
-            raise RuntimeError("fzf failed")
-        if result.stdout not in choices:
-            raise RuntimeError("invalid selection; no session was switched")
+        path, sessions = project
+        if len(sessions) == 1:
+            session = next(iter(sessions.values()))
+        else:
+            session = choose(sessions, "Sessions> ",
+                             label(path) + "\nEnter: switch session | Esc/Ctrl-C: cancel")
+            if session is None:
+                return 0
         if origin() != identity:
             raise RuntimeError("the invoking client changed; open the picker again")
-        session = choices[result.stdout]
         tmux("has-session", "-t", session)
         tmux("switch-client", "-c", client, "-t", session)
         return 0
