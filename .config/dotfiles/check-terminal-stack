@@ -14317,7 +14317,7 @@ if [ "$task10_native_ready" = true ]; then
     zoom_windows=$(capture_field \
       "$check_tmp/status-zoom-marker.txt" windows || true)
     require_text_contains "$zoom_windows" \
-      "$alert_index alert" \
+      "#[fg=#787c99,bg=#1A1B26]#[fg=#1A1B26,bg=#787c99]$alert_index#[fg=#787c99,bg=#1A1B26] alert" \
       "inactive zoomed window rounds its numeric index badge" || task10_native_ready=false
   else
     fail "inactive zoom marker status capture failed"
