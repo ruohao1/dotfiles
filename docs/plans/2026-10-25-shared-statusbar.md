@@ -16,9 +16,11 @@
 
 Use the existing native tmux formats and Neovim bridge. Keep the TokyoNight palette and existing Git helper. No plugin or runtime dependency is needed. Project identity comes from the session starting directory, so changing a pane's directory does not change its project label. Add it after mode, retaining the existing Git segment position. Bound that segment to leave room for the project.
 
-Keep the existing 80/100/120-column profiles and 48-cell side limits. Project caps are 8/12/18 cells; below 80 use 8 cells and hide it below 40. Git display caps are 8/12/16 cells. Hide the shell clock below 80. Window indices remain outside truncated window names so zoom brackets cannot be clipped. Unsaved state is a strict boolean, published as `@dotfiles_nvim_modified=0|1`; its marker remains available in the narrow profile.
+Keep the existing 80/100/120-column profiles and 48-cell side limits. Project caps are 8/10/12 cells; below 80 use 8 cells and hide it below 40. Window-name caps are 5/10/12 cells. Git display caps stay at 8/12/16 cells so change counters retain their space. Align the window list left, after mode/project/Git, and use one space at segment and tab boundaries. Keep the current file or directory context on the right. Hide the shell clock below 80. Window indices remain outside truncated window names so zoom brackets cannot be clipped. Unsaved state is a strict boolean, published as `@dotfiles_nvim_modified=0|1`; its marker remains available in the narrow profile.
 
 Selection by background and zoom by brackets remain independent. Text labels and italic zoom were considered and rejected during design. The user's boxed-index choice uses ordinary terminal characters.
+
+The compact-layout refinement reduces redundant padding and long labels. Keep relative file paths: replacing them with basenames would make files such as `src/index.ts` and `tests/index.ts` indistinguishable.
 
 ## Work and verification
 
@@ -36,3 +38,4 @@ Review focus: hostile project/window/file names, inactive zoomed windows, extrem
 - All eight standalone editor suites passed on the current main base. A real private Neovim/tmux run verified acknowledged ownership, edit/save publication, and native fallback when tmux status is disabled.
 - Independent review found no issues. Shell syntax and whitespace checks passed. Native macOS and the complete terminal-stack checker were not run.
 - Three runtime files were activated with backups. Five tmux status options were reloaded without restarting sessions. The existing local release-badge setting was preserved. Already-running editors use their loaded modules until restarted.
+- The compact follow-up passed the same 14 tmux tests on both versions, plus attached rendering probes at 80/100/120 columns with empty Git. One status file and four options were updated with a separate backup. ShellCheck and independent review passed.
