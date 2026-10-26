@@ -1271,7 +1271,7 @@ class TransactionTests(unittest.TestCase):
     def test_native_retry_reconciles_only_archived_config_route_and_rejects_stable_drift(self):
         from migration.model import fingerprint
         module = self.module()
-        for drift in ['none', 'provider', 'session', 'query', 'binding', 'source']:
+        for drift in ['none', 'provider', 'session', 'query', 'binding', 'source', 'command', 'context', 'status', 'stderr']:
             with self.subTest(drift=drift):
                 self.setUp()
                 provider = self.root / 'ghostty'
@@ -1279,7 +1279,7 @@ class TransactionTests(unittest.TestCase):
                 provider.chmod(0o755)
                 session = self.root / 'native-session'
                 session.write_text('session identity')
-                native_state = {'query': 'SpaceMono', 'binding': 'same'}
+                native_state = {'query': 'SpaceMono', 'binding': 'same', 'override': {}}
                 self.manifest['nativeDependencies'] = [{'id': 'ghostty'}]
                 def observed(path):
                     result = fingerprint(path)
@@ -1292,7 +1292,7 @@ class TransactionTests(unittest.TestCase):
                     return [{'id': 'ghostty', 'status': 'observed', 'command': 'ghostty', 'selectedExecutable': str(provider), 'binding': native_state['binding'],
                              'observations': observations, 'queries': [
                                  {'command': [str(provider), '+validate-config', '--config-file='+str(config)], 'context': {}, 'status': 0, 'stdout': '', 'stderr': ''},
-                                 {'command': [str(provider), '+show-config', '--changes-only'], 'context': {} if config == self.target else {'XDG_CONFIG_HOME': str(self.source.parents[1])}, 'status': 0, 'stdout': native_state['query'], 'stderr': ''}]}]
+                                  {'command': [str(provider), '+show-config', '--changes-only'], 'context': {} if config == self.target else {'XDG_CONFIG_HOME': str(self.source.parents[1])}, 'status': 0, 'stdout': native_state['query'], 'stderr': '', **native_state['override']}]}]
                 step = module.Journal.step
                 def interrupt(journal, name, action):
                     result = step(journal, name, action)
@@ -1307,6 +1307,11 @@ class TransactionTests(unittest.TestCase):
                         {'provider': provider, 'session': session, 'source': self.source}[drift].write_text('replaced')
                     elif drift in ['query', 'binding']:
                         native_state[drift] = 'changed'
+                    elif drift in ['command', 'context', 'status', 'stderr']:
+                        native_state['override'][drift] = {
+                            'command': [str(provider), '+show-config', '--all'],
+                            'context': {'XDG_CONFIG_HOME': '/unreviewed'},
+                            'status': 1, 'stderr': 'changed'}[drift]
                     if drift == 'none':
                         module.apply(self.plan, self.manifest, runtime=self.runtime)
                         self.assertEqual(read_owner(self.home)['phase'], 'home-manager')
@@ -1315,6 +1320,44 @@ class TransactionTests(unittest.TestCase):
                             module.apply(self.plan, self.manifest, runtime=self.runtime)
                         self.assertEqual(self.runtime.calls, [])
                         self.assertEqual(read_owner(self.home)['phase'], 'transferring')
+
+    def test_archived_ghostty_retry_uses_real_collector_and_preserves_plan(self):
+        module = self.module()
+        source = self.root / 'reviewed/ghostty/config.ghostty'
+        source.parent.mkdir(parents=True)
+        source.write_text('font-family = SpaceMono Nerd Font Mono\n')
+        self.target.write_bytes(source.read_bytes())
+        self.manifest['files'][0]['source'] = str(source)
+        self.manifest['nativeDependencies'] = [{'id': 'ghostty'}, {'id': 'space-mono-nerd-font'}]
+        provider = self.root / 'ghostty'
+        provider.write_text('''#!/bin/sh
+case "$1" in
+ --version) echo 'Ghostty 1.3.1';;
+ +validate-config) test -f "${2#--config-file=}";;
+ +show-config) test -f "$XDG_CONFIG_HOME/ghostty/config.ghostty" || exit 71; echo 'font-family = SpaceMono Nerd Font Mono';;
+ +list-fonts) echo 'SpaceMono Nerd Font Mono';;
+ *) exit 73;;
+esac
+''')
+        provider.chmod(0o755)
+        step = module.Journal.step
+        def interrupt(journal, name, action):
+            result = step(journal, name, action)
+            if name == 'archive-0': raise InterruptedError('after actual archive')
+            return result
+        with patch.dict(os.environ, {'DOTFILES_CALLER_PATH': str(self.root)}):
+            self.plan = inspect(self.manifest, self.home)
+            reviewed = json.loads(json.dumps(self.plan))
+            self.assertEqual(self.plan['conflicts'], [])
+            with patch.object(module.Journal, 'step', new=interrupt), self.assertRaises(InterruptedError):
+                module.apply(self.plan, self.manifest, runtime=self.runtime)
+            self.assertFalse(self.target.exists())
+            module.apply(self.plan, self.manifest, runtime=self.runtime)
+            module.apply(self.plan, self.manifest, runtime=self.runtime)
+        self.assertEqual(read_owner(self.home)['phase'], 'home-manager')
+        self.assertEqual(self.runtime.calls, [str(self.generation)])
+        self.assertEqual(self.plan, reviewed)
+        self.assertEqual(module.Journal(self.home, self.plan['transactionId']).data['plan'], reviewed)
 
     def test_native_publication_retry_accepts_reviewed_owned_copy_from_fresh_or_retained_home(self):
         from migration.model import fingerprint
