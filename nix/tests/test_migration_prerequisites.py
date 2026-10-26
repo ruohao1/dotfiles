@@ -286,8 +286,7 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertNotEqual(result['status'],'observed')
         self.assertTrue(result['claims'])
 
-    def test_absent_destination_uses_selected_config_without_default_file_creation(self):
-        module = self.module()
+    def ghostty_config(self):
         source = self.root / 'source/.config/ghostty/config.ghostty'
         source.parent.mkdir(parents=True)
         source.write_text('font-family = SpaceMono Nerd Font Mono\n')
@@ -306,10 +305,56 @@ esac
         executable.chmod(0o700)
         self.manifest['files']=[{'target':'.config/ghostty/config.ghostty','source':str(source)}]
         self.manifest['nativeDependencies']=[{'id':'ghostty'},{'id':'space-mono-nerd-font'}]
+        return source
+
+    def test_absent_destination_uses_selected_config_without_default_file_creation(self):
+        module = self.module()
+        self.ghostty_config()
         with patch.dict(os.environ,{'DOTFILES_CALLER_PATH':str(self.bin)}):
             result=module.inspect_native(self.manifest,self.home)
         self.assertEqual([r['status'] for r in result],['observed','observed'])
         self.assertEqual(list(self.home.iterdir()),[])
+
+    def test_normalize_observations_preserves_non_route_evidence(self):
+        import copy
+        module = self.module()
+        self.assertTrue(callable(getattr(module, 'normalize_observations', None)))
+        source = self.ghostty_config()
+        target = self.home / '.config/ghostty/config.ghostty'
+        target.parent.mkdir(parents=True)
+        target.write_bytes(source.read_bytes())
+        with patch.dict(os.environ, {'DOTFILES_CALLER_PATH': str(self.bin)}):
+            previous = module.inspect_native(self.manifest, self.home)
+            target.unlink()
+            current = module.inspect_native(self.manifest, self.home)
+        self.assertEqual([item['status'] for item in previous + current], ['observed'] * 4)
+        before = copy.deepcopy((previous, current))
+        owned = {str(target): self.manifest['files'][0]}
+        def unexpected_leaf(path):
+            self.fail('no included leaf needs authorization: ' + path)
+        for drift in ['none', 'command', 'context', 'status', 'stderr', 'binding']:
+            with self.subTest(drift=drift):
+                old, new = copy.deepcopy((previous, current))
+                query = new[-1]['queries'][-1]
+                if drift == 'binding':
+                    new[-1]['binding']['collector'] = 'changed'
+                elif drift != 'none':
+                    query[drift] = {'command': [str(self.bin / 'ghostty'), '+show-config', '--all'],
+                                    'context': {'XDG_CONFIG_HOME': '/unreviewed'},
+                                    'status': 1, 'stderr': 'changed'}[drift]
+                module.normalize_observations(old, new, home=self.home, owned=owned,
+                                              introduced_routes={}, permitted_leaf=unexpected_leaf)
+                for old_record, new_record in zip(old, new):
+                    self.assertNotIn(str(source), new_record['observations'])
+                    self.assertNotEqual(old_record['observations'][str(target)], new_record['observations'][str(target)])
+                    # Leaf changes remain for the transaction to prove.
+                    new_record['observations'][str(target)] = old_record['observations'][str(target)]
+                if drift == 'none':
+                    self.assertEqual(old, new)
+                else:
+                    self.assertNotEqual(old, new)
+        self.assertEqual((previous, current), before)
+        self.assertEqual(list(target.parent.iterdir()), [])
 
     def test_runtime_json_key_order_does_not_change_native_evidence(self):
         from types import SimpleNamespace

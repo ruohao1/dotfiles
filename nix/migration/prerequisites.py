@@ -9,7 +9,7 @@ import socket
 import stat
 import subprocess
 
-from .model import fingerprint, manifest_fingerprint
+from .model import Conflict, fingerprint, manifest_fingerprint
 
 CLAIMS = {
     'ghostty': ['native-version', 'effective-config'],
@@ -267,3 +267,72 @@ def inspect_native(manifest, home):
             if selected is None: record['status']='missing'
         records.append(record)
     return records
+
+
+def normalize_observations(previous, current, *, home, owned, introduced_routes, permitted_leaf):
+    """Normalize comparison copies; the caller proves leaves and provider routes.
+
+    Keep all other observations, bindings and query fields for exact comparison.
+    """
+    # Ghostty legitimately switches from a retained config to the same reviewed
+    # immutable config while its home leaf is archived. Do not relax query output,
+    # provider identity, or any other command/context/session observation.
+    config_target = str(home / '.config/ghostty/config.ghostty')
+    config_source = str(Path(owned[config_target]['source']).resolve()) if config_target in owned else None
+    ghostty = next((item.get('selectedExecutable') for item in previous if item['id'] == 'ghostty'), None)
+    def config_route(record):
+        if not config_source or not ghostty:
+            return
+        source_observation = record['observations'].get(config_source)
+        if source_observation is not None:
+            state = fingerprint(config_source)
+            info = Path(config_source).lstat()
+            if source_observation != dict(state, device=info.st_dev, inode=info.st_ino):
+                raise Conflict('immutable native config provider changed')
+            record['observations'].pop(config_source)
+        for query in record['queries']:
+            command = query['command']
+            if (len(command) == 3 and command[:2] == [ghostty, '+validate-config']
+                    and command[2] in ['--config-file=' + config_target, '--config-file=' + config_source]):
+                command[2] = '--config-file=' + config_source
+            if command == [ghostty, '+show-config', '--changes-only']:
+                if query['context'] in [{}, {'XDG_CONFIG_HOME': str(Path(config_source).parents[1])}]:
+                    query['context'] = {}
+                # Ghostty resolves relative includes through the selected config:
+                # a retained regular file names HOME; its reviewed symlink names
+                # the immutable source. Prove the included leaf independently.
+                lines = query['stdout'].splitlines(keepends=True)
+                for index, line in enumerate(lines):
+                    for path, item in owned.items():
+                        if Path(path).parent != Path(config_target).parent:
+                            continue
+                        resolved = str(Path(item['source']).resolve())
+                        if line in ['config-file = ' + value + '\n' for value in [path, resolved]]:
+                            permitted_leaf(path)
+                            lines[index] = 'config-file = ' + resolved + '\n'
+                            break
+                query['stdout'] = ''.join(lines)
+
+    for old, new in zip(previous, current):
+        config_route(old)
+        config_route(new)
+        for route, provider in introduced_routes.items():
+            if route not in new['observations'] or route in old['observations']:
+                continue
+            pinned = provider['executable']
+            def observed(path):
+                info = Path(path).lstat()
+                return dict(fingerprint(path), device=info.st_dev, inode=info.st_ino)
+            # uv's collector observes its caller route separately from the
+            # pinned runtime probe. Reconcile only the proven alias, retaining
+            # original provider evidence (or recorded absence) and queries.
+            before = old['observations'].get(pinned)
+            if (fingerprint(pinned) != provider['state']
+                    or (before is None and provider['selectedExecutable'] is not None)
+                    or (before is not None and before != observed(pinned))
+                    or new['observations'][route] != observed(route)
+                    or (pinned in new['observations'] and new['observations'][pinned] != before)):
+                raise Conflict('native canonical provider route differs from reviewed executable')
+            new['observations'].pop(route)
+            if before is not None:
+                new['observations'][pinned] = before
