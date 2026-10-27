@@ -2408,6 +2408,11 @@ create_failure_node_archive() {
       tar -cJf "$failure_node_path" -C "$managed_failure_source" \
         node-v24.19.0-linux-x64
       ;;
+    wrong-version)
+      make_version_command "$failure_node_root/bin/node" 'v24.20.0'
+      tar -cJf "$failure_node_path" -C "$managed_failure_source" \
+        node-v24.19.0-linux-x64
+      ;;
     *) return 1 ;;
   esac
   failure_node_sha256=$(file_sha256_for_test "$failure_node_path")
@@ -6763,6 +6768,21 @@ else
   printf '  unexpected command: %s\n' "$managed_failure_commands" >&2
 fi
 
+while IFS='|' read -r failure_version_tool failure_version failure_version_diagnostic; do
+  prepare_managed_failure_case "$failure_version_tool-wrong-manifest-version"
+  failure_asset_manifest=$managed_failure_harness/manifests/packages-direct.tsv
+  awk -F '\t' -v OFS='\t' \
+    -v tool="$failure_version_tool" -v version="$failure_version" '
+    $1 == tool && $2 == "linux" && $3 == "x86_64" { $4 = version }
+    { print }
+  ' "$failure_asset_manifest" >"$failure_asset_manifest.new"
+  mv "$failure_asset_manifest.new" "$failure_asset_manifest"
+  run_managed_failure_case "$failure_version_diagnostic"
+done <<'MANAGED_VERSION_FAILURE_CASES'
+node|24.20.0|unexpected managed Node version
+lua-language-server|3.20.0|unexpected managed LuaLS version
+MANAGED_VERSION_FAILURE_CASES
+
 prepare_managed_failure_case non-https-asset
 set_failure_case_direct_asset node \
   'http://fixtures.invalid/node-v24.19.0-linux-x64.tar.xz' \
@@ -6842,6 +6862,7 @@ node-parent-traversal|parent-traversal|verified Node archive contains an unsafe 
 node-outside-root|outside-root|verified Node archive contains an unsafe member
 node-missing-executable|missing-node|verified Node archive is missing executable bin/node
 node-missing-npm-cli|missing-npm-cli|verified Node archive is missing npm-cli.js
+node-wrong-staged-version|wrong-version|staged Node version does not match 24.19.0
 NODE_FAILURE_CASES
 
 while IFS='|' read -r failure_case_name failure_case_variant failure_case_diagnostic; do

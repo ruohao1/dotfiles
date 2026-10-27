@@ -47,6 +47,10 @@ mode=dry-run
 allow_community_packages=false
 repo_url=https://github.com/Ruohao1/dotfiles.git
 repo_ref=main
+# Exact managed releases; external providers keep their own minimum versions.
+node_fallback_version=24.19.0
+luals_fallback_version=3.19.1
+taplo_fallback_version=0.10.0
 npm_language_servers_lock_sha256=f01618d246ff8f53ad57e8d6a1cfe4d278f06a68d80eddbb254d910218aba4b8
 rollback_id=
 window_manager=
@@ -573,9 +577,9 @@ emit_package_plan() {
         '  install upstream herdr' \
         '  install upstream font-space-mono-nerd' \
         '  ensure upstream uv >=0.11.6 (fallback uv 0.12.5)' \
-        '  ensure upstream node >=22.0.0 with npm >=10.0.0 (fallback node 24.19.0)' \
+        "  ensure upstream node >=22.0.0 with npm >=10.0.0 (fallback node $node_fallback_version)" \
         '  ensure upstream lua-language-server >=3.19.1' \
-        '  ensure upstream taplo >=0.10.0 (fallback taplo 0.10.0)' \
+        "  ensure upstream taplo >=0.10.0 (fallback taplo $taplo_fallback_version)" \
         '  ensure npm bash-language-server@5.6.0' \
         '  ensure npm vscode-langservers-extracted@4.10.0' \
         '  ensure npm pyright@1.1.411' \
@@ -2089,7 +2093,7 @@ stage_node_runtime() {
   node_asset_format=$2
   node_asset_url=$3
   node_asset_sha256=$4
-  [ "$node_asset_version" = 24.19.0 ] \
+  [ "$node_asset_version" = "$node_fallback_version" ] \
     || die 'unexpected managed Node version'
   [ "$node_asset_format" = tar.xz ] \
     || die 'unexpected managed Node archive format'
@@ -2098,8 +2102,8 @@ stage_node_runtime() {
     *) die 'direct asset URL must use HTTPS: node' ;;
   esac
   case "$managed_architecture" in
-    x86_64) node_archive_root=node-v24.19.0-linux-x64 ;;
-    arm64) node_archive_root=node-v24.19.0-linux-arm64 ;;
+    x86_64) node_archive_root=node-v$node_fallback_version-linux-x64 ;;
+    arm64) node_archive_root=node-v$node_fallback_version-linux-arm64 ;;
     *) die "unsupported managed Node architecture: $managed_architecture" ;;
   esac
 
@@ -2126,8 +2130,8 @@ stage_node_runtime() {
   selected_node=$node_stage_root/node.ready/bin/node
   selected_npm=$node_stage_root/node.ready/bin/npm
   selected_node_version=$(command_version "$selected_node")
-  [ "$selected_node_version" = 24.19.0 ] \
-    || die 'staged Node version does not match 24.19.0'
+  [ "$selected_node_version" = "$node_fallback_version" ] \
+    || die "staged Node version does not match $node_fallback_version"
   selected_npm_version=$(
     PATH="$node_stage_root/node.ready/bin:$PATH" \
       "$selected_npm" --version 2>/dev/null \
@@ -2156,7 +2160,7 @@ stage_lua_language_server() {
   lua_asset_format=$2
   lua_asset_url=$3
   lua_asset_sha256=$4
-  [ "$lua_asset_version" = 3.19.1 ] \
+  [ "$lua_asset_version" = "$luals_fallback_version" ] \
     || die 'unexpected managed LuaLS version'
   [ "$lua_asset_format" = tar.gz ] \
     || die 'unexpected managed LuaLS archive format'
@@ -2210,7 +2214,7 @@ load_managed_taplo_record() {
   managed_taplo_asset_format=$2
   managed_taplo_asset_url=$3
   managed_taplo_asset_sha256=$4
-  [ "$managed_taplo_asset_version" = 0.10.0 ] \
+  [ "$managed_taplo_asset_version" = "$taplo_fallback_version" ] \
     || die 'unexpected managed Taplo version'
   [ "$managed_taplo_asset_format" = gzip ] \
     || die 'unexpected managed Taplo archive format'
@@ -2246,8 +2250,8 @@ stage_taplo() {
   chmod 0755 "$taplo_ready_root/taplo" \
     || die 'could not make the staged Taplo executable'
   read_managed_taplo_version "$taplo_ready_root/taplo" \
-    && [ "$managed_taplo_version" = 0.10.0 ] \
-    || die 'staged Taplo version does not match taplo 0.10.0'
+    && [ "$managed_taplo_version" = "$taplo_fallback_version" ] \
+    || die "staged Taplo version does not match taplo $taplo_fallback_version"
   bounded_command_succeeds \
     "$taplo_ready_root/taplo" lsp stdio --help \
     || die 'staged Taplo does not expose lsp stdio'
@@ -2778,7 +2782,7 @@ publish_debian_language_servers() {
       "$publish_stage_root/node.ready" "$managed_node_target" node-directory
   fi
   if [ "$managed_lua_required" = true ]; then
-    lua_relative_target=../opt/lua-language-server-3.19.1-$managed_architecture/bin/lua-language-server
+    lua_relative_target=../opt/lua-language-server-$luals_fallback_version-$managed_architecture/bin/lua-language-server
     # shellcheck disable=SC2016 # The generated wrapper expands these values at runtime.
     printf '%s\n' \
       '#!/bin/sh' \
@@ -3512,7 +3516,7 @@ managed_taplo_layout_is_exact() {
   managed_taplo_resolved=$(command -v taplo 2>/dev/null || true)
   [ "$managed_taplo_resolved" = "$managed_taplo_link" ] || return 1
   read_managed_taplo_version "$managed_taplo_link" || return 1
-  [ "$managed_taplo_version" = 0.10.0 ] || return 1
+  [ "$managed_taplo_version" = "$taplo_fallback_version" ] || return 1
   bounded_command_succeeds "$managed_taplo_link" lsp stdio --help
 }
 
@@ -3520,7 +3524,7 @@ prepare_managed_taplo_scope() {
   managed_taplo_manifest_root=$1
   validate_home_directory
   managed_architecture=$(normalized_architecture) || exit $?
-  managed_taplo_target=$HOME/.local/opt/taplo-0.10.0-$managed_architecture
+  managed_taplo_target=$HOME/.local/opt/taplo-$taplo_fallback_version-$managed_architecture
   managed_taplo_link=$HOME/.local/bin/taplo
   load_managed_taplo_record "$managed_taplo_manifest_root"
 
@@ -3773,13 +3777,13 @@ prepare_debian_language_servers() {
     managed_architecture=$(normalized_architecture) || exit $?
   fi
   if [ "$managed_node_required" = true ]; then
-    managed_node_target=$HOME/.local/opt/node-24.19.0-$managed_architecture
+    managed_node_target=$HOME/.local/opt/node-$node_fallback_version-$managed_architecture
   fi
   if [ "$managed_lua_required" = true ]; then
-    managed_lua_target=$HOME/.local/opt/lua-language-server-3.19.1-$managed_architecture
+    managed_lua_target=$HOME/.local/opt/lua-language-server-$luals_fallback_version-$managed_architecture
   fi
   if [ "$managed_taplo_required" = true ]; then
-    managed_taplo_target=$HOME/.local/opt/taplo-0.10.0-$managed_architecture
+    managed_taplo_target=$HOME/.local/opt/taplo-$taplo_fallback_version-$managed_architecture
   fi
   managed_lock_sha256=$npm_language_servers_lock_sha256
   case "$managed_lock_sha256" in
