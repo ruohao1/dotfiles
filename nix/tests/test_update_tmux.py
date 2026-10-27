@@ -16,6 +16,7 @@ import time
 import unittest
 
 SOURCE = Path(__file__).resolve().parents[2]
+TMUX_AUDIT = SOURCE / '.config/dotfiles/lib/tmux-audit.sh'
 
 
 @unittest.skipUnless(shutil.which('tmux'), 'tmux is required for attached status rendering')
@@ -319,21 +320,20 @@ class UpdateTmuxTests(unittest.TestCase):
         self.assertEqual(self.calls.read_text(), calls)
 
     def audit_status_jobs(self):
-        source = (SOURCE / '.config/dotfiles/check-terminal-stack').read_text()
-        function = 'tmux_status_jobs_are_exact() {' + source.split('tmux_status_jobs_are_exact() {', 1)[1].split('\n}\n', 1)[0] + '\n}\n'
         harness = self.root / 'audit.sh'
-        harness.write_text(function + '\ntmux_status_jobs_are_exact "$1" updates\n')
-        return subprocess.run(['/bin/sh', str(harness), str(self.socket)], env=self.env,
+        harness.write_text('set -u\n'
+                           '. "$1"\n'
+                           'tmux_audit_init "$HOME/.config/tmux"\n'
+                           'tmux_status_jobs_are_exact "$2" updates\n')
+        return subprocess.run(['/bin/sh', str(harness), str(TMUX_AUDIT), str(self.socket)], env=self.env,
                               cwd=self.home, text=True, capture_output=True, timeout=10)
 
     def test_source_audit_requires_quoted_project_and_exact_modified_predicate(self):
-        source = (SOURCE / '.config/dotfiles/check-terminal-stack').read_text()
-        functions = ''
-        for name in ['count_occurrences', 'tmux_status_assignment_manifest_is_exact',
-                     'tmux_status_palette_is_exact', 'tmux_status_source_is_safe']:
-            functions += name + '() {' + source.split(name + '() {', 1)[1].split('\n}\n', 1)[0] + '\n}\n'
         harness = self.root / 'source-audit.sh'
-        harness.write_text(functions + '\ntmux_status_source_is_safe "$1"\n')
+        harness.write_text('set -u\n'
+                           '. "$1"\n'
+                           'tmux_audit_init "$HOME/.config/tmux"\n'
+                           'tmux_status_source_is_safe "$2"\n')
         original = (SOURCE / '.config/tmux/conf/status.conf').read_text()
         candidate = self.root / 'status.conf'
         mutations = [None,
@@ -344,7 +344,7 @@ class UpdateTmuxTests(unittest.TestCase):
         for mutation in mutations:
             with self.subTest(mutation=mutation):
                 candidate.write_text(original if mutation is None else original.replace(mutation[0], mutation[1], 1))
-                result = subprocess.run(['/bin/sh', str(harness), str(candidate)], env=self.env,
+                result = subprocess.run(['/bin/sh', str(harness), str(TMUX_AUDIT), str(candidate)], env=self.env,
                                         cwd=self.home, text=True, capture_output=True, timeout=10)
                 self.assertEqual(result.returncode == 0, mutation is None, result.stdout + result.stderr)
 

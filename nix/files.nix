@@ -24,7 +24,7 @@ let
     && p != "conf/platform/${if linux then "macos" else "linux"}.conf"
     && builtins.match ".*(__pycache__|/\\.[^/]+).*" p == null
   ) (walk (sourceRoot + "/.config/tmux") "");
-  dotfilesPaths = [ "check-terminal-stack" "git-summary" "lib/config-source.py" ] ++ builtins.filter (p:
+  dotfilesPaths = [ "check-terminal-stack" "git-summary" "lib/config-source.py" "lib/tmux-audit.sh" ] ++ builtins.filter (p:
     builtins.match "manifests/config-.*\\.paths" p != null
     || builtins.match "manifests/packages.*\\.list" p != null
     || builtins.elem p [ "manifests/packages-npm-language-servers.json" "manifests/packages-npm-language-servers-lock.json" ]
