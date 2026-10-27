@@ -23,7 +23,8 @@ class ClipboardCheckerTests(unittest.TestCase):
         self.config.mkdir(parents=True, mode=0o700)
         self.source = self.root / 'source/.config'
         # Keep the canonical source tree separate from the deployed HOME.
-        for relative in ['dotfiles/check-terminal-stack', 'dotfiles/lib/config-source.py', *EDITOR]:
+        for relative in ['dotfiles/check-terminal-stack', 'dotfiles/lib/config-source.py',
+                         'dotfiles/lib/tmux-audit.sh', *EDITOR]:
             target = self.source / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(SOURCE / '.config' / relative, target)
@@ -81,13 +82,26 @@ printf '%s\\n' 'Neovim clipboard history assertions: ok'
 
     def test_native_ordinary_editor_files_remain_supported(self):
         self.native_capture()
-        for relative in ['dotfiles/check-terminal-stack', 'dotfiles/lib/config-source.py', *EDITOR]:
+        for relative in ['dotfiles/check-terminal-stack', 'dotfiles/lib/config-source.py',
+                         'dotfiles/lib/tmux-audit.sh', *EDITOR]:
             deployed = self.config / relative
             deployed.unlink()
             shutil.copy2(self.source / relative, deployed)
         result, output = self.check()
         self.assertEqual(result.returncode, 0, output)
         self.assertEqual(self.nvim_call.read_text().strip(), str(self.config / 'nvim'))
+
+    def test_foreign_deployed_audit_module_is_never_sourced(self):
+        marker = self.root / 'foreign-module-executed'
+        foreign = self.root / 'foreign.sh'
+        foreign.write_text(f': > "{marker}"\nexit 71\n')
+        deployed = self.config / 'dotfiles/lib/tmux-audit.sh'
+        deployed.unlink()
+        deployed.symlink_to(foreign)
+        result, output = self.check()
+        self.assertFalse(marker.exists(), 'foreign module executed before source validation')
+        self.assertEqual(result.returncode, 0, output)
+        self.assertTrue(self.nvim_call.exists(), 'canonical module did not load')
 
     def test_non_hypr_home_keeps_portable_editor_checks_without_capture_assets(self):
         result, output = self.check()

@@ -42,7 +42,7 @@ class FileDeploymentTests(unittest.TestCase):
                        ".config/tmux/PROJECTS.md", ".config/herdr/config.toml",
                        ".config/herdr/scripts/move-pane", ".local/bin/t",
                        ".config/dotfiles/check-terminal-stack", ".config/dotfiles/git-summary",
-                       ".config/dotfiles/lib/config-source.py"]:
+                       ".config/dotfiles/lib/config-source.py", ".config/dotfiles/lib/tmux-audit.sh"]:
             self.assertIn(target, files)
         module = files[".config/nvim/lua/data_query/tool.lua"].resolve()
         runner = files[".config/nvim/scripts/data-query-runner.py"].resolve()
@@ -52,6 +52,12 @@ class FileDeploymentTests(unittest.TestCase):
         navigator = next(item for item in MANIFEST["files"]
                          if item["target"] == ".config/tmux/scripts/session-navigator")
         self.assertTrue(navigator["executable"], "session navigator must be directly executable")
+        checker = files[".config/dotfiles/check-terminal-stack"].resolve()
+        tmux_audit = next(item for item in MANIFEST["files"]
+                          if item["target"] == ".config/dotfiles/lib/tmux-audit.sh")
+        self.assertFalse(tmux_audit["executable"], "tmux audit module must only be sourced")
+        self.assertEqual(checker.parent / "lib/tmux-audit.sh", Path(tmux_audit["source"]).resolve(),
+                         "checker module lost canonical source relationship")
         pairs = files[".config/tmux/tests/project-pairs.py"].resolve()
         repository = pairs.parents[3]
         self.assertTrue((repository / ".local/bin/t").is_file(), "checker tests lost canonical checkout layout")

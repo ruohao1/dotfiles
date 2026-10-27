@@ -8,6 +8,7 @@ import time
 import unittest
 
 SOURCE = Path(__file__).resolve().parents[2]
+TMUX_AUDIT = SOURCE / '.config/dotfiles/lib/tmux-audit.sh'
 KEYS = Path(os.environ.get('DOTFILES_SESSION_NAVIGATOR_KEYS', SOURCE / '.config/tmux/conf/keys.conf'))
 BINDING = ('bind-key f run-shell -b '
            '\'exec #{q:HOME}/.config/tmux/scripts/session-navigator --popup '
@@ -36,15 +37,10 @@ class SessionNavigatorCheckerTests(unittest.TestCase):
         self.command('new-session', '-d', '-s', 'checker', '/bin/sh')
         self.pristine = self.root / 'pristine'
         self.pristine.write_text(self.bindings())
-        source = (SOURCE / '.config/dotfiles/check-terminal-stack').read_text()
-        functions = ''
-        for name in ['tmux_pristine_binding_delta_is_exact', 'tmux_copy_pipe_and_run_shell_payloads_are_safe']:
-            functions += name + '() {' + source.split(name + '() {', 1)[1].split('\n}\n', 1)[0] + '\n}\n'
-        # Load the production expectation, not a value derived from the observed binding.
-        expectation = '\n'.join(line.strip() for line in source.splitlines()
-                                if line.startswith('  tmux_session_navigator_command='))
         self.audit = self.root / 'audit.sh'
-        self.audit.write_text(functions + '\n' + expectation + '\n'
+        self.audit.write_text('set -u\n'
+                              '. "$1"\nshift\n'
+                              'tmux_audit_init "$HOME/.config/tmux"\n'
                               'tmux_url_enabled=false\n'
                               'if [ "$3" = payload ]; then\n'
                               '  tmux_copy_pipe_and_run_shell_payloads_are_safe "$2"\n'
@@ -82,7 +78,7 @@ class SessionNavigatorCheckerTests(unittest.TestCase):
     def check(self, payload=False):
         candidate = self.root / 'candidate'
         candidate.write_text(self.bindings())
-        return subprocess.run(['/bin/sh', str(self.audit), str(self.pristine), str(candidate),
+        return subprocess.run(['/bin/sh', str(self.audit), str(TMUX_AUDIT), str(self.pristine), str(candidate),
                                'payload' if payload else 'delta'],
                               env=self.env, cwd=self.home, text=True, capture_output=True, timeout=10)
 
