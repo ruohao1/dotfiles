@@ -15,7 +15,7 @@ let
     builtins.elem p [ "init.lua" ".stylua.toml" ] || builtins.match "[^/]+\\.md" p != null
     || builtins.match "(lua|lsp)/.*\\.lua" p != null
     || p == "scripts/data-query-runner.py"
-    || builtins.elem p [ "python/pyproject.toml" "python/uv.lock" ]
+    || builtins.elem p [ "python/pyproject.toml" "python/uv.lock" "python/dependencies.py" ]
     || (builtins.match "tests/.*" p != null
       && builtins.match ".*(__pycache__|/\\.[^/]+).*" p == null)
   ) (walk (sourceRoot + "/.config/nvim") "");

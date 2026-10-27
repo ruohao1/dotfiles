@@ -1453,11 +1453,10 @@ nvim_notebook_output_is_exact() {
 nvim_editor_python_versions_are_exact() {
   [ "$#" -eq 2 ] || return 2
   nvim_editor_probe_python=$1
-  nvim_editor_probe_pynvim=$2
+  nvim_editor_probe_project=$2
 
-  PYTHONDONTWRITEBYTECODE=1 "$nvim_editor_probe_python" -c \
-    'import importlib.metadata as m,sys; expected={"pynvim":sys.argv[1],"jupyter_client":"8.9.1","nbformat":"5.11.0","jupytext":"1.19.5","ipykernel":"7.3.0"}; actual={name:m.version(name) for name in expected}; assert actual == expected, (actual, expected)' \
-    "$nvim_editor_probe_pynvim"
+  PYTHONDONTWRITEBYTECODE=1 "$nvim_editor_probe_python" -I -B \
+    "$notebook_dependency_reader" --project "$nvim_editor_probe_project" --check
 }
 
 nvim_parquet_versions_are_exact() {
@@ -6236,6 +6235,7 @@ fi
 # shellcheck source=lib/tmux-audit.sh
 . "$tmux_audit_module"
 tmux_audit_init "$tmux_root"
+notebook_dependency_reader="${tmux_audit_module%/lib/tmux-audit.sh}/../nvim/python/dependencies.py"
 # shellcheck disable=SC2016  # Preserve the literal tmux source spelling.
 tmux_persistence_source='$HOME/.config/tmux/conf/persistence.conf'
 # shellcheck disable=SC2016  # Preserve the literal tmux source spelling.
@@ -6612,6 +6612,7 @@ fi
 for static_lint_file in \
   "$terminal_stack_checker" \
   "$tmux_audit_module" \
+  "$notebook_dependency_reader" \
   "$nvim_root/.stylua.toml" \
   "$nvim_root/init.lua" \
   "$nvim_root/lsp/bashls.lua" \
@@ -6782,7 +6783,7 @@ if [ -x "$notebook_editor_python" ] \
   && [ -x "$notebook_editor_jupyter" ] \
   && [ -x "$notebook_editor_jupytext" ] \
   && nvim_editor_python_versions_are_exact \
-    "$notebook_editor_python" 0.6.0 \
+    "$notebook_editor_python" "${notebook_dependency_reader%/*}" \
     > "$notebook_editor_probe_output" 2>&1; then
   pass "Neovim notebook editor Python environment matches its exact dependency lock"
 else
@@ -6793,9 +6794,16 @@ else
 fi
 
 notebook_editor_negative_probe="$check_tmp/notebook-editor-python-negative.txt"
+notebook_editor_negative_project="$check_tmp/notebook-negative-project"
 if [ -x "$notebook_editor_python" ]; then
-  if nvim_editor_python_versions_are_exact \
-    "$notebook_editor_python" 0.0.0 \
+  if ! mkdir "$notebook_editor_negative_project" \
+    || ! sed 's/pynvim==[^"]*/pynvim==0.0.0/' \
+      "${notebook_dependency_reader%/*}/pyproject.toml" \
+      > "$notebook_editor_negative_project/pyproject.toml"; then
+    fail "could not prepare the notebook Python version mismatch fixture"
+    notebook_runtime_ready=false
+  elif nvim_editor_python_versions_are_exact \
+    "$notebook_editor_python" "$notebook_editor_negative_project" \
     > "$notebook_editor_negative_probe" 2>&1; then
     fail "Neovim notebook editor Python version probe accepted a mismatch"
     notebook_runtime_ready=false
