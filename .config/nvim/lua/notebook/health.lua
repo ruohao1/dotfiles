@@ -1,21 +1,15 @@
 local M = {}
 
 local process_timeout = 10000
+local module_source = debug.getinfo(1, "S").source
 
 local required_packages = {
-  { key = "jupytext", label = "jupytext", version = "1.19.5" },
-  { key = "pynvim", label = "pynvim", version = "0.6.0" },
-  { key = "jupyter_client", label = "jupyter-client", version = "8.9.1" },
-  { key = "nbformat", label = "nbformat", version = "5.11.0" },
-  { key = "ipykernel", label = "ipykernel", version = "7.3.0" },
+  "jupytext",
+  "pynvim",
+  "jupyter-client",
+  "nbformat",
+  "ipykernel",
 }
-
-local python_probe = table.concat({
-  "import importlib.metadata as metadata, json",
-  "import ipykernel, jupyter_client, jupytext, nbformat, pynvim",
-  "packages = {'ipykernel':'ipykernel','jupyter_client':'jupyter-client','jupytext':'jupytext','nbformat':'nbformat','pynvim':'pynvim'}",
-  "print(json.dumps({name: metadata.version(distribution) for name, distribution in packages.items()}, sort_keys=True))",
-}, "; ")
 
 local function nonempty(value)
   if type(value) ~= "string" then
@@ -200,9 +194,24 @@ local function new(deps)
       end
     end
 
+    local source, source_error = protected_value(function()
+      return deps.realpath(module_source:sub(2))
+    end)
+    local source_root = type(source) == "string"
+      and source:match("^(/.*)/lua/notebook/health%.lua$")
+    if not source_root then
+      report(
+        "error",
+        "editor Python dependency reader is unavailable: "
+          .. tostring(source_error or "could not resolve notebook health source")
+          .. "; run :NotebookBootstrap"
+      )
+      return
+    end
+
     local run_ok, result = pcall(
       deps.system,
-      { python, "-c", python_probe },
+      { python, "-I", "-B", source_root .. "/python/dependencies.py", "--imports" },
       { text = true },
       process_timeout
     )
@@ -224,29 +233,37 @@ local function new(deps)
       return
     end
 
-    local decode_ok, versions = pcall(deps.json_decode, result.stdout or "")
-    if not decode_ok or type(versions) ~= "table" then
+    local decode_ok, probe = pcall(deps.json_decode, result.stdout or "")
+    if
+      not decode_ok
+      or type(probe) ~= "table"
+      or type(probe.expected) ~= "table"
+      or type(probe.actual) ~= "table"
+    then
       report(
         "error",
         "editor Python dependency probe returned invalid JSON: "
-          .. tostring(versions)
+          .. tostring(probe)
           .. "; run :NotebookBootstrap"
       )
       return
     end
 
     for _, package in ipairs(required_packages) do
-      local version = versions[package.key]
-      if version == package.version then
-        report("ok", package.label .. " " .. version)
+      local expected = nonempty(probe.expected[package])
+      local version = probe.actual[package]
+      if not expected then
+        report("error", package .. " expected version is missing; run :NotebookBootstrap")
+      elseif version == expected then
+        report("ok", package .. " " .. version)
       else
         report(
           "error",
-          package.label
+          package
             .. " "
             .. tostring(version or "is missing")
             .. " (expected "
-            .. package.version
+            .. expected
             .. "); run :NotebookBootstrap"
         )
       end

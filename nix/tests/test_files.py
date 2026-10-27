@@ -35,7 +35,8 @@ class FileDeploymentTests(unittest.TestCase):
         files = {item["target"]: Path(item["source"]) for item in MANIFEST["files"]}
         for target in [".config/nvim/init.lua", ".config/nvim/.stylua.toml", ".config/nvim/lua/data_query/tool.lua",
                        ".config/nvim/scripts/data-query-runner.py", ".config/nvim/python/pyproject.toml",
-                       ".config/nvim/python/uv.lock", ".config/nvim/tests/data_query_tool.lua",
+                       ".config/nvim/python/uv.lock", ".config/nvim/python/dependencies.py",
+                       ".config/nvim/tests/data_query_tool.lua",
                        ".config/nvim/LINE-PINS.md", ".config/tmux/scripts/workspace",
                        ".config/tmux/scripts/location-pins.jq", ".config/tmux/scripts/session-navigator",
                        ".config/tmux/tests/workspace-state.sh",
@@ -47,6 +48,11 @@ class FileDeploymentTests(unittest.TestCase):
         module = files[".config/nvim/lua/data_query/tool.lua"].resolve()
         runner = files[".config/nvim/scripts/data-query-runner.py"].resolve()
         self.assertEqual(module.parents[2], runner.parents[1])
+        notebook_reader = files[".config/nvim/python/dependencies.py"].resolve()
+        self.assertEqual(notebook_reader.parent / "pyproject.toml",
+                         files[".config/nvim/python/pyproject.toml"].resolve())
+        self.assertEqual(notebook_reader.parent.parent,
+                         files[".config/nvim/lua/notebook/health.lua"].resolve().parents[2])
         workspace = files[".config/tmux/scripts/workspace"].resolve()
         self.assertTrue((workspace.parent / "location-pins.jq").is_file())
         navigator = next(item for item in MANIFEST["files"]

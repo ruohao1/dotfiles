@@ -10,11 +10,20 @@ end
 
 local expected_versions = {
   ipykernel = "7.3.0",
-  jupyter_client = "8.9.1",
+  ["jupyter-client"] = "8.9.1",
   jupytext = "1.19.5",
   nbformat = "5.11.0",
   pynvim = "0.6.0",
 }
+
+local function probe_result()
+  return {
+    actual = vim.deepcopy(expected_versions),
+    expected = vim.deepcopy(expected_versions),
+    python_compatible = true,
+    requires_python = ">=3.10,<3.15",
+  }
+end
 
 local function merge(target, source)
   for key, value in pairs(source or {}) do
@@ -121,7 +130,7 @@ local function healthy_dependencies(overrides)
           code = 0,
           signal = 0,
           stderr = "",
-          stdout = vim.json.encode(expected_versions) .. "\n",
+          stdout = vim.json.encode(probe_result()) .. "\n",
         }
       end
 
@@ -231,6 +240,8 @@ for _, item in ipairs(ordered_groups) do
 end
 
 local python_probes = 0
+local test_source = assert(vim.uv.fs_realpath(debug.getinfo(1, "S").source:sub(2)))
+local nvim_root = vim.fs.dirname(vim.fs.dirname(test_source))
 for _, call in ipairs(healthy.calls.commands) do
   expect(type(call.timeout) == "number" and call.timeout > 0, "health subprocess was unbounded")
   expect(call.timeout <= 10000, "health subprocess timeout exceeded ten seconds")
@@ -240,14 +251,142 @@ for _, call in ipairs(healthy.calls.commands) do
   )
   if call.command[1] == "/editor/bin/python" then
     python_probes = python_probes + 1
-    local program = call.command[3] or ""
-    for _, module in ipairs({ "ipykernel", "jupyter_client", "jupytext", "nbformat", "pynvim" }) do
-      expect(contains(program, module), "editor Python probe omitted " .. module)
-    end
-    expect(contains(program, "json"), "editor Python probe did not emit JSON")
+    expect(
+      vim.deep_equal(call.command, {
+        "/editor/bin/python",
+        "-I",
+        "-B",
+        nvim_root .. "/python/dependencies.py",
+        "--imports",
+      }),
+      "health must run the shared reader once with notebook imports"
+    )
   end
 end
 expect(python_probes == 1, "health must use exactly one editor Python probe")
+
+local function with_probe(value)
+  return run_case(nil, function(deps)
+    local original_system = deps.system
+    deps.system = function(command, options, timeout)
+      local result = original_system(command, options, timeout)
+      if command[1] == "/editor/bin/python" then
+        result.stdout = type(value) == "string" and value or vim.json.encode(value)
+      end
+      return result
+    end
+  end)
+end
+
+local changed_contract = probe_result()
+changed_contract.expected.pynvim = "9.9.9"
+expect(
+  with_probe(changed_contract):has("error", "pynvim 0.6.0 (expected 9.9.9)"),
+  "health must use the project-derived expected version"
+)
+changed_contract.actual.pynvim = "9.9.9"
+expect(
+  with_probe(changed_contract):has("ok", "pynvim 9.9.9"),
+  "health must accept an installed version matching the changed project"
+)
+
+for _, malformed in ipairs({
+  "{broken",
+  "[]",
+  { actual = expected_versions },
+  { expected = expected_versions },
+}) do
+  expect(
+    with_probe(malformed):has("error", "returned invalid JSON"),
+    "missing dependency maps must not report health success"
+  )
+end
+
+local missing_expected = probe_result()
+missing_expected.expected.pynvim = nil
+expect(
+  with_probe(missing_expected):has("error", "pynvim expected version is missing"),
+  "missing expected package metadata must fail closed"
+)
+local missing_actual = probe_result()
+missing_actual.actual.pynvim = nil
+expect(
+  with_probe(missing_actual):has("error", "pynvim is missing (expected 0.6.0)"),
+  "missing installed package metadata must retain the expected-version diagnostic"
+)
+
+do
+  local fixture = vim.fn.tempname()
+  local source = fixture .. "/standalone editor"
+  local deployed = fixture .. "/deployed"
+  vim.fn.mkdir(source .. "/lua/notebook", "p")
+  vim.fn.mkdir(source .. "/python", "p")
+  vim.fn.mkdir(deployed .. "/lua/notebook", "p")
+  vim.fn.mkdir(deployed .. "/python", "p")
+  vim.fn.writefile(
+    vim.fn.readfile(nvim_root .. "/lua/notebook/health.lua"),
+    source .. "/lua/notebook/health.lua"
+  )
+  vim.fn.writefile({ "# canonical reader" }, source .. "/python/dependencies.py")
+  vim.fn.writefile({ "# foreign deployed reader" }, deployed .. "/python/dependencies.py")
+  assert(
+    vim.uv.fs_symlink(source .. "/lua/notebook/health.lua", deployed .. "/lua/notebook/health.lua")
+  )
+  local standalone = dofile(deployed .. "/lua/notebook/health.lua")
+  local deps, _, calls = healthy_dependencies({ realpath = vim.uv.fs_realpath })
+  standalone._test.new(deps).check()
+  local reader_probe
+  for _, call in ipairs(calls.commands) do
+    if call.command[1] == "/editor/bin/python" then
+      reader_probe = call.command
+    end
+  end
+  expect(
+    reader_probe and reader_probe[4] == source .. "/python/dependencies.py",
+    "a deployed health link must select the reader beside its canonical standalone source"
+  )
+  vim.fn.delete(fixture, "rf")
+end
+
+for _, failed_resolution in ipairs({
+  function(path)
+    if path:match("/lua/notebook/health%.lua$") then
+      return nil, "injected missing source"
+    end
+    return path
+  end,
+  function(path)
+    if path:match("/lua/notebook/health%.lua$") then
+      error("injected source lookup failure")
+    end
+    return path
+  end,
+}) do
+  local unavailable = run_case({ realpath = failed_resolution })
+  expect(
+    unavailable:has("error", "dependency reader is unavailable")
+      and unavailable:has("error", ":NotebookBootstrap"),
+    "reader lookup failure must report recovery guidance"
+  )
+  for _, call in ipairs(unavailable.calls.commands) do
+    expect(call.command[1] ~= "/editor/bin/python", "unresolved reader reached Python")
+  end
+end
+
+local missing_reader = run_case(nil, function(deps)
+  local original_system = deps.system
+  deps.system = function(command, options, timeout)
+    if command[1] == "/editor/bin/python" then
+      return { code = 2, stderr = "can't open file dependencies.py", stdout = "" }
+    end
+    return original_system(command, options, timeout)
+  end
+end)
+expect(
+  missing_reader:has("error", "dependency probe failed")
+    and missing_reader:has("error", ":NotebookBootstrap"),
+  "missing reader file must remain an actionable probe failure"
+)
 
 local missing_editor = run_case({
   python_paths = function()

@@ -228,12 +228,25 @@ def inspect_native(manifest, home):
             python=home/'.local/share/nvim/notebook-python/bin/python'
             uv=provider('uv',True)
             for path in [project/'pyproject.toml',project/'uv.lock',python,python.with_name('jupyter'),python.with_name('jupytext')]: observe(path)
+            selected = {item['target']: item['source'] for item in manifest['files']}
+            reader_source = selected.get('.config/nvim/python/dependencies.py')
+            project_source = selected.get('.config/nvim/python/pyproject.toml')
+            reader = declared_project = None
+            if reader_source and project_source:
+                observe(reader_source); observe(project_source)
+                try:
+                    reader = Path(reader_source).resolve()
+                    declared_project = Path(project_source).resolve()
+                    observe(reader); observe(declared_project)
+                except (OSError, RuntimeError):
+                    reader = declared_project = None
             if uv and python.is_file():
                 lock=run([uv,'--no-config','--quiet','lock','--check','--offline','--no-cache','--python',str(python),'--project',str(project)])
                 claims[expected[0]]=lock['status']==0
-                code="import importlib.metadata as m,json,sys; e={'pynvim':'0.6.0','jupyter-client':'8.9.1','nbformat':'5.11.0','jupytext':'1.19.5','ipykernel':'7.3.0'}; a={n:m.version(n) for n in e}; assert (3,10)<=sys.version_info[:2]<(3,15); assert a==e,(a,e); print(json.dumps(a,sort_keys=True))"
-                metadata=run([str(python),'-I','-B','-c',code])
-                claims[expected[1]]=metadata['status']==0 and all(os.access(python.with_name(name),os.X_OK) for name in ['python','jupyter','jupytext'])
+                if (reader and str(reader).startswith('/nix/store/')
+                        and declared_project == reader.with_name('pyproject.toml')):
+                    metadata=run([str(python),'-I','-B',str(reader),'--check'])
+                    claims[expected[1]]=metadata['status']==0 and all(os.access(python.with_name(name),os.X_OK) for name in ['python','jupyter','jupytext'])
         elif identity=='desktop-clipboard':
             if linux:
                 manager=next((x.get('systemctlPath') for x in manifest.get('serviceManagerEffects',[]) if x['manager']=='systemd'),None) or provider('systemctl')

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -285,6 +286,65 @@ class PrerequisiteTests(unittest.TestCase):
         result = module.inspect_native(self.manifest,self.home)[0]
         self.assertNotEqual(result['status'],'observed')
         self.assertTrue(result['claims'])
+
+    def notebook(self):
+        module = self.module()
+        project = self.home / '.config/nvim/python'
+        project.mkdir(parents=True)
+        (project / 'pyproject.toml').write_text('[project]\ndependencies = ["pynvim==0.0.0"]\n')
+        (project / 'uv.lock').write_text('retained native lock\n')
+        (project / 'dependencies.py').write_text('raise RuntimeError("never execute retained policy")\n')
+        python = self.home / '.local/share/nvim/notebook-python/bin/python'
+        python.parent.mkdir(parents=True)
+        for name in ['python', 'jupyter', 'jupytext']:
+            executable = python.with_name(name)
+            executable.write_text('#!/bin/sh\nexit 0\n')
+            executable.chmod(0o700)
+        selected = Path('/nix/store/notebook-fixture/.config/nvim/python')
+        self.manifest['files'] = [{'target': '.config/nvim/python/' + name,
+                                  'source': str(selected / name)}
+                                 for name in ['dependencies.py', 'pyproject.toml']]
+        self.manifest['commandRequirements'] = [{'command': 'uv', 'provider': str(self.root / 'uv')}]
+        self.manifest['nativeDependencies'] = [{'id': 'notebook-uv-project'}]
+        return module, project, python, selected
+
+    def test_notebook_uses_selected_reader_and_observes_both_sources(self):
+        module, project, python, selected = self.notebook()
+        with patch.object(module.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '{}', '')) as run:
+            result = module.inspect_native(self.manifest, self.home)[0]
+        self.assertEqual(result['status'], 'observed')
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands, [[str(self.root / 'uv/bin/uv'), '--no-config', '--quiet', 'lock',
+            '--check', '--offline', '--no-cache', '--python', str(python), '--project', str(project)],
+            [str(python), '-I', '-B', str(selected / 'dependencies.py'), '--check']])
+        for path in [project / 'pyproject.toml', project / 'uv.lock',
+                     selected / 'dependencies.py', selected / 'pyproject.toml']:
+            self.assertIn(str(path), result['observations'])
+
+    def test_notebook_missing_or_foreign_selected_contract_stays_unverified(self):
+        module, project, _, selected = self.notebook()
+        for files in [[],
+                      [{'target': '.config/nvim/python/' + name, 'source': str(project / name)}
+                       for name in ['dependencies.py', 'pyproject.toml']],
+                      [{'target': '.config/nvim/python/dependencies.py', 'source': str(selected / 'dependencies.py')},
+                       {'target': '.config/nvim/python/pyproject.toml', 'source': '/nix/store/other/pyproject.toml'}]]:
+            with self.subTest(files=files), patch.object(module.subprocess, 'run',
+                    return_value=subprocess.CompletedProcess([], 0, '', '')) as run:
+                self.manifest['files'] = files
+                result = module.inspect_native(self.manifest, self.home)[0]
+                self.assertEqual(result['status'], 'unverified')
+                self.assertEqual(len(run.call_args_list), 1, 'untrusted contract reached Python')
+
+    def test_notebook_keeps_lock_metadata_and_executable_gates(self):
+        module, _, python, _ = self.notebook()
+        for lock_status, metadata_status, executable in [(1, 0, True), (0, 1, True), (0, 0, False)]:
+            with self.subTest(lock=lock_status, metadata=metadata_status, executable=executable):
+                python.with_name('jupytext').chmod(0o700 if executable else 0o600)
+                with patch.object(module.subprocess, 'run', side_effect=[
+                        subprocess.CompletedProcess([], lock_status, '', ''),
+                        subprocess.CompletedProcess([], metadata_status, '', '')]):
+                    result = module.inspect_native(self.manifest, self.home)[0]
+                self.assertEqual(result['status'], 'unverified')
 
     def ghostty_config(self):
         source = self.root / 'source/.config/ghostty/config.ghostty'
