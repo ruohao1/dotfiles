@@ -54,6 +54,7 @@ class OwnershipTests(unittest.TestCase):
             before = tree(self.root)
             for standalone in [False, True]:
                 for args in [['--apply', '--window-manager', 'none'],
+                             ['--apply', '--window-manager', 'none', '--expected-commit', '0' * 40],
                              ['--apply', '--managed-tool', 'taplo'], ['--rollback', 'latest']]:
                     with self.subTest(owner=owner, args=args, standalone=standalone):
                         result = self.deploy(args, standalone)

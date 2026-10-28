@@ -8192,8 +8192,8 @@ else
   fail 'rollback rejects a symlinked window-drag preference journal'
 fi
 require_contains "$(cat "$test_tmp/aerospace-rollback-invalid-symlink.output")" \
-  'bootstrap: transaction has invalid window-drag-gesture preference journal' \
-  'symlink preference preflight reports the invalid window-drag journal'
+  'bootstrap: unsafe rollback journal or path parents' \
+  'journal preflight reports the unsafe preference symlink'
 if [ "$(cat "$aerospace_run/status" 2>/dev/null || true)" = complete ] \
   && [ -d "$aerospace_home/.cfg" ] \
   && cmp -s "$fixture_work/.config/karabiner/karabiner.json" \
@@ -8870,7 +8870,8 @@ run_capture "$test_tmp/lifecycle-apply.output" env \
   DOTFILES_BOOTSTRAP_TEST_MANAGER=apt \
   DOTFILES_BOOTSTRAP_TEST_SKIP_PACKAGES=1 \
   DOTFILES_BOOTSTRAP_TEST_RUN_ID=lifecycle-linux \
-  "$bootstrap" --apply --repo "$fixture_repo" --ref main
+  "$bootstrap" --apply --repo "$fixture_repo" --ref main \
+    --expected-commit "$(git --git-dir="$fixture_repo" rev-parse main)"
 if [ "$run_status" -eq 0 ]; then
   pass 'Linux end-to-end sparse deployment succeeds'
 else

@@ -3,60 +3,71 @@
 A personal **Ghostty, tmux, and Neovim** setup for macOS and Linux, with optional
 AeroSpace, i3, or Hyprland configuration.
 
-## Install
+## Install or update
 
-The native installer is the default. You need `curl`, internet access, and package
-installation permissions. Run as your normal user; it uses `sudo` when needed.
-Git 2.34+ is required for a complete preview.
-
-### 1. Load the installer
-
-Paste this helper into your terminal. It downloads the installer and removes the
-temporary file after each run.
+You need macOS or Linux, `curl`, and Git 2.34+. Run as your normal user.
+Paste this command to open the setup menu:
 
 ```sh
-dotfiles_bootstrap() (
+(
   set -eu
-  installer=$(mktemp)
-  trap 'rm -f "$installer"' 0 HUP INT TERM
+  launcher=$(mktemp)
+  trap 'rm -f "$launcher"' 0
   curl --fail --location --show-error --silent \
-    --output "$installer" \
-    https://raw.githubusercontent.com/ruohao1/dotfiles/main/.config/dotfiles/bootstrap
-  sh "$installer" "$@"
+    --output "$launcher" \
+    https://raw.githubusercontent.com/ruohao1/dotfiles/main/.config/dotfiles/setup
+  sh "$launcher"
 )
 ```
 
-### 2. Preview your installation
-
-Choose your system. `none` keeps your current window manager.
-
-| System | Preview command | Window-manager choices |
-| --- | --- | --- |
-| macOS | `dotfiles_bootstrap --window-manager none` | `none`, `aerospace` |
-| Arch, EndeavourOS, Manjaro | `dotfiles_bootstrap --window-manager none` | `none`, `i3`, `hypr` |
-| Debian, Ubuntu, Linux Mint, Pop!_OS | `dotfiles_bootstrap --window-manager none --allow-community-packages` | `none`, `i3` |
-
-Replace `none` with another listed choice if wanted. Preview shows packages,
-file changes, conflicts, and backups without applying them.
-
-On apt systems, `--allow-community-packages` permits the pinned Ghostty installer
-if Ghostty is unavailable from the configured repositories. On Arch systems,
-bootstrap prints a `sudo pacman -Syu --needed …` command when packages are missing;
-run that command, then rerun bootstrap.
-
-### 3. Install
-
-Repeat your preview command with `--apply`. For example, on Ubuntu:
+After installation, open the same menu with:
 
 ```sh
-dotfiles_bootstrap --apply --window-manager none --allow-community-packages
+dotfiles
 ```
 
-Conflicting files are backed up automatically. Reopen Ghostty after installation.
-If you selected a window manager, reload it or start a new desktop session.
+| Action | What it does |
+| --- | --- |
+| Install or update configuration and tools | Preview packages, configuration, preferences, services, and backups; apply after confirmation. |
+| Update configuration | Fast-forward an existing native installation. Keep its selected files, repository, and branch. Do not change packages or services. |
+| Download source only | Create a separate checkout at a new destination. Do not install or activate it. |
+| Restore a native installation backup | Restore a completed bootstrap transaction after confirmation. Installed packages remain. |
 
-For AeroSpace, open Karabiner Elements, enable its background items, and complete
+The menu shows the actions available for your installation. Enter `q`, press
+Enter on an empty choice, or press Ctrl-C to exit. Apply confirmations default
+to **No**. A changed source or local edit stops a configuration update; review
+your changes with `dotfiles diff`. Existing Git commands such as `dotfiles status`
+continue to work.
+
+Full native setup asks for your window manager. `none` keeps your current one.
+
+| System | Window-manager choices |
+| --- | --- |
+| macOS | `none`, `aerospace` |
+| Arch, EndeavourOS, Manjaro | `none`, `i3`, `hypr` |
+| Debian, Ubuntu, Linux Mint, Pop!_OS | `none`, `i3` |
+
+On apt systems, the menu asks before permitting the pinned community Ghostty
+installer. On Arch, bootstrap prints a `sudo pacman -Syu --needed …` command if
+packages are missing; run it, then reopen the menu. The complete preview requires
+Git; the menu does not install Git or Nix for you.
+
+Full setup backs up conflicting configuration before replacing it. A
+configuration-only update refuses local edits and does not create a bootstrap
+backup. Restore applies to the last completed **full installation**, not the last
+Git update.
+
+After installation, reopen Ghostty. Reload affected applications after configuration
+updates. If you selected a window manager, reload it or start a new desktop
+session. For AeroSpace, enable Karabiner Elements background items and complete
 its macOS permission setup.
+
+For scripts or advanced native options, use the existing bootstrap directly:
+
+```sh
+# Preview; add --apply after reviewing the result.
+"$HOME/.config/dotfiles/bootstrap" --window-manager none
+```
 
 ## Start working
 
@@ -111,8 +122,15 @@ This route is **experimental**; platform and desktop/editor validation is
 incomplete. It requires Nix, Git, and Python 3, plus separate preparation for
 native apps, fonts, and OS permissions.
 
-After Home Manager takes ownership, use the Nix migration and recovery commands
-instead of the native installer. See [release updates and rollback](nix/README.md#confirmed-release-updates).
+The menu detects Home Manager ownership and delegates updates and recovery to
+`dotfiles-update`. It never falls back to native installation. Configure that
+updater first as described in [release updates and rollback](nix/README.md#confirmed-release-updates).
+
+When adopting this command, Nix can report an existing native
+`~/.local/bin/dotfiles` symlink as `preserved-symlink` or `occupied-new-target`.
+Review the reported path, move that exact command to an unused backup location,
+then generate a new migration/update preview. The installer preserves this
+conflict; it does not move or delete the native command automatically.
 
 ## More guides
 
@@ -124,5 +142,6 @@ instead of the native installer. See [release updates and rollback](nix/README.m
 Native configuration lives in `~/.config/ghostty`, `~/.config/tmux`, and `~/.config/nvim`.
 Bootstrap manages the bare Git repository in `~/.cfg` automatically.
 
-For a fork, add `--repo URL` and optionally `--ref REF`. Use SSH keys or Git
+For a fork, run `sh "$HOME/.config/dotfiles/setup" --repo URL --ref REF`, or pass
+those options to the downloaded launcher. Native updates reuse the configured upstream. Use SSH keys or Git
 credential helpers; keep credentials out of URLs retained in recovery records.

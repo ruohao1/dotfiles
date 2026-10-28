@@ -115,6 +115,34 @@ class MigrationPlanTests(unittest.TestCase):
         result = self.inspect()
         self.assertTrue({'home-mismatch', 'system-mismatch', 'unsafe-parent'} <= self.codes(result))
 
+    def test_native_dotfiles_command_is_preserved_during_initial_adoption(self):
+        command = self.home / '.local/bin/dotfiles'
+        command.parent.mkdir(parents=True)
+        command.symlink_to(self.home / '.config/dotfiles/dotfiles')
+        self.manifest['files'].append(dict(target='.local/bin/dotfiles', source=str(self.source), executable=False))
+        result = self.inspect()
+        self.assertTrue(any(item['code'] == 'preserved-symlink' and item['path'] == str(command)
+                            for item in result['conflicts']))
+        self.assertEqual(next(item['action'] for item in result['files']
+                              if item['target'] == '.local/bin/dotfiles'), 'preserve')
+
+    def test_retained_native_command_blocks_new_nix_target(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        command = self.home / '.local/bin/dotfiles'
+        command.parent.mkdir(parents=True)
+        command.symlink_to(self.home / '.config/dotfiles/dotfiles')
+        previous = dict(self.manifest, files=[])
+        self.manifest['files'].append(dict(target='.local/bin/dotfiles', source=str(self.source), executable=False))
+        owner = dict(phase='home-manager', transactionId='a' * 32, selectedGeneration='previous')
+        prior = SimpleNamespace(path=self.root / 'prior-journal', data={'generations': {'previous': previous}})
+        with patch('migration.plan.read_owner', return_value=owner), patch('migration.transaction.Journal', return_value=prior):
+            result = self.inspect()
+        self.assertTrue(any(item['code'] == 'occupied-new-target' and item['path'] == str(command)
+                            for item in result['conflicts']))
+        self.assertEqual(next(item['action'] for item in result['files']
+                              if item['target'] == '.local/bin/dotfiles'), 'preserve')
+
     def test_writable_or_foreign_owned_parent_conflicts_during_preview(self):
         from unittest.mock import patch
         from types import SimpleNamespace

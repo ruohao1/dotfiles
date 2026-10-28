@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import pty
 from pathlib import Path, PurePosixPath
 import subprocess
 import unittest
@@ -13,6 +14,33 @@ MANIFEST = None
 
 
 class FileDeploymentTests(unittest.TestCase):
+    def test_installed_cli_opens_the_nix_menu_without_native_metadata(self):
+        files = {item['target']: Path(item['source']) for item in MANIFEST['files']}
+        home = Path(ARGS.fixture_root) / 'menu-home'
+        config = home / '.config/dotfiles'
+        config.mkdir(parents=True)
+        (config / 'setup').symlink_to(files['.config/dotfiles/setup'])
+        owner = home / '.local/state/dotfiles-ownership/owner.json'
+        owner.parent.mkdir(parents=True)
+        owner.write_text('malformed marker is sufficient to prohibit native actions')
+        master, slave = pty.openpty()
+        try:
+            process = subprocess.Popen(['sh', str(files['.local/bin/dotfiles'])],
+                stdin=slave, stdout=slave, stderr=slave,
+                env={**os.environ, 'HOME': str(home)})
+            os.write(master, b'\n')
+            self.assertEqual(process.wait(timeout=10), 0)
+            output = os.read(master, 65536).decode()
+            self.assertIn('Nix ownership detected', output)
+            self.assertNotIn('Install configuration and tools', output)
+            self.assertFalse((home / '.cfg').exists())
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            os.close(master)
+            os.close(slave)
+
     def test_manifest_identity_and_immutable_outputs(self):
         self.assertEqual(MANIFEST["schema"], 1)
         self.assertIn(MANIFEST["profile"], ["linux", "darwin"])
@@ -42,8 +70,18 @@ class FileDeploymentTests(unittest.TestCase):
                        ".config/tmux/PROJECTS.md", ".config/herdr/config.toml",
                        ".config/herdr/scripts/move-pane", ".local/bin/t",
                        ".config/dotfiles/check-terminal-stack", ".config/dotfiles/git-summary",
+                       ".config/dotfiles/setup", ".config/dotfiles/dotfiles", ".local/bin/dotfiles",
+                       ".config/dotfiles/lib/ownership.sh",
                        ".config/dotfiles/lib/config-source.py", ".config/dotfiles/lib/tmux-audit.sh"]:
             self.assertIn(target, files)
+        wrapper = files[".config/dotfiles/dotfiles"].resolve()
+        self.assertEqual(files[".local/bin/dotfiles"].resolve(), wrapper)
+        self.assertEqual(wrapper.parent / "setup", files[".config/dotfiles/setup"].resolve())
+        self.assertEqual(wrapper.parent / "lib/ownership.sh", files[".config/dotfiles/lib/ownership.sh"].resolve())
+        for target in [".local/bin/dotfiles", ".config/dotfiles/dotfiles", ".config/dotfiles/setup"]:
+            self.assertTrue(next(item["executable"] for item in MANIFEST["files"] if item["target"] == target))
+        self.assertFalse(next(item["executable"] for item in MANIFEST["files"]
+                              if item["target"] == ".config/dotfiles/lib/ownership.sh"))
         module = files[".config/nvim/lua/data_query/tool.lua"].resolve()
         runner = files[".config/nvim/scripts/data-query-runner.py"].resolve()
         self.assertEqual(module.parents[2], runner.parents[1])
