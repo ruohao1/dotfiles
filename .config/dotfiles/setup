@@ -1,0 +1,395 @@
+#!/bin/sh
+# Interactive coordinator; deployment stays with bootstrap and the Nix updater.
+# shellcheck disable=SC2030,SC2031 # choose_source validates inherited repo/ref in an isolated subshell.
+set -eu
+umask 077
+LC_ALL=C
+export LC_ALL
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CEILING_DIRECTORIES \
+  GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_PREFIX GIT_NAMESPACE GIT_SHALLOW_FILE \
+  GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+
+die() { printf 'dotfiles: %s\n' "$*" >&2; exit 1; }
+ask() { printf '%s: ' "$1"; IFS= read -r answer || exit 0; }
+confirm() { ask "$1 [y/N]"; case "$answer" in y|Y|yes|YES) return 0;; *) return 1;; esac; }
+exists() { [ -e "$1" ] || [ -L "$1" ]; }
+native_git() { git -c core.fsmonitor=false --git-dir="$HOME/.cfg" --work-tree="$HOME" "$@"; }
+has_owner() { exists "$HOME/.local/state/dotfiles-ownership/owner.json"; }
+
+safe_path() {
+  case "$1" in /*) ;; *) return 1;; esac
+  case "$1" in /|*'/../'*|*'/./'*|*/..|*/.|*//*|*[[:cntrl:]]*) return 1;; esac
+  check_path=$1
+  while [ "$check_path" != / ]; do
+    [ ! -L "$check_path" ] || return 1
+    check_path=${check_path%/*}
+    [ -n "$check_path" ] || check_path=/
+  done
+}
+
+safe_parents() (
+  safe_path "$1" || return 1
+  directory=$1
+  while [ "$directory" != / ]; do
+    if exists "$directory"; then
+      [ -d "$directory" ] || return 1
+      listing=$(ls -ldn -- "$directory") || return 1
+      read -r permissions _ uid _rest <<EOF
+$listing
+EOF
+      case "$uid" in 0|"$(id -u)") ;; *) return 1;; esac
+      case "$permissions" in
+        ?????w*|????????w*)
+          # Root-owned sticky system parents such as /tmp protect private children.
+          [ "$uid" = 0 ] || return 1
+          case "$permissions" in ?????????t*) ;; *) return 1;; esac;;
+      esac
+    fi
+    directory=${directory%/*}; [ -n "$directory" ] || directory=/
+  done
+)
+
+safe_metadata() {
+  safe_path "$1" && safe_parents "${1%/*}" || return 1
+  { [ -f "$1" ] || [ -d "$1" ]; } && [ -r "$1" ] || return 1
+  record_listing=$(ls -ldn -- "$1") || return 1
+  read -r record_mode _ record_uid _rest <<EOF
+$record_listing
+EOF
+  [ "$record_uid" = "$(id -u)" ] || return 1
+  case "$record_mode" in ?????w*|????????w*) return 1;; esac
+}
+
+safe_record() { [ -f "$1" ] && safe_metadata "$1"; }
+
+single_native_config() {
+  # Keep trailing empty values so command substitution cannot hide ambiguity.
+  config_value=$(native_git config --get-all "$1" && printf '.') || die "missing native upstream setting: $1"
+  config_value=${config_value%.}
+  config_value=${config_value%?}
+  case "$config_value" in ''|*'
+'*) die "ambiguous native upstream setting: $1";; esac
+  printf '%s\n' "$config_value"
+}
+
+require_git() {
+  command -v git >/dev/null 2>&1 || die 'Git 2.34+ is required; install Git, then run dotfiles again.'
+  git_version=$(git --version | sed 's/^git version //;s/[^0-9.].*$//')
+  git_major=${git_version%%.*}
+  git_minor=${git_version#*.}; git_minor=${git_minor%%.*}
+  case "$git_major:$git_minor" in *[!0-9:]*|:*) die 'cannot determine Git version';; esac
+  [ "$git_major" -gt 2 ] || { [ "$git_major" -eq 2 ] && [ "$git_minor" -ge 34 ]; } \
+    || die 'Git 2.34+ is required for a complete preview.'
+}
+
+validate_source() {
+  case "$repo_url" in ''|-*|*[[:cntrl:]]*) die 'repository must be a URL or path without control characters';; esac
+  case "$repo_url" in
+    [hH][tT][tT][pP]::*|[hH][tT][tT][pP][sS]::*) die 'use a standard HTTP(S) URL';;
+    [hH][tT][tT][pP]:*|[hH][tT][tT][pP][sS]:*)
+      address=${repo_url#*:}
+      case "$address" in //[!/]*) ;; *) die 'HTTP(S) repository URL requires a host';; esac
+      authority=${address#//}; authority=${authority%%/*}
+      case "$authority" in *@*) die 'keep credentials out of repository URLs; use credential helpers or SSH';; esac
+      case "$repo_url" in *'?'*|*'#'*) die 'repository URLs must not contain queries or fragments';; esac
+      ;;
+  esac
+  case "$repo_ref" in ''|-*|*[!A-Za-z0-9._/-]*|*..*|*/) die 'unsupported Git reference';; esac
+}
+
+native_identity() {
+  safe_path "$HOME/.cfg" && [ -d "$HOME/.cfg" ] || die 'unsafe or missing native repository'
+  native_git rev-parse --verify HEAD >/dev/null || die 'invalid native repository'
+  branch=$(native_git symbolic-ref --quiet --short HEAD) || die 'native repository is detached; select its branch first'
+  remote=$(single_native_config "branch.$branch.remote") || return 1
+  upstream=$(single_native_config "branch.$branch.merge") || return 1
+  case "$remote" in ''|.|-*|*[!A-Za-z0-9._/-]*) die 'unsupported native upstream remote';; esac
+  single_native_config "remote.$remote.url" >/dev/null || return 1
+  native_url=$(native_git remote get-url --all "$remote") || die 'cannot read native upstream URL'
+  case "$native_url" in ''|*'
+'*) die 'ambiguous native upstream URL';; esac
+  case "$upstream" in refs/heads/*) ;; *) die 'native upstream must be a branch';; esac
+}
+
+choose_source() {
+  require_git
+  if [ "$installation" = native ] && { [ -z "$repo_url" ] || [ -z "$repo_ref" ]; }; then
+    if inherited=$(native_identity || exit 1; repo_url=$native_url; repo_ref=$upstream; validate_source; printf '%s\n%s\n' "$repo_url" "$repo_ref"); then
+      [ -n "$repo_url" ] || repo_url=$(printf '%s\n' "$inherited" | sed -n '1p')
+      [ -n "$repo_ref" ] || repo_ref=$(printf '%s\n' "$inherited" | sed -n '2p')
+    else
+      printf '%s\n' 'Choose the source explicitly; the installed upstream is unavailable.'
+      if [ -z "$repo_url" ]; then ask 'Repository URL'; repo_url=$answer; fi
+      if [ -z "$repo_ref" ]; then ask 'Git reference'; repo_ref=$answer; fi
+      validate_source
+    fi
+  fi
+  repo_url=${repo_url:-https://github.com/ruohao1/dotfiles.git}
+  repo_ref=${repo_ref:-main}
+  validate_source
+  printf 'Repository: %s\nReference: %s\n' "$repo_url" "$repo_ref"
+}
+
+stage_source() {
+  scratch=$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-setup.XXXXXXXX") || die 'cannot create private source storage'
+  staged=$scratch/source
+  git init -q "$staged"
+  git -C "$staged" fetch --quiet --no-tags "$repo_url" "$repo_ref" || die 'source download failed'
+  candidate=$(git -C "$staged" rev-parse --verify 'FETCH_HEAD^{commit}')
+  git -C "$staged" checkout --quiet --detach "$candidate"
+  printf 'Commit: %s\n' "$candidate"
+}
+
+load_guard() {
+  guard=$staged/.config/dotfiles/lib/ownership.sh
+  [ -f "$guard" ] && [ ! -L "$guard" ] || die 'selected source has no ownership helper'
+  # shellcheck disable=SC1090
+  . "$guard"
+  guard_loaded=true
+  ownership_check_paths || exit 1
+}
+
+latest_transaction() {
+  state_root=${XDG_STATE_HOME:-$HOME/.local/state}/dotfiles-bootstrap
+  safe_record "$state_root/latest" || return 1
+  run_id=$(cat "$state_root/latest")
+  case "$run_id" in ''|.|..|*[!A-Za-z0-9._-]*) return 1;; esac
+  run=$state_root/$run_id
+  for name in status repository reference window-manager platform managed.paths backed-up.paths; do
+    safe_record "$run/$name" || return 1
+  done
+  [ "$(cat "$run/status")" = complete ] || return 1
+  recorded_profile=$(cat "$run/window-manager")
+  case "$recorded_profile" in none|i3|hypr|aerospace) ;; *) return 1;; esac
+}
+
+full_setup() {
+  printf '%s\n' 'Full setup can change configuration, tools, system preferences, and user services.' \
+    'Existing configuration conflicts are backed up before replacement.'
+  choose_source
+  stage_source
+  load_guard
+  bootstrap=$staged/.config/dotfiles/bootstrap
+  [ -f "$bootstrap" ] && [ ! -L "$bootstrap" ] || die 'selected source has no native bootstrap'
+  remembered=
+  if latest_transaction && [ "$(cat "$run/repository")" = "$repo_url" ]; then
+    remembered=$recorded_profile
+  fi
+  case "$(uname -s)" in
+    Darwin) choices='none, aerospace';;
+    Linux) choices='none, i3 (hypr only on Arch)';;
+    *) die 'native setup supports macOS and Linux';;
+  esac
+  ask "Window manager ($choices)${remembered:+ [$remembered]}"
+  profile=${answer:-$remembered}
+  case "$profile" in none|i3|hypr|aerospace) ;; *) die 'choose a supported window manager explicitly';; esac
+  community=false
+  if [ "$(uname -s)" = Linux ] && command -v apt-get >/dev/null 2>&1; then
+    if confirm 'Allow pinned community packages when required'; then community=true; fi
+  fi
+  set -- --window-manager "$profile" --repo "$repo_url" --ref "$repo_ref" --expected-commit "$candidate"
+  [ "$community" = false ] || set -- "$@" --allow-community-packages
+  /bin/sh "$bootstrap" "$@" || return $?
+  confirm 'Apply full setup?' || return 0
+  /bin/sh "$bootstrap" "$@" --apply
+}
+
+native_snapshot() {
+  native_identity || return 1
+  if ! native_git diff --quiet || ! native_git diff --cached --quiet; then
+    die 'native configuration has local edits; review them first'
+  fi
+  native_git rev-parse HEAD
+  printf '%s\n' "$branch" "$remote" "$upstream" "$native_url"
+  native_git config --get core.sparseCheckout || :
+  native_git config --get core.sparseCheckoutCone || :
+  if exists "$HOME/.cfg/info/sparse-checkout"; then
+    safe_record "$HOME/.cfg/info/sparse-checkout" || die 'unsafe sparse selection'
+    cat "$HOME/.cfg/info/sparse-checkout"
+  fi
+}
+
+preview_configuration() {
+  printf '%s\n' 'Changed selected paths:'
+  if [ "$(native_git config --get core.sparseCheckout || :)" = true ]; then
+    git -C "$staged" sparse-checkout set --no-cone --no-sparse-index --stdin <"$HOME/.cfg/info/sparse-checkout"
+    # Include old selected paths as well, so the preview contains deletions.
+    { native_git -c core.quotePath=false ls-files -t; git -C "$staged" -c core.quotePath=false ls-files -t; } \
+      | sed -n 's/^H //p' | sort -u >"$scratch/selected-paths"
+    set --
+    while IFS= read -r selected_path; do set -- "$@" "$selected_path"; done <"$scratch/selected-paths"
+    [ "$#" -gt 0 ] || return 0
+    git --literal-pathspecs -C "$staged" --no-pager diff --stat "$old_commit" "$candidate" -- "$@"
+  else
+    git -C "$staged" --no-pager diff --stat "$old_commit" "$candidate"
+  fi
+}
+
+update_configuration() {
+  printf '%s\n' 'Update selected configuration files only. Packages and services are unchanged.'
+  require_git
+  before=$(native_snapshot) || exit 1
+  old_commit=$(native_git rev-parse HEAD)
+  native_identity
+  [ -z "$repo_url" ] || [ "$repo_url" = "$native_url" ] || die 'configuration updates use the installed upstream'
+  [ -z "$repo_ref" ] || [ "$repo_ref" = "$upstream" ] || [ "refs/heads/$repo_ref" = "$upstream" ] \
+    || die 'configuration updates use the installed upstream'
+  repo_url=$native_url; repo_ref=$upstream
+  validate_source
+  printf 'Repository: %s\nReference: %s\n' "$repo_url" "$repo_ref"
+  stage_source
+  load_guard
+  [ "$old_commit" != "$candidate" ] || { printf '%s\n' 'Configuration is already current.'; return 0; }
+  git -C "$staged" merge-base --is-ancestor "$old_commit" "$candidate" \
+    || die 'upstream is not a fast-forward of the installed configuration'
+  git -C "$staged" --no-pager log --oneline "$old_commit..$candidate"
+  preview_configuration
+  confirm 'Apply configuration update?' || return 0
+  ownership_acquire || exit 1
+  after=$(native_snapshot) || exit 1
+  [ "$before" = "$after" ] || die 'native configuration changed during review; preview again'
+  ownership_recheck || exit 1
+  native_git fetch --quiet --no-tags "$staged" "$candidate"
+  native_git merge --quiet --ff-only --no-autostash --no-overwrite-ignore "$candidate"
+  printf 'Configuration updated to %s\n' "$candidate"
+}
+
+download_source() {
+  printf '%s\n' 'Download a separate source checkout. Nothing will be installed or activated.'
+  choose_source
+  ask 'Destination'
+  destination=$answer
+  case "$destination" in /*) ;; '') return 0;; *) destination=$PWD/$destination;; esac
+  safe_path "$destination" || die 'destination must not contain symlinks or traversal'
+  case "$destination" in "$HOME"|"$HOME/.cfg"|"$HOME/.cfg/"*|"$HOME/.config"|"$HOME/.config/"*) die 'choose a destination outside live configuration';; esac
+  exists "$destination" && die 'destination already exists; choose a new directory'
+  [ -d "${destination%/*}" ] || die 'destination parent must exist'
+  stage_source
+  printf 'Destination: %s\n' "$destination"
+  confirm 'Download this source?' || return 0
+  mkdir "$destination" || die 'cannot reserve destination'
+  git clone --quiet --no-local "$staged" "$destination" \
+    || die "download failed; inspect the retained destination: $destination"
+  git -C "$destination" remote set-url origin "$repo_url"
+  printf 'Source downloaded to %s\n' "$destination"
+}
+
+transaction_snapshot() {
+  for name in managed.paths backed-up.paths created-directories.paths; do
+    if [ "$name" = created-directories.paths ] && ! exists "$run/$name"; then continue; fi
+    safe_record "$run/$name" && [ -f "$run/$name" ] || return 1
+    while IFS= read -r relative || [ -n "$relative" ]; do
+      case "$relative" in
+        ''|'#'*|/*|.|..|../*|*/../*|*/..|./*|*/./*|*/.|*/|*//*|*[!A-Za-z0-9._/@+\ -]*) return 1;;
+      esac
+      set -- "$HOME"
+      [ "$name" = created-directories.paths ] || set -- "$@" "$run/rollback-current"
+      [ "$name" != backed-up.paths ] || set -- "$@" "$run/backup"
+      for base do
+        target=$base/$relative
+        safe_parents "${target%/*}" || return 1
+      done
+    done <"$run/$name"
+  done
+  # Include optional service/preference records and helpers, but not backed-up user content.
+  records=$(find "$run" \( -path "$run/backup" -o -path "$run/rollback-current" \) -prune -o -print) || return 1
+  printf '%s\n' "$records" | sort | while IFS= read -r record; do
+    safe_metadata "$record" || exit 1
+    if [ -d "$record" ]; then printf 'directory: %s\n' "$record"
+    else cksum "$record" || exit 1; fi
+  done
+}
+
+restore_native() {
+  printf '%s\n' 'Restore a full native installation backup, not the last configuration-only Git update.' \
+    'Packages remain installed. Current configuration is archived by bootstrap rollback.'
+  latest_transaction || die 'no safe completed native installation backup is available'
+  selected_run=$run_id
+  reviewed_transaction=$(transaction_snapshot) || die 'unsafe native backup journal'
+  repo_url=$(cat "$run/repository"); repo_ref=$(cat "$run/reference")
+  validate_source
+  printf 'Transaction: %s\nRepository: %s\nReference: %s\nWindow manager: %s\nManaged paths:\n' \
+    "$selected_run" "$repo_url" "$repo_ref" "$recorded_profile"
+  cat "$run/managed.paths"
+  printf 'Backup paths:\n'; cat "$run/backed-up.paths"
+  printf 'Recorded system preferences and user services will also be restored.\n'
+  if safe_record "$run/services.list"; then cat "$run/services.list"; fi
+  bootstrap=$HOME/.config/dotfiles/bootstrap
+  safe_record "$bootstrap" || die 'installed native bootstrap is missing or unsafe'
+  scratch=$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-setup.XXXXXXXX")
+  cp "$bootstrap" "$scratch/bootstrap"
+  confirm 'Restore this installation backup?' || return 0
+  has_owner && die 'Home Manager ownership blocks native recovery'
+  current_transaction=$(transaction_snapshot) || die 'backup journal became unsafe during review'
+  [ "$current_transaction" = "$reviewed_transaction" ] || die 'backup state changed during review'
+  /bin/sh "$scratch/bootstrap" --rollback "$selected_run"
+}
+
+nix_action() {
+  command -v dotfiles-update >/dev/null 2>&1 || die 'dotfiles-update is unavailable; use the Nix migration/recovery guide'
+  if [ "$1" = update ]; then
+    dotfiles-update install
+  else
+    dotfiles-update status || return $?
+    ask 'Generation to restore (blank exits; use the printed recovery commands for pending transactions)'
+    [ -n "$answer" ] || return 0
+    dotfiles-update rollback --generation "$answer"
+  fi
+}
+
+cleanup() {
+  result=$?
+  trap - 0 HUP INT TERM
+  if [ "$guard_loaded" = true ] && [ -n "$ownership_lock_path" ]; then ownership_release || result=1; fi
+  [ -z "$scratch" ] || rm -rf -- "$scratch"
+  exit "$result"
+}
+
+main() {
+  repo_url=; repo_ref=; scratch=; guard_loaded=false
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --help|-h)
+        printf '%s\n' 'Usage: setup [--repo URL] [--ref REF]' \
+          'Open the dotfiles setup menu in a terminal. Installed use: dotfiles' \
+          'Git 2.34+ is required for previews/downloads. Native and Nix ownership stay separate.'
+        return 0;;
+      --repo|--ref)
+        [ "$#" -ge 2 ] || die "$1 requires a value"
+        case "$1" in --repo) repo_url=$2;; --ref) repo_ref=$2;; esac
+        shift 2;;
+      *) die 'unknown option; use --help';;
+    esac
+  done
+  [ -t 0 ] && [ -t 1 ] || die 'an interactive terminal is required; use bootstrap for scripted setup'
+  safe_path "${HOME:-}" && [ -d "$HOME" ] || die 'HOME must be an existing absolute directory without symlinks'
+  trap cleanup 0
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  installation=fresh
+  if has_owner; then installation=nix
+  elif exists "$HOME/.cfg"; then installation=native; fi
+  while :; do
+    case "$installation" in
+      fresh) printf '\nDotfiles · Fresh installation\n\n1) Install configuration and tools\n2) Download source only\n';;
+      native) printf '\nDotfiles · Native installation\n\n1) Update configuration\n2) Install or update configuration and tools\n3) Download source only\n4) Restore a native installation backup\n';;
+      nix) printf '\nDotfiles · Nix ownership detected\n\n1) Update through Nix\n2) Download source only\n3) Nix status and recovery\n';;
+    esac
+    printf 'q) Exit\n'
+    ask 'Choice'
+    case "$installation:$answer" in
+      *:q|*:'') return 0;;
+      fresh:1|native:2) full_setup; return $?;;
+      native:1) update_configuration; return $?;;
+      fresh:2|native:3|nix:2) download_source; return $?;;
+      native:4) restore_native; return $?;;
+      nix:1) nix_action update; return $?;;
+      nix:3) nix_action recovery; return $?;;
+      *) printf '%s\n' 'Choose a listed number, or q to exit.';;
+    esac
+  done
+}
+
+main "$@"

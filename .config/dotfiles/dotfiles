@@ -10,6 +10,10 @@ case ${HOME:-} in
     ;;
 esac
 
+if [ "$#" -eq 0 ]; then
+  exec /bin/sh "$HOME/.config/dotfiles/setup"
+fi
+
 if [ ! -d "$HOME/.cfg" ]; then
   printf '%s\n' "dotfiles: repository metadata not found at $HOME/.cfg" >&2
   exit 1

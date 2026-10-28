@@ -27,12 +27,14 @@ usage() {
   printf '%s\n' \
     'usage: bootstrap [--apply] --window-manager (hypr|i3|aerospace|none)' \
     '                 [--allow-community-packages] [--repo URL] [--ref REF]' \
+    '                 [--expected-commit OID]' \
     '       bootstrap [--apply] --managed-tool taplo' \
     '       bootstrap --rollback (latest|RUN_ID)' \
     '       bootstrap --help' \
     '' \
     'Without --apply, bootstrap prints a dry-run and makes no persistent changes.' \
     'Use --apply to install packages and deploy the selected dotfiles.' \
+    'Use --expected-commit to verify the reviewed source before installing packages (requires Git).' \
     'Use --window-manager to make the platform-specific manager choice explicit.' \
     'Use --allow-community-packages to permit the documented Ghostty Ubuntu/Debian installer.' \
     >"$output"
@@ -59,6 +61,8 @@ managed_tool_was_set=false
 window_manager_was_set=false
 repo_was_set=false
 ref_was_set=false
+expected_commit=
+expected_commit_was_set=false
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -85,6 +89,12 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || die '--ref requires a Git reference' 2
       ref_was_set=true
       repo_ref=$2
+      shift
+      ;;
+    --expected-commit)
+      [ "$#" -ge 2 ] || die '--expected-commit requires a full commit ID' 2
+      expected_commit=$2
+      expected_commit_was_set=true
       shift
       ;;
     --managed-tool)
@@ -118,6 +128,18 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+if [ "$expected_commit_was_set" = true ]; then
+  case "$expected_commit" in
+    ''|*[!0-9a-f]*) die 'expected commit must be a full hexadecimal commit ID' 2 ;;
+  esac
+  case "${#expected_commit}" in
+    40|64) ;;
+    *) die 'expected commit must be a full hexadecimal commit ID' 2 ;;
+  esac
+  [ "$mode" != rollback ] && [ "$managed_tool_was_set" = false ] \
+    || die '--expected-commit requires full preview or apply mode' 2
+fi
 
 if [ "$managed_tool_was_set" = true ]; then
   [ "$managed_tool" = taplo ] \
@@ -384,7 +406,7 @@ validate_manifest_path() {
   manifest_path=$1
   case "$manifest_path" in
     ''|'#'*) return 1 ;;
-    /*|.|..|../*|*/../*|*/..|./*|*//*|*[?*\[]*)
+    /*|.|..|../*|*/../*|*/..|./*|*/./*|*/.|*/|*//*|*[?*\[]*)
       die "unsafe manifest path: $manifest_path"
       ;;
   esac
@@ -3944,6 +3966,7 @@ load_remote_manifests() {
   manifest_commit=$(git --git-dir="$manifest_gitdir" \
     rev-parse --verify 'FETCH_HEAD^{commit}') \
     || die "standalone repository reference is not a commit: $repo_ref"
+  verify_expected_commit "$manifest_commit"
 
   for manifest_name in \
     config-common.paths \
@@ -3973,6 +3996,11 @@ load_remote_manifests() {
       || die "repository is missing standalone manifest: $manifest_name"
   done
   script_dir=$manifest_source
+}
+
+verify_expected_commit() {
+  [ -z "$expected_commit" ] || [ "$1" = "$expected_commit" ] \
+    || die 'repository changed from the expected commit; preview again before applying'
 }
 
 prepare_repository() {
@@ -4005,6 +4033,7 @@ prepare_repository() {
     prepared_commit=$(git --git-dir="$prepared_gitdir" rev-parse --verify 'FETCH_HEAD^{commit}') \
       || die "repository reference is not a commit: $repo_ref"
   fi
+  verify_expected_commit "$prepared_commit"
   git --git-dir="$prepared_gitdir" config remote.origin.fetch \
     '+refs/heads/*:refs/remotes/origin/*' \
     || die 'could not configure the repository fetch mapping'
@@ -4708,6 +4737,83 @@ reverse_journal() {
   sed '1!G;h;$!d' "$1"
 }
 
+rollback_safe_parents() (
+  case "$1" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in */../*|*/./*|*/..|*/.|*//*|*[[:cntrl:]]*) return 1 ;; esac
+  directory=$1
+  while [ "$directory" != / ]; do
+    [ ! -L "$directory" ] || return 1
+    if [ -e "$directory" ]; then
+      [ -d "$directory" ] || return 1
+      listing=$(ls -ldn -- "$directory") || return 1
+      read -r permissions _ uid _rest <<EOF
+$listing
+EOF
+      case "$uid" in 0|"$ownership_uid") ;; *) return 1 ;; esac
+      case "$permissions" in
+        ?????w*|????????w*)
+          # Root-owned sticky system parents such as /tmp protect private children.
+          [ "$uid" = 0 ] || return 1
+          case "$permissions" in ?????????t*) ;; *) return 1 ;; esac ;;
+      esac
+    fi
+    directory=${directory%/*}; [ -n "$directory" ] || directory=/
+  done
+)
+
+rollback_path_restored() (
+  [ -r "$transaction_run/backed-up.paths" ] || return 1
+  while IFS= read -r saved || [ -n "$saved" ]; do
+    case "$1" in
+      "$saved"|"$saved"/*)
+        # A consumed backup also covers its children if it restored a blocking parent.
+        path_exists "$transaction_run/backup/$saved" || return 0 ;;
+    esac
+  done <"$transaction_run/backed-up.paths"
+  return 1
+)
+
+validate_rollback_journal() (
+  rollback_safe_parents "$transaction_run" || return 1
+  # Backups preserve arbitrary user content; only journal metadata must be private.
+  records=$(find "$transaction_run" \( -path "$transaction_run/backup" -o -path "$transaction_run/rollback-current" \) -prune -o -print) || return 1
+  while IFS= read -r record; do
+    [ ! -L "$record" ] && { [ -f "$record" ] || [ -d "$record" ]; } || return 1
+    listing=$(ls -ldn -- "$record") || return 1
+    read -r permissions _ uid _rest <<EOF
+$listing
+EOF
+    [ "$uid" = "$ownership_uid" ] || return 1
+    case "$permissions" in ?????w*|????????w*) return 1 ;; esac
+  done <<EOF
+$records
+EOF
+  for name in managed.paths backed-up.paths created-directories.paths; do
+    path_exists "$transaction_run/$name" || continue
+    [ -f "$transaction_run/$name" ] && [ -r "$transaction_run/$name" ] || return 1
+    while IFS= read -r relative || [ -n "$relative" ]; do
+      validate_manifest_path "$relative" || return 1
+    done <"$transaction_run/$name"
+  done
+  [ "$(cat "$transaction_run/status")" != rolled-back ] || return 0
+  for name in managed.paths backed-up.paths created-directories.paths; do
+    [ -r "$transaction_run/$name" ] || continue
+    while IFS= read -r relative || [ -n "$relative" ]; do
+      rollback_path_restored "$relative" && continue
+      set -- "$HOME"
+      [ "$name" = created-directories.paths ] || set -- "$@" "$transaction_run/rollback-current"
+      [ "$name" != backed-up.paths ] || set -- "$@" "$transaction_run/backup"
+      for base do
+        target=$base/$relative
+        rollback_safe_parents "${target%/*}" || return 1
+      done
+    done <"$transaction_run/$name"
+  done
+)
+
 archive_current_path() {
   archive_relative=$1
   archive_current=$HOME/$archive_relative
@@ -4727,6 +4833,7 @@ prune_created_directories() {
     | sort -rn \
     | cut -f 2- \
     | while IFS= read -r prune_relative || [ -n "$prune_relative" ]; do
+        rollback_path_restored "$prune_relative" && continue
         rmdir "$HOME/$prune_relative" >/dev/null 2>&1 || true
       done
 }
@@ -4991,6 +5098,10 @@ restore_previous_service_state() {
 rollback_transaction() {
   ownership_recheck || return 1
   transaction_run=$1
+  validate_rollback_journal || {
+    printf '%s\n' 'bootstrap: unsafe rollback journal or path parents' >&2
+    return 1
+  }
   rollback_status=$(cat "$transaction_run/status" 2>/dev/null || true)
   if [ "$rollback_status" = rolled-back ]; then
     printf 'Transaction is already rolled back: %s\n' "${transaction_run##*/}"
@@ -5015,6 +5126,7 @@ rollback_transaction() {
   if [ -r "$managed_journal" ]; then
     reverse_journal "$managed_journal" \
       | while IFS= read -r rollback_relative || [ -n "$rollback_relative" ]; do
+          rollback_path_restored "$rollback_relative" && continue
           archive_current_path "$rollback_relative" || exit 1
         done \
       || return 1
@@ -5037,7 +5149,7 @@ run_manual_rollback() {
     requested_id=$(cat "$transaction_state_root/latest")
   fi
   case "$requested_id" in
-    ''|*[!A-Za-z0-9._-]*) die 'resolved rollback ID contains unsupported characters' ;;
+    ''|.|..|*[!A-Za-z0-9._-]*) die 'resolved rollback ID contains unsupported characters' ;;
   esac
   requested_run=$transaction_state_root/$requested_id
   [ -d "$requested_run" ] || die "transaction does not exist: $requested_id"
@@ -5212,6 +5324,9 @@ trap 'handle_transaction_signal INT 130' INT
 trap 'handle_transaction_signal TERM 143' TERM
 
 # Coordinate before scoped dispatch, prerequisites, package tracking or Git fetch.
+if [ -n "$expected_commit" ]; then
+  require_git_capabilities
+fi
 if [ "$mode" = apply ] || [ "$mode" = rollback ]; then
   ownership_acquire || exit 1
 fi
@@ -5272,6 +5387,12 @@ fi
 
 [ -n "$script_dir" ] || die 'cannot locate bootstrap manifests'
 
+if [ -n "$expected_commit" ]; then
+  # Retain the reviewed tree through package installation; never fetch it again.
+  prepare_repository "$platform" "$window_manager" "$script_dir/manifests"
+  printf 'Expected commit: %s\n' "$expected_commit"
+fi
+
 printf 'Mode: %s\n' "$mode"
 printf 'Platform: %s\n' "$platform"
 printf 'Package manager: %s\n' "$manager"
@@ -5296,7 +5417,7 @@ if [ "$mode" = dry-run ]; then
   fi
   if [ "$prepare_dry_run" = true ]; then
     if command -v git >/dev/null 2>&1; then
-      prepare_repository "$platform" "$window_manager" "$script_dir/manifests"
+      [ -n "$prepared_gitdir" ] || prepare_repository "$platform" "$window_manager" "$script_dir/manifests"
       emit_conflict_plan "$window_manager"
     else
       printf '%s\n' 'Conflict scan deferred until Git is installed.'
@@ -5316,7 +5437,7 @@ if [ "$mode" = apply ]; then
     && [ "${DOTFILES_BOOTSTRAP_TEST_STOP_AFTER_PACKAGES:-0}" = 1 ]; then
     exit 0
   fi
-  prepare_repository "$platform" "$window_manager" "$script_dir/manifests"
+  [ -n "$prepared_gitdir" ] || prepare_repository "$platform" "$window_manager" "$script_dir/manifests"
   deploy_configuration "$platform" "$manager" "$window_manager"
   exit 0
 fi

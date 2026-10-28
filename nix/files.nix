@@ -24,7 +24,8 @@ let
     && p != "conf/platform/${if linux then "macos" else "linux"}.conf"
     && builtins.match ".*(__pycache__|/\\.[^/]+).*" p == null
   ) (walk (sourceRoot + "/.config/tmux") "");
-  dotfilesPaths = [ "check-terminal-stack" "git-summary" "lib/config-source.py" "lib/tmux-audit.sh" ] ++ builtins.filter (p:
+  dotfilesPaths = [ "check-terminal-stack" "git-summary" "setup" "dotfiles" "lib/ownership.sh"
+    "lib/config-source.py" "lib/tmux-audit.sh" ] ++ builtins.filter (p:
     builtins.match "manifests/config-.*\\.paths" p != null
     || builtins.match "manifests/packages.*\\.list" p != null
     || builtins.elem p [ "manifests/packages-npm-language-servers.json" "manifests/packages-npm-language-servers-lock.json" ]
@@ -32,7 +33,8 @@ let
   # Preserve executable modes for all retained helpers and tests, so HM
   # links them into the tree rather than copying files to change their mode.
   executable = target:
-    builtins.elem target [ ".local/bin/t" ".config/dotfiles/check-terminal-stack" ".config/dotfiles/git-summary" ]
+    builtins.elem target [ ".local/bin/t" ".config/dotfiles/check-terminal-stack" ".config/dotfiles/git-summary"
+      ".config/dotfiles/setup" ".config/dotfiles/dotfiles" ]
     || (builtins.match "\\.config/(herdr|tmux)/scripts/.*" target != null && builtins.match ".*\\.jq" target == null)
     || builtins.match "\\.config/tmux/tests/.*\\.sh" target != null;
   singles = [
@@ -69,7 +71,11 @@ let
     { inherit target;
     source = "${runtimeTree}/${target}";
     executable = executable target;
-  }) selectedPaths;
+  }) selectedPaths ++ [ {
+    target = ".local/bin/dotfiles";
+    source = "${runtimeTree}/.config/dotfiles/dotfiles";
+    executable = true;
+  } ];
 in {
   files = builtins.listToAttrs (map (file: { name = file.target; value = { inherit (file) source executable; }; }) selected);
   mutableSeeds = [ {
