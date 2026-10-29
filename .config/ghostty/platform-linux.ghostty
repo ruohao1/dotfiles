@@ -1,3 +1,6 @@
+# Avoid the per-user io_uring memory budget shared with other desktop processes.
+async-backend = epoll
+
 # Linux terminal-stack keys: physical Alt becomes the canonical Meta protocol.
 keybind = alt+space=text:\x1b\x20
 keybind = alt+n=esc:n

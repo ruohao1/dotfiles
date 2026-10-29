@@ -144,6 +144,7 @@ usage() {
     '  tmux-workspace doctor       validate persistence dependencies' \
     '  tmux-workspace supervise    restore, checkpoint, and save on stop' \
     '  tmux-workspace codex-hook   handle Codex hook JSON from stdin' \
+    '  tmux-workspace claude-hook  handle Claude hook JSON from stdin' \
     '  tmux-workspace resume-pane GENERATION PANE_KEY' \
     >"$output"
 }
@@ -410,14 +411,17 @@ validate_snapshot() {
       and (.process.kind == "shell"
         or .process.kind == "nvim"
         or .process.kind == "codex"
+        or .process.kind == "claude"
         or .process.kind == "other")
       and (.process.codex_session_id == null or (.process.codex_session_id | safe_text(512) and length > 0))
+      and (.process.claude_session_id == null or (.process.claude_session_id | safe_text(512) and length > 0))
       and (.process.nvim_session == null
         or (.process.nvim_session
           | safe_text(1024) and test("^nvim/pane-[0-9]+\\.vim$")))
-      and (if .process.kind == "codex" then .process.nvim_session == null
-        elif .process.kind == "nvim" then .process.codex_session_id == null
-        else .process.codex_session_id == null and .process.nvim_session == null end))
+      and (if .process.kind == "codex" then .process.nvim_session == null and .process.claude_session_id == null
+        elif .process.kind == "claude" then .process.nvim_session == null and .process.codex_session_id == null
+        elif .process.kind == "nvim" then .process.codex_session_id == null and .process.claude_session_id == null
+        else .process.codex_session_id == null and .process.claude_session_id == null and .process.nvim_session == null end))
     and all(.windows[];
       . as $window
       | all($window.panes[];
@@ -469,6 +473,67 @@ session_id_is_valid() {
     ''|-*) return 1 ;;
   esac
   safe_text "$session_id" 512
+}
+
+agent_process_identity() {
+  identity_pane_pid=$(tmux_run display-message -p -t "$1" '#{pane_pid}') || return 1
+  python3 - "$identity_pane_pid" "$2" <<'PYIDENTITY'
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+try:
+    pane_pid, agent = int(sys.argv[1]), sys.argv[2]
+    if pane_pid <= 1 or agent not in {"codex", "claude"}:
+        raise ValueError("invalid agent process")
+    if sys.platform.startswith("linux"):
+        def process(pid):
+            prefix, _, tail = Path(f"/proc/{pid}/stat").read_text().rpartition(")")
+            head, name = prefix.split(" (", 1)
+            fields = tail.split()
+            if int(head) != pid or len(fields) < 20 or fields[0] in {"Z", "X"}:
+                raise ValueError("unavailable process")
+            return name, fields
+
+        _, pane = process(pane_pid)
+        foreground = int(pane[5])
+        if foreground <= 1:
+            raise ValueError("no foreground process")
+        name, fields = process(foreground)
+        # stat fields: process group, controlling TTY, foreground group, birth ticks.
+        if int(fields[2]) != foreground or int(fields[5]) != foreground \
+                or fields[4] == "0" or fields[4] != pane[4]:
+            raise ValueError("ambiguous foreground process")
+        born = str(int(fields[19]))
+        if process(pane_pid)[1][5] != str(foreground):
+            raise ValueError("foreground process changed")
+    elif sys.platform == "darwin":
+        def ps(pid, fields):
+            return subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", fields], text=True,
+                stderr=subprocess.DEVNULL, env=dict(os.environ, LC_ALL="C", TZ="UTC0"))
+
+        foreground = int(ps(pane_pid, "tpgid=").strip())
+        fields = ps(foreground, "pid=,pgid=,tpgid=,lstart=,comm=").split(None, 8)
+        if foreground <= 1 or len(fields) != 9 \
+                or list(map(int, fields[:3])) != [foreground] * 3:
+            raise ValueError("ambiguous foreground process")
+        # shortcut: ps birth times have second precision; macOS runtime is unverified.
+        born = " ".join(fields[3:8])
+        time.strptime(born, "%a %b %d %H:%M:%S %Y")
+        name = Path(fields[8].strip()).name
+        if int(ps(pane_pid, "tpgid=").strip()) != foreground:
+            raise ValueError("foreground process changed")
+    else:
+        raise ValueError("unsupported process identity")
+    if name != agent and not name.startswith(agent + "-"):
+        raise ValueError("foreground process is not the agent")
+    print(f"{foreground}:{born}")
+except (OSError, ValueError, subprocess.SubprocessError):
+    sys.exit(1)
+PYIDENTITY
 }
 
 require_safe_text() {
@@ -744,6 +809,7 @@ capture_snapshot() {
       ' "$windows_file")
     fi
     codex_session_id=
+    claude_session_id=
     nvim_session=
     case ${pane_command##*/} in
       nvim|nvimdiff|nvim-wrapped|nvimdiff-wrapped)
@@ -754,19 +820,26 @@ capture_snapshot() {
           nvim_session=$(checkpoint_nvim "$pane_key" "$nvim_server" || :)
         fi
         ;;
-      codex|codex-*)
-        codex_active=$(tmux_run show-options -pqv -t "$pane_key" \
-          @dotfiles_codex_active 2>/dev/null || :)
-        codex_session_id=$(tmux_run show-options -pqv -t "$pane_key" \
-          @dotfiles_codex_session_id 2>/dev/null || :)
-        if [ "$codex_active" = 1 ] \
-          && { [ -z "$codex_session_id" ] \
-            || session_id_is_valid "$codex_session_id"; }; then
-          process_kind=codex
-        else
-          process_kind=other
-          codex_session_id=
+      codex|codex-*|claude|claude-*)
+        process_kind=${pane_command##*/}
+        process_kind=${process_kind%%-*}
+        agent_active=$(tmux_run show-options -pqv -t "$pane_key" \
+          "@dotfiles_${process_kind}_active" 2>/dev/null || :)
+        agent_session_id=$(tmux_run show-options -pqv -t "$pane_key" \
+          "@dotfiles_${process_kind}_session_id" 2>/dev/null || :)
+        recorded_identity=$(tmux_run show-options -pqv -t "$pane_key" \
+          "@dotfiles_${process_kind}_process_identity" 2>/dev/null || :)
+        current_identity=$(agent_process_identity "$pane_key" "$process_kind" || :)
+        # Missing or untrusted hooks still leave the agent's resume picker.
+        if [ "$agent_active" != 1 ] || [ -z "$current_identity" ] \
+          || [ "$recorded_identity" != "$current_identity" ] \
+          || ! session_id_is_valid "$agent_session_id"; then
+          agent_session_id=
         fi
+        case $process_kind in
+          codex) codex_session_id=$agent_session_id ;;
+          claude) claude_session_id=$agent_session_id ;;
+        esac
         ;;
       sh|ash|bash|dash|fish|ksh|mksh|nu|tcsh|zsh|elvish)
         process_kind=shell
@@ -784,6 +857,7 @@ capture_snapshot() {
       --arg line_pin_session_key "$pane_pin_session" \
       --arg process_kind "$process_kind" \
       --arg codex_session_id "$codex_session_id" \
+      --arg claude_session_id "$claude_session_id" \
       --arg nvim_session "$nvim_session" \
       '{
         key:$key,
@@ -795,6 +869,7 @@ capture_snapshot() {
         process:{
           kind:$process_kind,
           codex_session_id:(if $codex_session_id == "" then null else $codex_session_id end),
+          claude_session_id:(if $claude_session_id == "" then null else $claude_session_id end),
           nvim_session:(if $nvim_session == "" then null else $nvim_session end)
         }
       }' >>"$panes_file"
@@ -1620,7 +1695,7 @@ record_restore() {
 
 resume_restored_processes() {
   resume_keys_file=$workspace_runtime/restore-$$-resume-keys
-  jq -r '.panes[] | select(.process.kind == "codex" or .process.kind == "nvim") | .key' \
+  jq -r '.panes[] | select(.process.kind == "codex" or .process.kind == "claude" or .process.kind == "nvim") | .key' \
     "$selected_manifest" >"$resume_keys_file"
   chmod 0600 "$resume_keys_file"
   while IFS= read -r saved_pane_key; do
@@ -1631,8 +1706,7 @@ resume_restored_processes() {
     resumed_process_kind=$(jq -er --arg key "$saved_pane_key" \
       '.panes[] | select(.key == $key) | .process.kind' "$selected_manifest")
     case $resumed_process_kind in
-      codex) resumed_executable=codex ;;
-      nvim) resumed_executable=nvim ;;
+      codex|claude|nvim) resumed_executable=$resumed_process_kind ;;
       *) die 'invalid resumed process kind' 1 ;;
     esac
     if ! executable_available "$resumed_executable"; then
@@ -1671,36 +1745,40 @@ notify_unavailable_process() {
   esac
 }
 
-codex_hook() {
+agent_hook() {
+  hook_agent=$1
   prepare_roots
   case ${TMUX_PANE-} in
     %*) ;;
     *) return 0 ;;
   esac
   require_identifier "$TMUX_PANE" '^%[0-9]+$' 'TMUX_PANE'
-  hook_temp=$workspace_runtime/.codex-hook-$$
+  hook_temp=$workspace_runtime/.agent-hook-$$
   command cat >"$hook_temp"
   chmod 0600 "$hook_temp"
   hook_event=$(jq -er '.hook_event_name | select(type == "string")' \
-    "$hook_temp") || die 'invalid Codex hook event' 1
+    "$hook_temp") || die "invalid $hook_agent hook event" 1
   hook_session_id=$(jq -er '.session_id | select(type == "string")' \
-    "$hook_temp") || die 'invalid Codex hook session identifier' 1
+    "$hook_temp") || die "invalid $hook_agent hook session identifier" 1
   session_id_is_valid "$hook_session_id" \
-    || die 'invalid Codex hook session identifier' 1
+    || die "invalid $hook_agent hook session identifier" 1
 
   case $hook_event in
     SessionStart)
+      hook_identity=$(agent_process_identity "$TMUX_PANE" "$hook_agent" || :)
       tmux_run set-option -pt "$TMUX_PANE" \
-        @dotfiles_codex_session_id "$hook_session_id" \
-        \; set-option -pt "$TMUX_PANE" @dotfiles_codex_active 1
+        "@dotfiles_${hook_agent}_session_id" "$hook_session_id" \
+        \; set-option -pt "$TMUX_PANE" "@dotfiles_${hook_agent}_process_identity" "$hook_identity" \
+        \; set-option -pt "$TMUX_PANE" "@dotfiles_${hook_agent}_active" 1
       ;;
     SessionEnd)
       current_session_id=$(tmux_run show-options -pqv -t "$TMUX_PANE" \
-        @dotfiles_codex_session_id 2>/dev/null || :)
+        "@dotfiles_${hook_agent}_session_id" 2>/dev/null || :)
       if [ "$current_session_id" = "$hook_session_id" ]; then
         tmux_run set-option -pu -t "$TMUX_PANE" \
-          @dotfiles_codex_session_id \
-          \; set-option -pu -t "$TMUX_PANE" @dotfiles_codex_active
+          "@dotfiles_${hook_agent}_session_id" \
+          \; set-option -pu -t "$TMUX_PANE" "@dotfiles_${hook_agent}_process_identity" \
+          \; set-option -pu -t "$TMUX_PANE" "@dotfiles_${hook_agent}_active"
       fi
       ;;
   esac
@@ -1724,19 +1802,23 @@ resume_pane() {
   process_kind=$(printf '%s\n' "$pane_record" | jq -er '.process.kind')
   select_process_locale
   case $process_kind in
-    codex)
-      if ! executable_available codex; then
-        notify_unavailable_process codex "${TMUX_PANE-}"
+    codex|claude)
+      if ! executable_available "$process_kind"; then
+        notify_unavailable_process "$process_kind" "${TMUX_PANE-}"
         exit 127
       fi
-      codex_session_id=$(printf '%s\n' "$pane_record" | \
-        jq -r '.process.codex_session_id // empty')
-      if [ -n "$codex_session_id" ]; then
-        session_id_is_valid "$codex_session_id" \
-          || die 'invalid Codex session identifier in snapshot' 1
-        LC_ALL="$workspace_process_locale" exec codex resume "$codex_session_id"
+      agent_session_id=$(printf '%s\n' "$pane_record" | \
+        jq -r --arg agent "$process_kind" '.process[$agent + "_session_id"] // empty')
+      case $process_kind in
+        codex) resume_argument=resume ;;
+        claude) resume_argument=--resume ;;
+      esac
+      if [ -n "$agent_session_id" ]; then
+        session_id_is_valid "$agent_session_id" \
+          || die "invalid $process_kind session identifier in snapshot" 1
+        LC_ALL="$workspace_process_locale" exec "$process_kind" "$resume_argument" "$agent_session_id"
       fi
-      LC_ALL="$workspace_process_locale" exec codex resume
+      LC_ALL="$workspace_process_locale" exec "$process_kind" "$resume_argument"
       ;;
     nvim)
       if ! executable_available nvim; then
@@ -1936,7 +2018,7 @@ cleanup_on_exit() {
   fi
   if [ -n "$hook_temp" ]; then
     case $hook_temp in
-      "$workspace_runtime"/.codex-hook-*) rm -f "$hook_temp" ;;
+      "$workspace_runtime"/.agent-hook-*) rm -f "$hook_temp" ;;
     esac
   fi
   if [ "$restore_in_progress" -eq 1 ] && [ "$restore_committed" -eq 0 ]; then
@@ -1979,7 +2061,12 @@ case ${1-} in
   codex-hook)
     [ "$#" -eq 1 ] || { usage 0; exit 2; }
     initialize_workspace_source
-    codex_hook
+    agent_hook codex
+    ;;
+  claude-hook)
+    [ "$#" -eq 1 ] || { usage 0; exit 2; }
+    initialize_workspace_source
+    agent_hook claude
     ;;
   resume-pane)
     [ "$#" -eq 3 ] || { usage 0; exit 2; }

@@ -5,6 +5,7 @@ Documentation=man:tmux(1)
 [Service]
 Type=simple
 ExecStart=%h/.config/tmux/scripts/workspace supervise
+KillMode=process
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30

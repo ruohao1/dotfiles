@@ -79,9 +79,10 @@ run_workspace_missing_executable() {
   set -e
 }
 
-run_codex_hook() {
-  hook_pane=$1
-  hook_payload=$2
+run_agent_hook() {
+  hook_agent=$1
+  hook_pane=$2
+  hook_payload=$3
   set +e
   printf '%s\n' "$hook_payload" |
     HOME=$test_root/home \
@@ -91,13 +92,24 @@ run_codex_hook() {
       TMUX_WORKSPACE_TESTING=1 \
       TMUX_WORKSPACE_SOCKET=$socket \
       TMUX_PANE=$hook_pane \
-      "$workspace" codex-hook >"$stdout" 2>"$stderr"
+      "$workspace" "$hook_agent-hook" >"$stdout" 2>"$stderr"
   status=$?
   set -e
 }
 
 private_tmux() {
   "$real_tmux" -S "$socket" "$@"
+}
+
+wait_for_pane_command() {
+  waited=0
+  while [ "$waited" -lt 200 ]; do
+    current_command=$(private_tmux display-message -p -t "$1" '#{pane_current_command}')
+    [ "$current_command" = "$2" ] && return 0
+    sleep 0.01
+    waited=$((waited + 1))
+  done
+  fail "pane command did not become $2"
 }
 
 stop_private_server() {
@@ -760,12 +772,19 @@ assert_equal codex \
   "$beta_command" \
   "beta pane command"
 
+run_workspace save
+assert_equal 0 "$status" "unregistered Codex checkpoint"
+unregistered_generation=$(cat "$state/dotfiles/tmux/current")
+jq -e 'all(.panes[]; .process.kind == "codex" and .process.codex_session_id == null)' \
+  "$state/dotfiles/tmux/snapshots/$unregistered_generation/snapshot.json" >/dev/null \
+  || fail "unregistered Codex panes must retain their resume picker"
+
 alpha_payload='{"session_id":"thr_alpha","transcript_path":"/ignored/a.jsonl","cwd":"/same","hook_event_name":"SessionStart","model":"gpt-5.6-sol","source":"startup"}'
 beta_payload='{"session_id":"thr_beta","transcript_path":"/ignored/b.jsonl","cwd":"/same","hook_event_name":"SessionStart","model":"gpt-5.6-sol","source":"resume"}'
-run_codex_hook "$codex_alpha_pane" "$alpha_payload"
+run_agent_hook codex "$codex_alpha_pane" "$alpha_payload"
 assert_equal 0 "$status" "alpha SessionStart hook"
 [ ! -s "$stdout" ] || fail "SessionStart hook wrote model context"
-run_codex_hook "$codex_beta_pane" "$beta_payload"
+run_agent_hook codex "$codex_beta_pane" "$beta_payload"
 assert_equal 0 "$status" "beta SessionStart hook"
 assert_equal thr_alpha \
   "$(private_tmux show-options -pqv -t "$codex_alpha_pane" @dotfiles_codex_session_id)" \
@@ -775,18 +794,18 @@ assert_equal thr_beta \
   "beta pane exact session"
 
 stale_end='{"session_id":"thr_stale","transcript_path":"/ignored/stale.jsonl","cwd":"/same","hook_event_name":"SessionEnd","model":"gpt-5.6-sol","reason":"other"}'
-run_codex_hook "$codex_alpha_pane" "$stale_end"
+run_agent_hook codex "$codex_alpha_pane" "$stale_end"
 assert_equal 0 "$status" "stale SessionEnd hook"
 assert_equal thr_alpha \
   "$(private_tmux show-options -pqv -t "$codex_alpha_pane" @dotfiles_codex_session_id)" \
   "stale SessionEnd preserves current conversation"
 alpha_end='{"session_id":"thr_alpha","transcript_path":"/ignored/a.jsonl","cwd":"/same","hook_event_name":"SessionEnd","model":"gpt-5.6-sol","reason":"other"}'
-run_codex_hook "$codex_alpha_pane" "$alpha_end"
+run_agent_hook codex "$codex_alpha_pane" "$alpha_end"
 assert_equal 0 "$status" "matching SessionEnd hook"
 assert_equal '' \
   "$(private_tmux show-options -pqv -t "$codex_alpha_pane" @dotfiles_codex_session_id)" \
   "matching SessionEnd clears identifier"
-run_codex_hook "$codex_alpha_pane" "$alpha_payload"
+run_agent_hook codex "$codex_alpha_pane" "$alpha_payload"
 assert_equal 0 "$status" "alpha SessionStart re-registration"
 
 run_workspace save
@@ -799,6 +818,7 @@ jq -e '
 ' "$codex_manifest" >/dev/null || fail "distinct same-cwd Codex metadata"
 
 private_tmux set-option -pu -t "$codex_beta_pane" @dotfiles_codex_session_id
+private_tmux set-option -pu -t "$codex_beta_pane" @dotfiles_codex_active
 run_workspace save
 assert_equal 0 "$status" "Codex picker fallback checkpoint"
 codex_generation=$(cat "$state/dotfiles/tmux/current")
@@ -866,6 +886,200 @@ assert_contains 'codex is unavailable; the restored shell was left open' \
 [ ! -e "$codex_log_directory/alpha" ] \
   && [ ! -e "$codex_log_directory/picker" ] \
   || fail "missing Codex restore dispatched a process"
+
+stop_private_server
+cp "$fixture_sleep" "$shim_directory/claude"
+cp "$fixture_sleep" "$shim_directory/node"
+"$real_tmux" -f "$test_root/home/.tmux.conf" -S "$socket" \
+  new-session -d -s claude-work -c "$test_root/projects/alpha" 'exec claude 300'
+private_tmux new-window -d -t '=claude-work:2' \
+  -c "$test_root/projects/alpha" 'exec claude 300'
+private_tmux new-window -d -t '=claude-work:3' \
+  -c "$test_root/projects/alpha" 'exec claude 300'
+private_tmux new-window -d -t '=claude-work:4' \
+  -c "$test_root/projects/alpha" 'exec node 300'
+claude_alpha_pane=$(private_tmux display-message -p -t '=claude-work:1' '#{pane_id}')
+claude_beta_pane=$(private_tmux display-message -p -t '=claude-work:3' '#{pane_id}')
+stale_claude_pane=$(private_tmux display-message -p -t '=claude-work:4' '#{pane_id}')
+wait_attempt=0
+while [ "$wait_attempt" -lt 200 ]; do
+  agent_commands=$(private_tmux list-panes -a -F '#{pane_current_command}' | sort)
+  [ "$agent_commands" = "$(printf 'claude\nclaude\nclaude\nnode')" ] && break
+  sleep 0.01
+  wait_attempt=$((wait_attempt + 1))
+done
+assert_equal "$(printf 'claude\nclaude\nclaude\nnode')" "$agent_commands" 'Claude fixture commands'
+alpha_payload='{"session_id":"claude_alpha","transcript_path":"/ignored/claude-a.jsonl","cwd":"/same","hook_event_name":"SessionStart","source":"startup"}'
+beta_payload='{"session_id":"claude_beta","transcript_path":"/ignored/claude-b.jsonl","cwd":"/same","hook_event_name":"SessionStart","source":"resume"}'
+run_agent_hook claude "$claude_alpha_pane" "$alpha_payload"
+assert_equal 0 "$status" 'Claude SessionStart hook'
+[ ! -s "$stdout" ] || fail 'Claude hook wrote model context'
+run_agent_hook claude "$claude_beta_pane" "$beta_payload"
+assert_equal 0 "$status" 'second Claude SessionStart hook'
+run_agent_hook claude "$stale_claude_pane" '{"session_id":"stale-claude","hook_event_name":"SessionStart"}'
+assert_equal 0 "$status" 'stale Claude metadata fixture'
+run_agent_hook claude "$claude_alpha_pane" '{"session_id":"stale","hook_event_name":"SessionEnd"}'
+assert_equal 0 "$status" 'stale Claude SessionEnd hook'
+assert_equal claude_alpha \
+  "$(private_tmux show-options -pqv -t "$claude_alpha_pane" @dotfiles_claude_session_id)" \
+  'stale Claude SessionEnd preserves current conversation'
+run_agent_hook claude "$claude_alpha_pane" '{"session_id":"claude_alpha","hook_event_name":"SessionEnd"}'
+assert_equal 0 "$status" 'matching Claude SessionEnd hook'
+assert_equal '' \
+  "$(private_tmux show-options -pqv -t "$claude_alpha_pane" @dotfiles_claude_session_id)" \
+  'matching Claude SessionEnd clears identifier'
+run_agent_hook claude "$claude_alpha_pane" "$alpha_payload"
+assert_equal 0 "$status" 'Claude SessionStart re-registration'
+run_workspace save
+assert_equal 0 "$status" 'Claude metadata checkpoint'
+claude_generation=$(cat "$state/dotfiles/tmux/current")
+claude_manifest=$state/dotfiles/tmux/snapshots/$claude_generation/snapshot.json
+jq -e --arg stale "$stale_claude_pane" '
+  ([.panes[] | select(.process.kind == "claude")] | length) == 3
+  and any(.panes[]; .key == $stale and .process.kind == "other" and .process.claude_session_id == null)
+  and any(.panes[]; .process.claude_session_id == "claude_alpha")
+  and any(.panes[]; .process.claude_session_id == "claude_beta")
+  and any(.panes[]; .process.claude_session_id == null)
+' "$claude_manifest" >/dev/null || fail 'distinct Claude IDs, picker, and stale markers on unrelated Node processes'
+stop_private_server
+cat >"$shim_directory/claude" <<'SHIM'
+#!/bin/sh
+set -eu
+case $* in
+  '--resume claude_alpha') output=$CODEX_TEST_LOG_DIRECTORY/claude-alpha ;;
+  '--resume claude_beta') output=$CODEX_TEST_LOG_DIRECTORY/claude-beta ;;
+  '--resume') output=$CODEX_TEST_LOG_DIRECTORY/claude-picker ;;
+  *) output=$CODEX_TEST_LOG_DIRECTORY/unexpected ;;
+esac
+locale charmap >"$output.locale"
+printf '%s\n' "$@" >"$output"
+SHIM
+chmod 0755 "$shim_directory/claude"
+run_workspace restore
+assert_equal 0 "$status" 'Claude process restore'
+wait_attempt=0
+while { [ ! -f "$codex_log_directory/claude-alpha" ] \
+  || [ ! -f "$codex_log_directory/claude-beta" ] \
+  || [ ! -f "$codex_log_directory/claude-picker" ]; } \
+  && [ "$wait_attempt" -lt 200 ]; do
+  sleep 0.01
+  wait_attempt=$((wait_attempt + 1))
+done
+assert_equal "$(printf '%s\n%s' --resume claude_alpha)" \
+  "$(cat "$codex_log_directory/claude-alpha")" 'exact first Claude resume argv'
+assert_equal "$(printf '%s\n%s' --resume claude_beta)" \
+  "$(cat "$codex_log_directory/claude-beta")" 'exact second Claude resume argv'
+assert_equal --resume "$(cat "$codex_log_directory/claude-picker")" 'Claude picker argv'
+assert_equal UTF-8 "$(cat "$codex_log_directory/claude-alpha.locale")" 'Claude UTF-8 locale'
+[ ! -e "$codex_log_directory/unexpected" ] || fail 'unexpected agent resume argv'
+cp "$claude_manifest" "$claude_manifest.original"
+jq --arg key "$claude_alpha_pane" '
+  (.panes[] | select(.key == $key) | .process.claude_session_id) = "--invalid-option"
+' "$claude_manifest.original" >"$claude_manifest"
+run_workspace resume-pane "$claude_generation" "$claude_alpha_pane"
+assert_equal 1 "$status" 'Claude option-like session IDs are rejected'
+jq --arg key "$claude_alpha_pane" '
+  (.panes[] | select(.key == $key) | .process.codex_session_id) = "wrong-agent"
+' "$claude_manifest.original" >"$claude_manifest"
+run_workspace resume-pane "$claude_generation" "$claude_alpha_pane"
+assert_equal 1 "$status" 'mixed agent metadata is rejected'
+mv "$claude_manifest.original" "$claude_manifest"
+stop_private_server
+run_workspace_missing_executable claude restore
+assert_equal 0 "$status" 'missing Claude executable restore'
+assert_equal sh "$(private_tmux list-panes -a -F '#{pane_current_command}' | sort -u)" \
+  'missing Claude leaves restored shells open'
+assert_contains 'claude is unavailable; the restored shell was left open' \
+  "$state/dotfiles/tmux/last-warning" 'missing Claude warning'
+pass 'Codex and Claude exact resumes, picker fallbacks, and missing binaries'
+
+stop_private_server
+cp "$fixture_sleep" "$shim_directory/codex"
+cp "$fixture_sleep" "$shim_directory/claude"
+cat >"$test_root/run-agent" <<'SHIM'
+#!/bin/sh
+set -eu
+printf '%s\n' "$$" >"$1"
+exec "$2" 300
+SHIM
+chmod 0755 "$test_root/run-agent"
+"$real_tmux" -f "$test_root/home/.tmux.conf" -S "$socket" \
+  new-session -d -s agent-lifetime -c "$test_root/projects/alpha" 'exec sh -i'
+lifetime_pane=$(private_tmux display-message -p -t '=agent-lifetime:1' '#{pane_id}')
+lifetime_shell_pid=$(private_tmux display-message -p -t "$lifetime_pane" '#{pane_pid}')
+for lifetime_agent in codex claude; do
+  lifetime_command=$(jq -nr --arg runner "$test_root/run-agent" \
+    --arg pid_file "$test_root/agent.pid" --arg agent "$lifetime_agent" \
+    '[$runner, $pid_file, $agent] | @sh')
+  private_tmux send-keys -t "$lifetime_pane" -l "$lifetime_command"
+  private_tmux send-keys -t "$lifetime_pane" Enter
+  wait_for_pane_command "$lifetime_pane" "$lifetime_agent"
+  first_agent_pid=$(cat "$test_root/agent.pid")
+  case $first_agent_pid in
+    ''|*[!0-9]*) fail 'invalid private foreground agent PID' ;;
+  esac
+  [ "$first_agent_pid" -gt 1 ] && [ "$first_agent_pid" != "$lifetime_shell_pid" ] \
+    || fail 'agent must be a child of the persistent shell'
+  run_agent_hook "$lifetime_agent" "$lifetime_pane" \
+    '{"session_id":"old-lifetime","hook_event_name":"SessionStart"}'
+  assert_equal 0 "$status" "$lifetime_agent lifetime SessionStart"
+  run_workspace save
+  assert_equal 0 "$status" "$lifetime_agent original lifetime checkpoint"
+  lifetime_manifest=$state/dotfiles/tmux/snapshots/$(cat "$state/dotfiles/tmux/current")/snapshot.json
+  jq -e --arg key "$lifetime_pane" --arg agent "$lifetime_agent" '
+    any(.panes[]; .key == $key and .process[$agent + "_session_id"] == "old-lifetime")
+  ' "$lifetime_manifest" >/dev/null || fail "$lifetime_agent original exact ID was lost"
+
+  private_tmux set-option -pu -t "$lifetime_pane" "@dotfiles_${lifetime_agent}_process_identity"
+  run_workspace save
+  assert_equal 0 "$status" "$lifetime_agent legacy hook checkpoint"
+  lifetime_manifest=$state/dotfiles/tmux/snapshots/$(cat "$state/dotfiles/tmux/current")/snapshot.json
+  jq -e --arg key "$lifetime_pane" --arg agent "$lifetime_agent" '
+    any(.panes[]; .key == $key and .process.kind == $agent
+      and .process[$agent + "_session_id"] == null)
+  ' "$lifetime_manifest" >/dev/null || fail "$lifetime_agent legacy marker must use the picker"
+  run_agent_hook "$lifetime_agent" "$lifetime_pane" \
+    '{"session_id":"old-lifetime","hook_event_name":"SessionStart"}'
+  assert_equal 0 "$status" "$lifetime_agent re-registration"
+  run_workspace save
+  assert_equal 0 "$status" "$lifetime_agent re-registered checkpoint"
+  lifetime_manifest=$state/dotfiles/tmux/snapshots/$(cat "$state/dotfiles/tmux/current")/snapshot.json
+  jq -e --arg key "$lifetime_pane" --arg agent "$lifetime_agent" '
+    any(.panes[]; .key == $key and .process[$agent + "_session_id"] == "old-lifetime")
+  ' "$lifetime_manifest" >/dev/null || fail "$lifetime_agent re-registration must restore its exact ID"
+
+  # Exit without SessionEnd, then start the same agent under the same shell.
+  kill -TERM "$first_agent_pid"
+  wait_for_pane_command "$lifetime_pane" sh
+  private_tmux send-keys -t "$lifetime_pane" -l "$lifetime_command"
+  private_tmux send-keys -t "$lifetime_pane" Enter
+  wait_for_pane_command "$lifetime_pane" "$lifetime_agent"
+  replacement_agent_pid=$(cat "$test_root/agent.pid")
+  case $replacement_agent_pid in
+    ''|*[!0-9]*) fail 'invalid replacement foreground agent PID' ;;
+  esac
+  [ "$replacement_agent_pid" -gt 1 ] \
+    && [ "$replacement_agent_pid" != "$first_agent_pid" ] \
+    && [ "$replacement_agent_pid" != "$lifetime_shell_pid" ] \
+    || fail 'replacement agent must have a new child PID'
+  assert_equal "$lifetime_shell_pid" \
+    "$(private_tmux display-message -p -t "$lifetime_pane" '#{pane_pid}')" \
+    'replacement keeps the original pane shell PID'
+  assert_equal old-lifetime \
+    "$(private_tmux show-options -pqv -t "$lifetime_pane" "@dotfiles_${lifetime_agent}_session_id")" \
+    'replacement fixture retains stale hook metadata'
+  run_workspace save
+  assert_equal 0 "$status" "$lifetime_agent replacement checkpoint"
+  lifetime_manifest=$state/dotfiles/tmux/snapshots/$(cat "$state/dotfiles/tmux/current")/snapshot.json
+  jq -e --arg key "$lifetime_pane" --arg agent "$lifetime_agent" '
+    any(.panes[]; .key == $key and .process.kind == $agent
+      and .process[$agent + "_session_id"] == null)
+  ' "$lifetime_manifest" >/dev/null \
+    || fail "$lifetime_agent replacement reused a stale exact session ID"
+  kill -TERM "$replacement_agent_pid"
+  wait_for_pane_command "$lifetime_pane" sh
+done
+pass 'same-shell agent replacements fall back to the picker'
 
 stop_private_server
 real_nvim=$(command -v nvim) || fail "nvim is required"
