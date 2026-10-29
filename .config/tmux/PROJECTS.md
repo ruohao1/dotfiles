@@ -37,6 +37,37 @@ If a graphical window cannot open, `t` reports the error and leaves the sessions
 available. Re-run `t --with-editor` from Ghostty to retry. Project selection still prefers an
 existing session rooted at the exact current directory before the Git root.
 
+## Resume agent conversations after a reboot
+
+Workspace checkpoints retain running Codex and Claude panes. They resume the
+recorded conversation when its session ID is available. Otherwise, they open
+the agent's history picker. They never choose a conversation by its directory,
+because several panes can use the same directory.
+The recorded ID must belong to the same foreground agent process that ran when
+the hook registered it. A replacement process or an unreadable process identity
+opens the picker, even if an old hook marker remains in the pane.
+
+Codex records its ID through `~/.codex/hooks.json`. Review and trust the workspace
+hooks through `/hooks` when prompted. See the [Codex hook documentation](https://learn.chatgpt.com/docs/hooks).
+Claude records its ID through `SessionStart` and `SessionEnd` hooks in
+`~/.claude/settings.json`. Both events must run
+`"$HOME/.config/tmux/scripts/workspace" claude-hook`. Preserve other settings
+when adding these hooks. Automatic Claude restoration requires the native
+`claude` process. Generic Node or Bun processes are left as shells, because a
+stale hook marker cannot prove that they are still Claude. See the
+[Claude hook documentation](https://code.claude.com/docs/en/hooks).
+
+The agent executable must be available to the workspace service. Native
+installations search `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`,
+`/usr/bin`, and `/bin`. Nix-managed installations search the selected Home
+Manager profile first, then these fallback paths. If an executable is missing,
+restoration leaves the shell open and records a warning.
+
+The native Linux service stops only its checkpoint supervisor. The supervisor
+saves a final checkpoint, and tmux panes remain running across service stops
+and restarts. The Nix-managed service still uses systemd's default control-group
+stop behavior.
+
 ## Switch between running sessions
 
 Press **Alt+Space, then f** to open a fuzzy project picker. Each project appears

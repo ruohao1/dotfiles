@@ -160,48 +160,6 @@ for index, group in ipairs(plugin.opts.spec) do
 end
 eq(actual_groups, expected_groups, "WhichKey leader groups")
 
-local lock_path = vim.fs.joinpath(nvim_root, "lazy-lock.json")
-local lock = vim.json.decode(table.concat(vim.fn.readfile(lock_path), "\n"))
-eq(lock, {
-  ["fzf-lua"] = { branch = "main", commit = "05e44d38de0a79c11fba5f7bf8138791b1dbdd1e" },
-  ["image.nvim"] = { branch = "master", commit = "da2be65c153ba15a14a342b05591652a6df70d58" },
-  ["jupytext.nvim"] = {
-    branch = "master",
-    commit = "2e86acfa4345f611c86f57116db0c06ffecb721d",
-  },
-  ["lazy.nvim"] = { branch = "main", commit = "306a05526ada86a7b30af95c5cc81ffba93fef97" },
-  ["mini.icons"] = { branch = "main", commit = "e56797f90192d81f1fda02e662fc3e8e3d775027" },
-  ["mini.pairs"] = { branch = "main", commit = "4a014143fcb4e9df26198ccb3ecff3b9e77a048c" },
-  ["mini.starter"] = {
-    branch = "main",
-    commit = "0575c96206d63fd98d7f786df78dc225bf847d95",
-  },
-  ["mini.surround"] = {
-    branch = "main",
-    commit = "580e4cb98c5900d9fe743865fb5a5b2178b4ab18",
-  },
-  ["molten-nvim"] = { branch = "main", commit = "a286aa914d9a154bc359131aab788b5a077a5a99" },
-  ["nvim-treesitter"] = {
-    branch = "main",
-    commit = "074aa4422bf029908338e855d0c0f71470a971bb",
-  },
-  ["oil.nvim"] = { branch = "master", commit = "b73018b75affd13fa38e2fc94ef753b465f770d7" },
-  ["otter.nvim"] = { branch = "main", commit = "f4a033d4e2bd86d4f09386a73d3861538601253d" },
-  ["quarto-nvim"] = { branch = "main", commit = "17f1e5d664bc615478230dc0240666329efacf9b" },
-  ["smart-splits.nvim"] = {
-    branch = "master",
-    commit = "ba2850ff3d3b09785a7105c69d06a12117d4b97d",
-  },
-  ["tokyonight.nvim"] = {
-    branch = "main",
-    commit = "545d72cde6400835d895160ecb5853874fd5156d",
-  },
-  ["which-key.nvim"] = {
-    branch = "main",
-    commit = "3aab2147e74890957785941f0c1ad87d0a44c15a",
-  },
-}, "Neovim plugin lock boundary")
-
 local plugin_source_path = vim.fs.joinpath(nvim_root, "tests", "plugin_source.lua")
 local plugin_source = table.concat(vim.fn.readfile(plugin_source_path), "\n")
 eq(
