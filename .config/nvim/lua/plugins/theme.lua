@@ -10,6 +10,8 @@ return {
       terminal_colors = true,
       on_highlights = function(highlights)
         highlights.MiniStarterCurrent = { link = "Visual" }
+        highlights.MiniStarterGitGraph =
+          vim.tbl_extend("force", highlights.Comment, { italic = false })
       end,
       styles = {
         comments = { italic = true },

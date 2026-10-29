@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Keep Neovim starter commit-graph connectors upright while secondary text
+  retains its italic styling.
 - Preserve local Neovim plugin pins during validation. Verify bundled plugin
   revisions and sources, and report configured runtime checks as skipped when
   extra local plugins are present. WhichKey tests no longer require unrelated

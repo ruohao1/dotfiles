@@ -154,7 +154,7 @@ local function repository_panel(view, budget)
           seen = seen + 1
         end
         rows[#rows + 1] = {
-          unit(entry.graph or "", "Comment"),
+          unit(entry.graph or "", "MiniStarterGitGraph"),
           unit(entry.oid and (" " .. entry.oid .. " ") or "", "Identifier"),
           unit(entry.subject or "", "Normal"),
         }
