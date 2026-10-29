@@ -23,7 +23,7 @@ jobs:
       - name: Install terminal test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends tmux fzf
+          sudo apt-get install --yes --no-install-recommends tmux fzf jq
       - name: Run isolated source suites
         shell: bash
         run: |
@@ -46,7 +46,7 @@ jobs:
               python3 -B -m unittest discover -v -s nix/tests -p test_entrypoint.py
               python3 -B -m unittest discover -v -s nix/tests -p test_setup_cli.py
               python3 -B -m unittest discover -v -s nix/tests -p test_ownership.py
-              python3 -B -m unittest discover -v -s nix/tests -p test_checker_clipboard.py
+              python3 -B -m unittest discover -v -s nix/tests -p "test_checker_*.py"
               python3 -B -m unittest discover -v -s nix/tests -p "test_session_navigator*.py"
               python3 -B -m unittest discover -v -s nix/tests -p "test_migration_*.py"
               python3 -B -m unittest discover -v -s nix/tests -p "test_update_*.py"

@@ -2597,6 +2597,8 @@ hardened_plugin_git() {
     -C "$hardened_git_checkout" "$@"
 }
 
+approved_nvim_plugins='fzf-lua image.nvim jupytext.nvim lazy.nvim mini.icons mini.pairs mini.starter mini.surround molten-nvim nvim-treesitter oil.nvim otter.nvim quarto-nvim smart-splits.nvim tokyonight.nvim which-key.nvim'
+
 nvim_lock_is_exact() {
   [ "$#" -eq 1 ] || return 2
 
@@ -2611,6 +2613,28 @@ nvim_lock_is_exact() {
       end
     )
   ' "$1" >/dev/null 2>&1
+}
+
+nvim_lock_project_managed() {
+  [ "$#" -eq 2 ] || return 2
+  case "$2" in
+    "$check_tmp"/*) ;;
+    *) return 2 ;;
+  esac
+  [ ! -e "$2" ] && [ ! -L "$2" ] || return 1
+
+  # Snapshot only managed pins; never rewrite the user's mutable lockfile.
+  (umask 077; set -C
+    jq -e -s --arg names "$approved_nvim_plugins" '
+      if length != 1 or (.[0] | type) != "object" then
+        error("expected one lock object")
+      else
+        .[0] as $lock
+        | $names | split(" ")
+        | map({key: ., value: $lock[.]}) | from_entries
+      end
+    ' "$1" > "$2" 2>/dev/null
+  ) && nvim_lock_is_exact "$2"
 }
 
 nvim_trust_reject() {
@@ -3133,7 +3157,7 @@ run_nvim_trust_self_test() {
   nvim_self_test_start_failures=$failures
   printf '%s\n' 'Neovim plugin trust self-test'
 
-  for nvim_self_test_command in git jq nvim cmp grep mkdir ln cp mv chmod touch; do
+  for nvim_self_test_command in git jq nvim cmp grep mkdir ln cp mv chmod touch cat; do
     if ! command -v "$nvim_self_test_command" >/dev/null 2>&1; then
       fail "Neovim trust self-test requires $nvim_self_test_command"
     fi
@@ -3164,6 +3188,54 @@ run_nvim_trust_self_test() {
   nvim_trust_expect_reject \
     "non-object plugin lock value is rejected" \
     nvim_lock_is_exact "$check_tmp/nvim-lock-nonobject.json" || true
+
+  nvim_trust_expect_accept \
+    "stock managed lock projection is accepted" \
+    nvim_lock_project_managed "$check_tmp/nvim-lock-valid.json" \
+    "$check_tmp/nvim-lock-stock-projection.json" || true
+  # shellcheck disable=SC2016  # jq owns the literal $original binding.
+  nvim_trust_expect_accept \
+    "stock projection retains every managed pin" \
+    jq -e --slurpfile original "$check_tmp/nvim-lock-valid.json" \
+    '. == $original[0]' "$check_tmp/nvim-lock-stock-projection.json" || true
+
+  if jq '. ["lazy.nvim"].commit = "85c7ff3711b730b4030d03144f6db6375044ae82"' \
+    "$check_tmp/nvim-lock-extra.json" > "$check_tmp/nvim-lock-local.json" \
+    && cp "$check_tmp/nvim-lock-local.json" "$check_tmp/nvim-lock-local.before"; then
+    nvim_trust_expect_accept \
+      "local extra pin permits managed projection" \
+      nvim_lock_project_managed "$check_tmp/nvim-lock-local.json" \
+      "$check_tmp/nvim-lock-local-projection.json" || true
+    nvim_trust_expect_accept \
+      "projection preserves the selected lazy.nvim pin and excludes local pins" \
+      jq -e '. ["lazy.nvim"].commit == "85c7ff3711b730b4030d03144f6db6375044ae82"
+        and (has("unexpected.nvim") | not)' \
+      "$check_tmp/nvim-lock-local-projection.json" || true
+    nvim_trust_expect_accept \
+      "managed projection preserves local lock bytes" \
+      cmp -s "$check_tmp/nvim-lock-local.before" "$check_tmp/nvim-lock-local.json" || true
+    nvim_trust_expect_reject \
+      "local lock remains outside the exact runtime boundary" \
+      nvim_lock_is_exact "$check_tmp/nvim-lock-local.json" || true
+  else
+    fail "could not create retained local-pin fixture"
+  fi
+
+  if ! jq 'del(. ["mini.icons"])' "$check_tmp/nvim-lock-valid.json" \
+    > "$check_tmp/nvim-lock-missing-managed.json"; then
+    fail "could not create missing managed-plugin fixture"
+  fi
+  printf '%s\n' '[]' > "$check_tmp/nvim-lock-array.json"
+  printf '%s\n' '42' > "$check_tmp/nvim-lock-scalar.json"
+  printf '%s\n' '{' > "$check_tmp/nvim-lock-invalid-json.json"
+  cat "$check_tmp/nvim-lock-valid.json" "$check_tmp/nvim-lock-valid.json" \
+    > "$check_tmp/nvim-lock-multiple.json"
+  for nvim_projection_invalid in missing nonhex nonobject missing-managed array scalar invalid-json multiple; do
+    nvim_trust_expect_reject \
+      "managed projection rejects $nvim_projection_invalid lock" \
+      nvim_lock_project_managed "$check_tmp/nvim-lock-$nvim_projection_invalid.json" \
+      "$check_tmp/nvim-lock-$nvim_projection_invalid-projection.json" || true
+  done
 
   nvim_fixture=$check_tmp/nvim-trust-valid-ignored
   if nvim_trust_fixture_init "$nvim_fixture" lazy.nvim; then
@@ -11531,7 +11603,6 @@ do
   fi
 done
 
-approved_nvim_plugins='fzf-lua image.nvim jupytext.nvim lazy.nvim mini.icons mini.pairs mini.starter mini.surround molten-nvim nvim-treesitter oil.nvim otter.nvim quarto-nvim smart-splits.nvim tokyonight.nvim which-key.nvim'
 mini_icons_dir="$nvim_data_root/lazy/mini.icons"
 which_key_dir="$nvim_data_root/lazy/which-key.nvim"
 oil_dir="$nvim_data_root/lazy/oil.nvim"
@@ -11552,13 +11623,22 @@ for plugin_name in $approved_nvim_plugins; do
 done
 
 lock_valid=false
+lock_has_extra_plugins=false
+lock_source_path="$check_tmp/nvim-source-lock.json"
+managed_lock_path="$check_tmp/nvim-managed-lock.json"
 if command -v jq >/dev/null 2>&1 \
   && [ -r "$nvim_root/lazy-lock.json" ] \
-  && nvim_lock_is_exact "$nvim_root/lazy-lock.json"; then
+  && (umask 077; set -C; cat "$nvim_root/lazy-lock.json" > "$lock_source_path") \
+  && nvim_lock_project_managed "$lock_source_path" "$managed_lock_path"; then
   lock_valid=true
-  pass "Neovim lockfile contains exactly sixteen object-valued pinned plugins"
+  if nvim_lock_is_exact "$lock_source_path"; then
+    pass "Neovim lockfile contains exactly sixteen object-valued pinned plugins"
+  else
+    lock_has_extra_plugins=true
+    pass "Neovim managed lock projection contains exactly sixteen object-valued pinned plugins"
+  fi
 else
-  fail "Neovim lockfile must contain the exact sixteen-plugin object boundary"
+  fail "Neovim lockfile must contain all sixteen managed plugin objects with valid pinned commits"
 fi
 
 if [ "$lock_valid" = true ] && [ "$plugins_ready" = true ]; then
@@ -11567,7 +11647,7 @@ if [ "$lock_valid" = true ] && [ "$plugins_ready" = true ]; then
   for plugin_name in $approved_nvim_plugins; do
     plugin_dir="$nvim_data_root/lazy/$plugin_name"
     plugin_lock=$(jq -r --arg name "$plugin_name" \
-      '.[$name].commit // empty' "$nvim_root/lazy-lock.json")
+      '.[$name].commit // empty' "$managed_lock_path")
     if nvim_plugin_revision_is_exact "$plugin_dir" "$plugin_lock"; then
       pass "$plugin_name HEAD matches lazy-lock.json"
     else
@@ -11583,7 +11663,7 @@ if [ "$plugin_revisions_match" = true ]; then
   for plugin_name in $approved_nvim_plugins; do
     plugin_dir="$nvim_data_root/lazy/$plugin_name"
     plugin_lock=$(jq -r --arg name "$plugin_name" \
-      '.[$name].commit // empty' "$nvim_root/lazy-lock.json")
+      '.[$name].commit // empty' "$managed_lock_path")
     if ! require_clean_git_worktree \
       "$plugin_dir" "$plugin_name" "$plugin_lock" \
       "$check_tmp/plugin-$plugin_name"; then
@@ -11597,10 +11677,16 @@ if [ "$nvim_config_ready" = true ] \
   && [ "$plugins_ready" = true ] \
   && [ "$plugin_revisions_match" = true ] \
   && [ "$plugin_worktrees_clean" = true ]; then
-  plugins_trusted=true
-  pass "Neovim sixteen-plugin revision and source trust gate satisfied"
+  if [ "$lock_has_extra_plugins" = false ]; then
+    plugins_trusted=true
+    pass "Neovim sixteen-plugin revision and source trust gate satisfied"
+  else
+    warn "Partial Neovim validation: managed plugin revisions and sources passed; extra local plugins remain unvalidated and configured runtime checks are skipped"
+  fi
 else
   fail "Neovim plugin trust gate is closed; live plugin code will not run"
+fi
+if [ "$plugins_trusted" != true ]; then
   printf '%s\n' \
     'SKIP  Neovim editing, navigation, theme, Treesitter, parser, provider, and pane assertions'
 fi
@@ -12098,7 +12184,7 @@ if [ "$nvim_config_ready" = true ] \
     for plugin_name in image.nvim jupytext.nvim molten-nvim otter.nvim quarto-nvim; do
       plugin_dir="$nvim_data_root/lazy/$plugin_name"
       plugin_lock=$(jq -r --arg name "$plugin_name" \
-        '.[$name].commit // empty' "$nvim_root/lazy-lock.json")
+        '.[$name].commit // empty' "$managed_lock_path")
       require_clean_git_worktree \
         "$plugin_dir" "$plugin_name" "$plugin_lock" \
         "$check_tmp/plugin-post-notebook-$plugin_name" || true
@@ -12120,6 +12206,7 @@ parquet_nonzero_output="$check_tmp/nvim-parquet-integration-nonzero.out"
 parquet_nonzero_log="$check_tmp/nvim-parquet-integration-nonzero.log"
 
 if [ "$nvim_config_ready" = true ] \
+  && [ "$plugins_trusted" = true ] \
   && [ "$parquet_runtime_ready" = true ] \
   && command -v nvim >/dev/null 2>&1 \
   && (umask 077 && mkdir -p \
@@ -12167,6 +12254,8 @@ if [ "$nvim_config_ready" = true ] \
     [ ! -s "$parquet_log" ] || sed 's/^/      /' "$parquet_log" >&2
     fail "Neovim Parquet viewer integration failed or changed its source"
   fi
+elif [ "$plugins_trusted" != true ]; then
+  printf '%s\n' 'SKIP  configured Neovim Parquet integration: plugin trust gate closed'
 else
   fail "could not prepare the checker-owned Parquet integration fixture"
 fi
@@ -12321,6 +12410,8 @@ if [ "$platform" = "linux" ]; then
       || sed 's/^/      /' "$data_query_sandbox_log" >&2
     fail "Neovim data query operating-system sandbox probe failed"
   fi
+  elif [ "$plugins_trusted" != true ]; then
+    printf '%s\n' 'SKIP  configured Neovim data query integration: plugin trust gate closed'
   else
     fail "could not prepare the checker-owned data query integration fixtures"
   fi
@@ -12329,6 +12420,8 @@ elif [ "$platform" = "macos" ]; then
 fi
 
 task9_ready=false
+task10_ready=false
+if [ "$plugins_trusted" = true ]; then
 if [ "$tmux_started" = true ] \
   && [ "$nvim_config_ready" = true ] \
   && [ "$plugins_trusted" = true ] \
@@ -14369,6 +14462,10 @@ else
   task10_ready=false
 fi
 
+else
+  printf '%s\n' 'SKIP  configured Neovim TUI and dependent status assertions: plugin trust gate closed'
+fi
+
 if [ "$tmux_started" = true ] \
   && [ "$nvim_config_ready" = true ] \
   && [ "$plugins_trusted" = true ] \
@@ -14508,6 +14605,8 @@ if [ "${1:-}" = "--interactive" ]; then
   printf '\nInteractive matrix\n'
   if [ "$failures" -ne 0 ]; then
     printf 'SKIP  interactive matrix because automated checks reported %s failure(s)\n' "$failures"
+  elif [ "$plugins_trusted" != true ]; then
+    printf '%s\n' 'SKIP  interactive matrix because configured Neovim runtime was not validated'
   elif [ ! -t 0 ] || [ ! -t 1 ]; then
     fail "interactive matrix requires a real TTY on stdin and stdout; piped answers are not accepted"
   else

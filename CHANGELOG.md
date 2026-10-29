@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Preserve local Neovim plugin pins during validation. Verify bundled plugin
+  revisions and sources, and report configured runtime checks as skipped when
+  extra local plugins are present. WhichKey tests no longer require unrelated
+  plugins to match an older lockfile.
 - Restore Codex and Claude conversations when session metadata matches the
   current agent process. Use the picker when metadata is missing or stale.
   Native Linux supervisor restarts keep tmux sessions running. Use epoll for
